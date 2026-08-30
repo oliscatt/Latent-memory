@@ -1,0 +1,29 @@
+__pycache__/
+*.pyc
+.weights.json
+.retractions.json
+.entities.json
+# 块向量缓存（云端/本地 embedding 档建库时算一次、缓存在本机）——
+# 它带着语料内容的指纹，跟上面几个 sidecar 一样不该被谁误提交进来
+.embed_cache.json
+init_state.json
+threads.jsonl
+# 未解决事项 sidecar：正文就是用户当前仍未结束的事情
+未解决.md
+
+# 用户自己的产出物绝不该进这个仓库
+CLAUDE.md
+AGENTS.md
+memory/
+mcp-config.json
+问卷prompt.txt
+# generic 档（自建前端）的产出：人格文件叫 persona.md，随货还多一份契约副本。
+# 契约那条**必须锚在根目录**——不锚的话会连仓库自己的 docs/注入契约.md 一起忽略掉
+/persona.md
+/注入契约.md
+# 换客户端档时旧人格文件退役成的 .bak，同样是用户的私人内容
+*.bak
+# 人格候选提取的任务包与回填结果（初始化 extract 那一步产在 <出货目录>/persona-extraction/）。
+# 里面「人格候选输入清单.json」记着你语料文件的路径和哈希、「候选结果.json」直接装着
+# 从语料里抽出来的人格原文——都是你的私人内容，跟 memory/ 同等对待
+persona-extraction/
