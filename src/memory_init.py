@@ -1446,7 +1446,7 @@ def mcp_config_snippet(server_path, corpus_dir, threads_path, route=None,
 
     **但绝对路径跟着机器走**（2026.08.02，真实用户在云端容器里当场接不上）：
     同一份配置换台机器/换个容器就断，而且 MCP server 起不来**不报到用户脸上**
-    ——会话照开、模型照回话，只是没有那五个工具。所以 Claude Code 档在
+    ——会话照开、模型照回话，只是没有那六个工具。所以 Claude Code 档在
     「全部路径都在产出目录下」时（当前出货是 server、语料、threads、独立索引四条；
     §3b 那种整套进仓库的形态）改产
     `${CLAUDE_PROJECT_DIR:-.}/…` 可搬运写法。三个硬边界：

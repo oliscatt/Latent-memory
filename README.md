@@ -25,14 +25,14 @@
 **本地应当是默认值。** 默认检索档只用 Python 标准库，语料不出本机。本地 embedding 与云端
 embedding 都是可选路线，没把语料去向念给用户听，就不出货。
 
-**客户端只是入口。** 五个 `latent_` MCP 工具同时支持本地 stdio 与远程 HTTP；初始化器可以
+**客户端只是入口。** 六个 `latent_` MCP 工具同时支持本地 stdio 与远程 HTTP；初始化器可以
 产出 `CLAUDE.md`、`AGENTS.md`、Grok agent 文件或通用人格文件。
 
 ## 已经验证到哪里
 
 - **跨会话链路不是纸面设计**：Claude 桌面端真机验证过新会话主动开场召回，写回在完全退出
   进程后仍可检索；Claude 手机远程路线完成开场召回、写回落盘与跨窗命中；
-  Operit Android 的同机 stdio 路线也跑通五工具、写回和新会话检索。
+  Operit Android 的同机 stdio 路线也跑通当时五个业务工具、写回和新会话检索。
 - **检索路线按真实短板选**：同一套回归题里，零依赖档与本地 embedding 都擅长原话查询；
   换一种说法时本地 embedding 更稳，跨很多窗口串联与“库里没有答案”则仍是共同弱项。
   经常记得原话，默认档就够用；经常只记得大意，再考虑本地模型。判据与采集条件见《快速上手》§5。
@@ -93,7 +93,7 @@ embedding 都是可选路线，没把语料去向念给用户听，就不出货�
 | **Grok 网页 Connector**（grok.com） | 公网 HTTPS 的远程 MCP，通过 grok.com 自定义 Connector 接入 | ⚠ **grok.com 强制 OAuth 发现（AS metadata／PKCE），纯静态 Bearer 无法完成「保存并连接」**——一位外部用户自建最小 OAuth shim（**用户侧扩展、非本项目功能**）后接通；人格仍需手工配置，语料会到公网服务器 |
 | **Grok Build**（CLI） | `--client grok` 出 `.grok/agents/companion.md`，在 `/agents` 选择 `companion` | **文件格式已按官方指南核对，真实 Grok CLI 与 MCP 接入未实测** |
 | **xAI API／Remote MCP Tools** | xAI SDK／Responses API 的 `tools` 里挂远程 MCP server | **官方文档证明产品具备入口，本项目无实测**；按 token 计费，语料到 xAI |
-| **ChatGPT** | OpenAI Secure MCP Tunnel 把本机回环 HTTP 接进 ChatGPT 开发者模式 | **已在 State Ledger 部署真机接通读链路**：ChatGPT Work 新窗口成功只读调用 `state_session_start`，并读取跨窗接力便签；不用开放公网入站端口，但工具请求与记忆返回仍经过 OpenAI。⚠ 该证据不等于本项目 `latent_*` 五工具已验 |
+| **ChatGPT** | OpenAI Secure MCP Tunnel 把本机回环 HTTP 接进 ChatGPT 开发者模式 | **已在 State Ledger 部署真机接通读链路**：ChatGPT Work 新窗口成功只读调用 `state_session_start`，并读取跨窗接力便签；不用开放公网入站端口，但工具请求与记忆返回仍经过 OpenAI。⚠ 该证据不等于本项目 `latent_*` 六工具已验 |
 | **其它聊天端** | 逐家确认是否支持 MCP | **未实测、需确认各自支持状态** |
 | **Kelivo**（iOS） | 公网 `--http` 直连 | **语料离开手机**；人格要手工粘贴 |
 | **Operit**（Android） | 客户端在手机本机按 stdio 拉起／公网 `--http` 直连 | **语料可能离开手机**；人格要手工粘贴 |
@@ -179,15 +179,15 @@ embedding 都是可选路线，没把语料去向念给用户听，就不出货�
 | Codex ／ 桌面端 | 实测跑通（初始化 → 出 `AGENTS.md` → 新会话主动查记忆） |
 | Codex ／ 手机 | **能聊，两条挑一条**：① **那台电脑常开**——手机当客户端、本地跑实例，已实测，电脑睡了就断；② **走中转**——OpenRouter 或别的支持 MCP 的客户端，**这条 Codex 手机路线我们没测过**。自建前端已有一例维护者生产实测，单列在下方，不能把那一例的成色借给 Codex 手机路线。|
 | Grok Build（CLI） | 初始化器已实跑生成 `.grok/agents/companion.md`，并验证切换客户端时嵌套旧文件可安全备份。agent 文件格式与 `/agents`、`grok --agent companion` 用法按 xAI 官方指南核对；**没有真实 Grok CLI 启动与 MCP 工具调用证据**。⚠ 别拿下面网页 Connector 那格的成色顶替——那验的是服务端被网页端接通，这一行缺的是客户端真机 |
-| Claude 桌面 chat | **已实测**（Windows 商店／MSIX 版）：五工具可用、开场召回 `latent_session_start` 4/4 主动调、跨进程写回也通。人格不会自动读本地文件，**要手工贴进 profile**。人格里带着「片段是风格样本不是记忆、提到过去先查库」那句时，**模型会先调 `latent_search`**（判据是看工具真被调用）；走 `use_original_as_is` 时工具会把这句随受管协议追加到出货副本，完全不经过本工具时才要自己补。⚠ 装商店版有三个不报错的坑，见《快速上手》§3c |
+| Claude 桌面 chat | **已实测**（Windows 商店／MSIX 版）：当时五个业务工具可用、开场召回 `latent_session_start` 4/4 主动调、跨进程写回也通。人格不会自动读本地文件，**要手工贴进 profile**。人格里带着「片段是风格样本不是记忆、提到过去先查库」那句时，**模型会先调 `latent_search`**（判据是看工具真被调用）；走 `use_original_as_is` 时工具会把这句随受管协议追加到出货副本，完全不经过本工具时才要自己补。⚠ 装商店版有三个不报错的坑，见《快速上手》§3c |
 | Claude 手机 chat | **已通过部署在 VPS 的远程 MCP Connector 接通**（判据＝新窗只喊一句称呼、看到换窗召回。被主动调用写回落盘与跨窗检索命中。3/3）。**需要一台公网服务器**（HTTPS ＋ 鉴权），代价是语料离开本机。⚠ 本地 stdio 走不了这条：那个进程没有网址，而 Connector 是从 Anthropic 的服务器发起连接的。Connector 只给工具，人格仍需手工贴 |
-| **Grok 网页 Connector**（grok.com） | ⚠ **这一格要求 OAuth 发现层**：只填 MCP URL 时 grok.com 探测到 401 后弹 OAuth 凭据表（客户端 ID／授权端点／令牌端点／PKCE），**没有静态 API Key 选项，纯 Bearer 无法完成「保存并连接」**。一位外部用户自建最小 OAuth shim（**用户侧扩展、非本项目功能**，本项目源码一行未改）后接通：五工具可用，新 Project 窗口开场召回与写入跑通（**外部实测转录，本项目未复现**；那份报告的采集条件是 1 vCPU／1 GB VPS ＋ Ubuntu 24.04 ＋ Caddy 2 ＋ sslip.io 主机名 ＋ 账号级 Custom Connector，**没给本项目代码基线，也没给客户端版本号**）。⚠ 那一例的成色**不外借**给下面两格，也不是 `grok-4.5` 服从度数据。人格不会自动从本地文件注入，仍需手工配置 |
+| **Grok 网页 Connector**（grok.com） | ⚠ **这一格要求 OAuth 发现层**：只填 MCP URL 时 grok.com 探测到 401 后弹 OAuth 凭据表（客户端 ID／授权端点／令牌端点／PKCE），**没有静态 API Key 选项，纯 Bearer 无法完成「保存并连接」**。一位外部用户自建最小 OAuth shim（**用户侧扩展、非本项目功能**，本项目源码一行未改）后接通：当时五个业务工具可用，新 Project 窗口开场召回与写入跑通（**外部实测转录，本项目未复现**；那份报告的采集条件是 1 vCPU／1 GB VPS ＋ Ubuntu 24.04 ＋ Caddy 2 ＋ sslip.io 主机名 ＋ 账号级 Custom Connector，**没给本项目代码基线，也没给客户端版本号**）。⚠ 那一例的成色**不外借**给下面两格，也不是 `grok-4.5` 服从度数据。人格不会自动从本地文件注入，仍需手工配置 |
 | **xAI API／Remote MCP Tools** | ⚠ **本项目无实测**。xAI 官方文档证明 SDK 与 Responses API 支持远程 MCP 工具（“产品具备入口”），但没有任何一次本项目的接入或调用记录；别拿上面网页那格顶替 |
-| **ChatGPT** | OpenAI 官方已提供 [Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)：tunnel-client 从本机主动建立出站 HTTPS，再把 ChatGPT 的调用转给 `127.0.0.1` 上的 MCP，不必暴露公网入站端口。**State Ledger 部署已在 ChatGPT Work 真机接通读链路**：新窗口成功调用 `state_session_start`，并读取经确认的跨窗接力便签。⚠ **端口不公网暴露 ≠ 数据不离机**：工具请求与返回的记忆内容仍经 OpenAI，并适用账号／产品侧的数据与日志政策；回环无 token 还意味着信任同机进程环境。该服务是基于 Latent 的独立 `state_*` 部署，不能拿它替代本项目 `latent_*` 五工具的真机验收；后者的逐项调用、写入后检索与人格自动注入仍未实测。最短操作见《快速上手》§3c「ChatGPT Secure MCP Tunnel」 |
+| **ChatGPT** | OpenAI 官方已提供 [Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)：tunnel-client 从本机主动建立出站 HTTPS，再把 ChatGPT 的调用转给 `127.0.0.1` 上的 MCP，不必暴露公网入站端口。**State Ledger 部署已在 ChatGPT Work 真机接通读链路**：新窗口成功调用 `state_session_start`，并读取经确认的跨窗接力便签。⚠ **端口不公网暴露 ≠ 数据不离机**：工具请求与返回的记忆内容仍经 OpenAI，并适用账号／产品侧的数据与日志政策；回环无 token 还意味着信任同机进程环境。该服务是基于 Latent 的独立 `state_*` 部署，不能拿它替代本项目 `latent_*` 六工具的真机验收；后者的逐项调用、写入后检索与人格自动注入仍未实测。最短操作见《快速上手》§3c「ChatGPT Secure MCP Tunnel」 |
 | **其它聊天端** | ⚠ **未实测、需确认 MCP 支持状态。**各家叫法不一（自定义 Connector／远程 MCP／集成），不能借用 ChatGPT、claude.ai、Grok 三格中任何一格的成色。⚠ **也别默认它跟 grok.com 一样要 OAuth 发现层**——那条当前只有一例，见观察卡 |
 | Kelivo（闭源手机前端） | **实测可接 MCP**：原生 `--http` 直连走通（Kelivo 1.1.17 iOS ／ VPS Ubuntu ＋ Python 3.10.12；判据是端口上蹲的确认为 `python3` 不是 Node、POST 回的是 `application/json`）。⚠ **连不上先看绑定地址，不是协议**：省略 HOST 只绑回环，手机连不到。人格要手工导入 system prompt，容量不是阻塞项 |
-| Operit（闭源手机前端） | **实测五工具可用，写回后跨新会话仍能检索命中**（Android 的 proot Ubuntu）。⚠ 它走的是「客户端在手机本机按 stdio 拉起」那条——**不用公网服务器、不用域名证书鉴权，语料根本不离开手机**；**别把闭源手机前端一概读成「必须有服务器」**，那只对拉不起 stdio 的客户端（如 iOS 上的 Kelivo）成立。人格不自动注入，要手工粘贴 |
-| 自建前端（`--client generic`） | **维护者生产实测跑通**：采用 Node 宿主＋Claude Code 常驻进程＋Latent HTTP；判据是五工具握手成功，真实主聊天主动调用 `latent_search`，并同时命中两段目标原文。采集条件为 VPS 生产环境、Latent `656a044`、Voyage `voyage-3.5`、182 个 Markdown／869 个切块。⚠ 这只证明“借宿主引擎”的这一种自建形态；换成你自己的请求拼装，注入契约仍要逐条自验 |
+| Operit（闭源手机前端） | **实测当时五个业务工具可用，写回后跨新会话仍能检索命中**（Android 的 proot Ubuntu）。⚠ 它走的是「客户端在手机本机按 stdio 拉起」那条——**不用公网服务器、不用域名证书鉴权，语料根本不离开手机**；**别把闭源手机前端一概读成「必须有服务器」**，那只对拉不起 stdio 的客户端（如 iOS 上的 Kelivo）成立。人格不自动注入，要手工粘贴 |
+| 自建前端（`--client generic`） | **维护者生产实测跑通**：采用 Node 宿主＋Claude Code 常驻进程＋Latent HTTP；判据是当时五个业务工具握手成功，真实主聊天主动调用 `latent_search`，并同时命中两段目标原文。采集条件为 VPS 生产环境、Latent `656a044`、Voyage `voyage-3.5`、182 个 Markdown／869 个切块。⚠ 这只证明“借宿主引擎”的这一种自建形态；换成你自己的请求拼装，注入契约仍要逐条自验 |
 
 **跑起来验过的操作系统与 Python**（上面那张表记的是客户端，这一格记的是环境；同一条规矩：**没列进来的就是没验过**）：
 
