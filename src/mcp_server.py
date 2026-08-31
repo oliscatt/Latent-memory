@@ -20,7 +20,7 @@ tools/list / tools/call，字段名与错误分层均照规格），**已查证�
 
 **成色（2026.08.03 改准，此前写的是“尚未与任何真实客户端握手核对”，已过时）**：
 已有一条真实客户端链路——Operit（Android）＋ proot Ubuntu，客户端按 stdio 拉起本进程，
-握手、工具列表、真实调用三样都走过：五个工具全部接通，`latent_append` 写入后
+握手、工具列表、真实调用三样都走过：当时五个业务工具全部接通，`latent_append` 写入后
 **新开会话仍检索命中**。外部实测转录，本项目未复现。
 
 ⚠ **剩下的边界仍然作数，别读成“都验过了”**：Claude 桌面 App 那一格仍未连过；
@@ -421,7 +421,6 @@ def validate_index_summaries(items, text, current_state, local_date):
         raise ValueError("未提供 indexSummaries：本次不写索引摘要。")
     evidence_base = text.strip() + "\n" + current_state.strip()
     wanted_date = local_date.replace("-", ".")
-    pattern = re.compile(r"^\*\*(\d{4}\.\d{2}\.\d{2})\*\*：(.+)。\n(.+)。\*\*当下：(.+)。\*\*$")
     validated = []
     for number, item in enumerate(items, 1):
         if not isinstance(item, dict):
@@ -430,12 +429,26 @@ def validate_index_summaries(items, text, current_state, local_date):
         if not isinstance(summary, str) or not summary.strip():
             raise ValueError(f"摘要第 {number} 条 summary 不能为空；本次没有写盘。")
         summary = summary.strip()
-        match = pattern.fullmatch(summary)
-        if not match or any(not part.strip() for part in match.groups()[1:]):
+        first = re.match(r"^\*\*(\d{4}\.\d{2}\.\d{2})\*\*：(.+)。\n", summary)
+        if not first or not first.group(2).strip():
             raise ValueError(
-                f"摘要第 {number} 条格式不符合两行四段契约；本次没有写盘。\n"
+                f"摘要第 {number} 条第 1 段（A）不匹配；期望第一行形状为 "
+                "**YYYY.MM.DD**：(A)。；本次没有写盘。\n"
                 f"{INDEX_SUMMARY_FORMAT_GUIDE}")
-        if match.group(1) != wanted_date:
+        remainder = summary[first.end():]
+        second = re.match(r"^(.+)。\*\*当下：", remainder)
+        if not second or not second.group(1).strip():
+            raise ValueError(
+                f"摘要第 {number} 条第 2 段（B）不匹配；期望第二行先写 "
+                "(B)。**当下：；本次没有写盘。\n"
+                f"{INDEX_SUMMARY_FORMAT_GUIDE}")
+        third = re.fullmatch(r"(.+)。\*\*$", remainder[second.end():])
+        if not third or not third.group(1).strip():
+            raise ValueError(
+                f"摘要第 {number} 条第 3 段（C）不匹配；期望结尾形状为 "
+                "(C)。**；本次没有写盘。\n"
+                f"{INDEX_SUMMARY_FORMAT_GUIDE}")
+        if first.group(1) != wanted_date:
             raise ValueError(f"摘要第 {number} 条日期应为 {wanted_date}；本次没有写盘。")
         if not isinstance(terms, list) or not terms:
             raise ValueError(f"摘要第 {number} 条 evidenceTerms 必须是非空数组；本次没有写盘。")
@@ -445,9 +458,14 @@ def validate_index_summaries(items, text, current_state, local_date):
                 raise ValueError(f"摘要第 {number} 条 evidenceTerms 含空值或纯标点。")
             if term not in unique:
                 unique.append(term)
-            if term not in summary or term not in evidence_base:
-                out_of_bounds.append(term)
-        segments = match.groups()[1:]
+            missing = []
+            if term not in summary:
+                missing.append("summary")
+            if term not in evidence_base:
+                missing.append("text/current_state")
+            if missing:
+                out_of_bounds.append(f"{term}（缺在 {' 与 '.join(missing)}）")
+        segments = (first.group(2), second.group(1), third.group(1))
         unanchored = [str(position) for position, segment in enumerate(segments, 1)
                       if not any(term in segment for term in unique)]
         if out_of_bounds or unanchored:
@@ -455,7 +473,7 @@ def validate_index_summaries(items, text, current_state, local_date):
             gaps = "、".join(unanchored) or "无"
             raise ValueError(f"摘要第 {number} 条未通过证据锚点校验。越界词：{over}；"
                              f"未锚定段：{gaps}。每个摘要段都要含至少一个同时存在于摘要与同批 "
-                             "text 或 current_state 的 evidenceTerms 证据词。")
+                             "text/current_state 的 evidenceTerms 证据词；两边缺任一处都算越界。")
         validated.append(summary)
     return validated
 
@@ -1923,6 +1941,8 @@ def diagnose(corpus_dir, threads_path=None, embed=False, time_context=None,
                         "写回、归窗、检索标签同一个口径")
     else:
         add(WARN, "时区", f"没配 --timezone，用的是默认值 {tc.name}（东八区）。"
+                          "doctor 是独立进程，只看自己这条命令行上的 --timezone；"
+                          "服务进程配过不算。"
                           "你就在东八区的话这条可以不管；**不在的话现在写下的记忆"
                           "日期是错的**，且不报错——文件名、记录标题、检索标签和重启后"
                           "的新鲜度信号会一起错。在 MCP 配置里补一行 "
@@ -1938,28 +1958,64 @@ def diagnose(corpus_dir, threads_path=None, embed=False, time_context=None,
     add(OK, "MCP 接线", f"握手 {hs['result']['protocolVersion']}，工具 {len(tools)} 个："
                         + "、".join(t["name"] for t in tools))
 
-    probe = _doctor_probe(index)
+    invalid_schemas = []
+    for tool in tools:
+        schema = tool.get("inputSchema")
+        reasons = []
+        if not isinstance(schema, dict) or schema.get("type") != "object":
+            reasons.append("inputSchema 顶层不是 type: object")
+        if isinstance(schema, dict):
+            combinators = [name for name in ("anyOf", "oneOf") if name in schema]
+            if combinators:
+                reasons.append("顶层出现 " + "／".join(combinators))
+        if reasons:
+            invalid_schemas.append(f"{tool.get('name', '<未命名>')}（{'；'.join(reasons)}）")
+    if invalid_schemas:
+        add(FAIL, "工具 schema", "；".join(invalid_schemas)
+            + "。兼容层可能拒绝整张工具表或丢掉参数。")
+    else:
+        add(OK, "工具 schema", "全部工具的 inputSchema 顶层均为 type: object，且无 anyOf/oneOf")
+
+    probe, weak_probe = _doctor_probe(index)
     res = srv.handle({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
                       "params": {"name": "latent_search",
                                  "arguments": {"query": probe}}})["result"]
-    if res["isError"]:
-        add(FAIL, "检索自查", f"拿语料自己的标题“{probe}”去查，反而查不到："
-                              + res["content"][0]["text"].splitlines()[0])
-    else:
-        add(OK, "检索自查", f"拿语料自己的标题“{probe}”查得到")
+    level, detail = _doctor_probe_outcome(probe, weak_probe, res)
+    add(level, "检索自查", detail)
     return out
 
 
 def _doctor_probe(index):
-    """从语料自己身上取一句探针 query——用最新那块的标题（没有标题就用首行）。
-    拿库里确实存在的说法去查，查不到就说明接线坏了，而不是"这个问题库里没有"。"""
-    i = max(range(len(index.meta)),
-            key=lambda j: index.meta[j].get("timestamp") or 0)
-    head = (index.meta[i].get("heading") or "").strip()
-    if not head:
-        head = next((ln.lstrip("# ").strip() for ln in index.chunks[i].splitlines()
-                     if ln.strip()), "")
-    return head[:30]
+    """优先取含内容词的标题；只有日期／窗口标题时返回弱探针标记。"""
+    ranked = sorted(range(len(index.meta)),
+                    key=lambda j: index.meta[j].get("timestamp") or 0, reverse=True)
+    candidates = []
+    for i in ranked:
+        head = (index.meta[i].get("heading") or "").strip()
+        if not head:
+            head = next((ln.lstrip("# ").strip() for ln in index.chunks[i].splitlines()
+                         if ln.strip()), "")
+        if head:
+            candidates.append(head[:30])
+    for head in candidates:
+        residue = re.sub(r"\d{4}[年./-]\d{1,2}[月./-]\d{1,2}日?", " ", head)
+        residue = re.sub(r"第?\s*\d+\s*(?:窗|窗口|轮|次|段)", " ", residue)
+        residue = re.sub(r"[\s·._/|｜:：\-—年月日记录对话聊天窗口]+", "", residue)
+        if len(residue) >= 2:
+            return head, False
+    return candidates[0], True
+
+
+def _doctor_probe_outcome(probe, weak_probe, result):
+    """把探针结果分级；弱探针失败只说明标题缺内容词，不冒充接线失败。"""
+    if not result["isError"]:
+        return OK, f"拿语料自己的标题“{probe}”查得到"
+    error = result["content"][0]["text"].splitlines()[0]
+    if weak_probe:
+        return (WARN, f"语料标题只有日期／窗口等通用词，只能拿“{probe}”试查；"
+                      "这类探针缺少内容词，查不到不能据此判定接线失败。"
+                      f"请另拿正文中的一句原话调用 latent_search：{error}")
+    return FAIL, f"拿语料自己的标题“{probe}”去查，反而查不到：{error}"
 
 
 def format_doctor_report(checks):
@@ -2268,8 +2324,22 @@ def _selftest():
             "只有一行", "仍在处理", "2026-08-20")
         assert False, "形状错误必须拒绝"
     except ValueError as exc:
-        assert INDEX_SUMMARY_TEMPLATE in str(exc) and INDEX_SUMMARY_EXAMPLE in str(exc), \
-            "格式错误必须把同一模板与合法样例交还给调用方"
+        assert "第 1 段（A）" in str(exc) and INDEX_SUMMARY_TEMPLATE in str(exc) \
+            and INDEX_SUMMARY_EXAMPLE in str(exc), \
+            "格式错误必须定位 A 段，并把同一模板与合法样例交还给调用方"
+    malformed_segments = (
+        ("**2026.08.20**：第一段。\n缺少当下标签", "第 2 段（B）"),
+        ("**2026.08.20**：第一段。\n第二段。**当下：缺少结尾", "第 3 段（C）"),
+    )
+    for malformed, expected_segment in malformed_segments:
+        try:
+            validate_index_summaries(
+                [{"summary": malformed, "evidenceTerms": ["第一段"]}],
+                "第一段和第二段", "缺少结尾", "2026-08-20")
+            assert False, f"{expected_segment} 形状错误必须拒绝"
+        except ValueError as exc:
+            assert expected_segment in str(exc) and "期望" in str(exc), \
+                f"格式错误必须定位到 {expected_segment} 并说明期望形状：{exc}"
     valid_summary = "**2026.08.20**：柳州那晚约定直说。\n一直猜而难过。**当下：约定仍成立。**"
     valid_terms = ["柳州那晚", "约定", "直说", "一直猜", "难过", "仍成立"]
     base_text = "柳州那晚约定直说，一直猜让她难过。"
@@ -2292,6 +2362,23 @@ def _selftest():
             assert False, "越界词或无证据锚点的摘要段必须拒绝"
         except ValueError as exc:
             assert expected in str(exc)
+    try:
+        validate_index_summaries(
+            [{"summary": valid_summary, "evidenceTerms": valid_terms + ["旅行社"]}],
+            base_text + "旅行社已确认。", "约定仍成立", "2026-08-20")
+        assert False, "只在 text 中、没进 summary 的证据词必须拒绝"
+    except ValueError as exc:
+        assert "旅行社（缺在 summary）" in str(exc) and "两边缺任一处都算越界" in str(exc), \
+            f"越界文案必须点明词缺在 summary：{exc}"
+    try:
+        validate_index_summaries(
+            [{"summary": valid_summary.replace("一直猜", "旅行社一直猜"),
+              "evidenceTerms": valid_terms + ["旅行社"]}],
+            base_text, "约定仍成立", "2026-08-20")
+        assert False, "只在 summary 中、没进 text/current_state 的证据词必须拒绝"
+    except ValueError as exc:
+        assert "旅行社（缺在 text/current_state）" in str(exc), \
+            f"越界文案必须点明词缺在 text/current_state：{exc}"
     normalized_evidence = validate_index_evidence(
         [{"type": "event", "quote": '代号是 "LT-3289"'},
          {"type": "state", "quote": "测试　仍在进行"}],
@@ -2378,7 +2465,10 @@ def _selftest():
                                           "latent_unresolved",
                                           "latent_thread_close"]
     for t in tools:
-        assert set(t) >= {"name", "description", "inputSchema"} and t["inputSchema"]["type"] == "object"
+        assert set(t) >= {"name", "description", "inputSchema"} \
+            and t["inputSchema"]["type"] == "object" \
+            and not {"anyOf", "oneOf"}.intersection(t["inputSchema"]), \
+            f"{t['name']} 的 inputSchema 顶层必须是 object，且不得出现 anyOf/oneOf"
     # 2c.【工具 annotations】变异靶心：任一工具漏字段、把检索冒充只读、
     #     把更正冒充纯追加，或把本地记忆库误标成 open world，这张逐字表都会红。
     expected_annotations = {
@@ -3259,6 +3349,8 @@ def _selftest():
         assert str(corpus.resolve()) in out, \
             f"报告里必须出现真实绝对路径（相对路径要解析开），实际输出：{out}"
         assert "建库：2 块" in out and "索引层 1" in out, f"块数与分层计数要在输出里：{out}"
+        assert "✓ 工具 schema" in out and "无 anyOf/oneOf" in out, \
+            f"doctor 必须逐工具检查 schema 顶层形状：{out}"
         #    断在“建库：”那一行上，别只断“2 块”——时间戳来源那行也带块数，
         #    松着断的话把块数写死成常量的变异会从那儿溜过去（实测溜过一次）
         #    块数要真的数出来：**同一次 selftest 里再跑一份块数不同的语料**，
@@ -3272,6 +3364,31 @@ def _selftest():
             encoding="utf-8")
         code2, out2 = run_doctor(td, "--corpus", "另一份")
         assert code2 == 0 and "建库：3 块" in out2, f"块数要真数出来，不是写死的：{out2}"
+        #    最新标题只有日期时，必须继续找较旧但有内容词的标题，不能拿日期冒充探针。
+        probe_index = MemoryIndex()
+        probe_index.add("## 修咖啡机\n换掉保险丝。",
+                        {"heading": "修咖啡机", "timestamp": 1})
+        probe_index.add("## 2026-08-29 记\n那天整理了房间。",
+                        {"heading": "2026-08-29 记", "timestamp": 2})
+        probe_index.build()
+        assert _doctor_probe(probe_index) == ("修咖啡机", False), \
+            "doctor 应优先挑含内容词的标题，不按最新时间盲取纯日期标题"
+        date_probe_index = MemoryIndex()
+        date_probe_index.add("## 2026-08-29 记\n那天整理了房间。",
+                             {"heading": "2026-08-29 记", "timestamp": 2})
+        date_probe_index.build()
+        assert _doctor_probe(date_probe_index) == ("2026-08-29 记", True), \
+            "只有纯日期标题时必须标成弱探针，供失败结果降级 WARN"
+        failed_probe = {"isError": True, "content": [{"text": "没有可靠命中\n请换个问法"}]}
+        weak_level, weak_detail = _doctor_probe_outcome(
+            "2026-08-29 记", True, failed_probe)
+        assert weak_level == WARN and "标题只有日期／窗口等通用词" in weak_detail \
+            and "正文中的一句原话" in weak_detail, \
+            f"纯日期弱探针失败必须降级 WARN 并给人工复查出口：{weak_detail}"
+        strong_level, strong_detail = _doctor_probe_outcome(
+            "修咖啡机", False, failed_probe)
+        assert strong_level == FAIL and "反而查不到" in strong_detail, \
+            "含内容词的强探针失败仍必须判 FAIL"
         assert "时间范围" in out and "2026-06-17" in out, \
             f"时间范围（最早/最晚）要在输出里——旧快照那个坑靠它：{out}"
         assert "filename" in out, f"时间戳来源分布要在输出里：{out}"
@@ -4060,6 +4177,8 @@ def _selftest():
         code20b, out20b = run_doctor(td20, "--corpus", "corpus")
         assert "⚠ 时区" in out20b and "没配 --timezone" in out20b, \
             f"没配时区要报 ⚠，这是那次事故唯一会露头的地方：{out20b}"
+        assert "doctor 是独立进程" in out20b and "服务进程配过不算" in out20b, \
+            f"时区 WARN 必须说明 doctor 只看自己命令行：{out20b}"
         #    ⚠ 默认值改成东八区之后（2026.08.05 拍板），这一格**不许降成 ✓**：
         #    对东八区以外的使用者它就是错的，降成 ✓ 等于给可能错的日期发合格证
         assert "Asia/Shanghai" in out20b or "UTC+08:00" in out20b, \

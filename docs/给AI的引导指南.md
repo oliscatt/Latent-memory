@@ -88,7 +88,7 @@ TA 已经在用 CC 的话，直接走这条。
 已实测（Windows，微软商店／MSIX 版）：
 
 - **MCP 连上，开场召回 `latent_session_start` 4/4 主动调**；
-- **五工具全在，跨进程写回也通**——判据是**完全退出进程**重开还查得到；开新对话窗
+- **当时五个业务工具全在，跨进程写回也通**——判据是**完全退出进程**重开还查得到；开新对话窗
   查到只证明内存索引，没证明落盘；
 - **人格不会自动注入**（它够不到本地文件），全文要 TA 手工贴进 profile，
   填**个人偏好**、不是 Project instructions。
@@ -173,7 +173,7 @@ TA 已经在用 CC 的话，直接走这条。
   shim、`/mcp` 仍进本项目，shim 走完 PKCE 后把原有 token 当 access_token 发出去。
   ⚠ **那是用户侧扩展、不是本项目功能**，本项目源码一行没改；**没有那层 shim，
   这一格当前就是接不上**。别把「有人接通了」讲成「照文档配好就能接」。
-- 加上 shim 之后确实跑通了：五工具可用，新 Project 窗口里开场召回与写入都成立。
+- 加上 shim 之后确实跑通了：当时五个业务工具可用，新 Project 窗口里开场召回与写入都成立。
   ⚠ **外部实测转录，本项目未复现。**
 - ⚠ `latent_thread_close` 在网页 Grok 上不会被触发（关标签没有回调）；旧窗口
   （连接器后加的）也不稳定自发召回，**报告没给次数与分母，这条只有方向没有数**。
@@ -197,7 +197,7 @@ tunnel-client 主动建立出站 HTTPS，把 ChatGPT 请求转给 `127.0.0.1` �
 tunnel ID 与运行时 key 只从 OpenAI Platform 原始页面取，**不写入仓库或聊天记录**。
 
 基于 Latent 的独立 State Ledger 部署已由 ChatGPT Work 新窗口通过 Connector
-成功调用 `state_session_start` 并读取跨窗接力便签，因此可以说“ChatGPT Secure MCP Tunnel 已有真机读链路记录”。⚠ 该记录使用 `state_*`，不等于本项目 `latent_*` 五工具全量验收：逐个工具调用、`latent_append` 写入后的跨窗 `latent_search` 命中，以及人格自动注入仍无证据，不能借本次结果补齐。
+成功调用 `state_session_start` 并读取跨窗接力便签，因此可以说“ChatGPT Secure MCP Tunnel 已有真机读链路记录”。⚠ 该记录使用 `state_*`，不等于本项目 `latent_*` 六工具全量验收：逐个工具调用、`latent_append` 写入后的跨窗 `latent_search` 命中，以及人格自动注入仍无证据，不能借本次结果补齐。
 
 #### 其它 AI 聊天端 → **未实测、需确认 MCP 支持状态**
 
@@ -215,7 +215,7 @@ tunnel ID 与运行时 key 只从 OpenAI Platform 原始页面取，**不写入�
 从公网讲起会把 TA 劝去买服务器，而 TA 可能根本不需要。
 
 **能拉起（Operit／Android 是这条）** → **语料根本不离开手机，不用服务器、不用域名、
-不用证书、不用鉴权。**实测跑通（proot Ubuntu，五工具全接通，`latent_append` 写回后
+不用证书、不用鉴权。**实测跑通（proot Ubuntu，当时五个业务工具全接通，`latent_append` 写回后
 新开会话仍检索命中）。见《快速上手》§3c「部署形态一」。三条实测撞出来的坑：
 
 - **别自己 `nohup` 起后台进程**——stdio 要 stdin，手动起会当场崩；这个 server 只能由客户端拉起。
@@ -274,7 +274,7 @@ Claude Code 云端必调**：云端已有一例漏调反馈；宿主支持生命
 
 出货给 `persona.md` 和一份《注入契约》（五条判据 ＋ 四个坑）。
 **维护者生产自建前端实测跑通**：用 Node 宿主驱动 Claude Code
-常驻进程，Latent 走 HTTP；判据是五工具握手成功，真实主聊天主动调用 `latent_search`
+常驻进程，Latent 走 HTTP；判据是当时五个业务工具握手成功，真实主聊天主动调用 `latent_search`
 并同时命中两段目标原文。采集条件为 VPS 生产环境、Latent `656a044`、
 Voyage `voyage-3.5`、182 个 Markdown／869 个切块。另有百来行参考宿主
 （`src/reference_host.py`）上的 DeepSeek／GLM 独立会话实测。
