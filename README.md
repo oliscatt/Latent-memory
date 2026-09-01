@@ -93,7 +93,7 @@ embedding 都是可选路线，没把语料去向念给用户听，就不出货�
 | **Grok 网页 Connector**（grok.com） | 公网 HTTPS 的远程 MCP，通过 grok.com 自定义 Connector 接入 | ⚠ **grok.com 强制 OAuth 发现（AS metadata／PKCE），纯静态 Bearer 无法完成「保存并连接」**——一位外部用户自建最小 OAuth shim（**用户侧扩展、非本项目功能**）后接通；人格仍需手工配置，语料会到公网服务器 |
 | **Grok Build**（CLI） | `--client grok` 出 `.grok/agents/companion.md`，在 `/agents` 选择 `companion` | **文件格式已按官方指南核对，真实 Grok CLI 与 MCP 接入未实测** |
 | **xAI API／Remote MCP Tools** | xAI SDK／Responses API 的 `tools` 里挂远程 MCP server | **官方文档证明产品具备入口，本项目无实测**；按 token 计费，语料到 xAI |
-| **ChatGPT** | OpenAI Secure MCP Tunnel 把本机回环 HTTP 接进 ChatGPT 开发者模式 | **已在 State Ledger 部署真机接通读链路**：ChatGPT Work 新窗口成功只读调用 `state_session_start`，并读取跨窗接力便签；不用开放公网入站端口，但工具请求与记忆返回仍经过 OpenAI。⚠ 该证据不等于本项目 `latent_*` 六工具已验 |
+| **ChatGPT** | OpenAI Secure MCP Tunnel 把本机回环 HTTP 接进 ChatGPT 开发者模式 | **已在 State Ledger 部署真机接通读链路**：ChatGPT Work 新窗口成功只读调用 `state_session_start`，并读取跨窗接力便签；不用开放公网入站端口，但工具请求与记忆返回仍经过 OpenAI。⚠ 该证据不等于本项目 `latent_*` 七工具已验 |
 | **其它聊天端** | 逐家确认是否支持 MCP | **未实测、需确认各自支持状态** |
 | **Kelivo**（iOS） | 公网 `--http` 直连 | **语料离开手机**；人格要手工粘贴 |
 | **Operit**（Android） | 客户端在手机本机按 stdio 拉起／公网 `--http` 直连 | **语料可能离开手机**；人格要手工粘贴 |
@@ -148,7 +148,7 @@ embedding 都是可选路线，没把语料去向念给用户听，就不出货�
 - **检索融合**：BM25 词面 + 语义 + 关系图谱三路 RRF 融合。诚实标注：默认零依赖档下语义那一路（字符 bigram 余弦）跟词面路高度重合、几乎没有独立贡献（我们自己的回归集消融实测），实际是词面+图谱两路在干活；装 fastembed 走 `--embed` 后语义路才名副其实。`latent_search` 另接受一个可选 `queryVariant`：自然问法查不到时，由宿主模型补一种更具体的说法，服务器保留原查询并做一次受控 RRF 融合；原查询两票、改述一票，最终 topN 才加一次权重。⚠ 机制已用虚构夹具和真 MCP 调用验证；外部十道私有题没有上交，**不能写成原 5/10 已经提高到某个新分数**。
 - **MCP 协议**：按官方规格 2025-06-18 实现；同时支持本地 stdio 与远程 Streamable HTTP（`--http`＋`--token`）。`--http` 收的是 `[HOST:]PORT`，**省略 HOST 只绑回环、别的机器连不到**；绑非回环时起动横幅会多打一行提醒——那条链路是裸 HTTP，token 与检索回来的记忆内容都是明文，推荐绑回环、公网那一跳交给反代管 TLS（**只提醒，不拦你起动**）。
 - **按客户端的 `Accept` 给传输形态**：只认 SSE 响应体的客户端拿到单事件 SSE（`event: message` ＋ `data:`），其余拿 `application/json`（`Accept` 里两个都写、写 `*/*`、或没带这个头，都走 JSON）；**GET 会拿到一条只发心跳、永不发消息的空长流**——本服务没有服务器主动推送的场景，这条流存在的理由只有一个：有的客户端先发 GET 建长流，收到 405 之后不改用 POST，就一直等下去。不要它就加 `--no-sse-stream`（那样 GET 恒回 405）。长流同时最多 4 条。⚠ **这两条只有自检盖着、没有真机**：自检是真端口往返，量的是「服务端形态已具备」，**不是「哪个客户端因此接上了」**。
-- **工具名带 `latent_` 前缀**：`latent_search` / `latent_session_start` / `latent_append` / `latent_correct` / `latent_unresolved` / `latent_thread_close`。`latent_unresolved` 维护 `<corpus>/未解决.md`；旧 append／thread_close 不带新字段仍继续写入并明确回 `not_reviewed`，需要严格复核时显式加 `--require-unresolved-review`。前缀不是装饰——**通用名（`memory_search` 这类）可能跟宿主自带的同名工具撞上**，撞上之后服务照常连着、工具列表照常看得见、模型照常回话，只是调的不是这一份，**全程零报错**。
+- **工具名带 `latent_` 前缀**：`latent_search` / `latent_session_start` / `latent_append` / `latent_correct` / `latent_cleanup` / `latent_unresolved` / `latent_thread_close`。`latent_append` 可传 `mode=preflight`，复用真实写入校验并返回预计落点，timeline、index 与未解决清单零写入；参数错误会附同类“写错／写对”最小输入。工具整体仍可写，因此不冒充只读。`latent_cleanup` 只按 `latent_append` 返回的稳定 `recordId` 两阶段精准清理误写；`latent_unresolved` 维护 `<corpus>/未解决.md`。旧 append／thread_close 不带新字段仍继续写入并明确回 `not_reviewed`，需要严格复核时显式加 `--require-unresolved-review`。前缀不是装饰——**通用名（`memory_search` 这类）可能跟宿主自带的同名工具撞上**，撞上之后服务照常连着、工具列表照常看得见、模型照常回话，只是调的不是这一份，**全程零报错**。
 - **被拒的请求在服务端留一行**：401／403／404／405／400／411／413／501 各说各的原因（含方法、路径、来源 IP），**排查不用猜是哪一种**；正常请求照旧不打日志。⚠ 405 有三种含义，那一行会说清是哪一种（客户端本来就只要 JSON／长流被 `--no-sse-stream` 关掉了／长流开满了）——**只有第一种不是故障**，另两种下不会回退的客户端会一直等。⚠ 那一行**不含 token、不含请求体**（那里面是你的问句和记忆正文），路径也剥掉了 query；被扫时有每分钟上限，**压掉多少条会明说**。
 
 ## 文档
@@ -158,7 +158,7 @@ embedding 都是可选路线，没把语料去向念给用户听，就不出货�
 | [`docs/给AI的引导指南.md`](docs/给AI的引导指南.md) | **AI**——让它带用户走完整个流程 |
 | [`docs/快速上手.md`](docs/快速上手.md) | 想自己动手的人 |
 | [`docs/注入契约.md`](docs/注入契约.md) | **自己写前端的人**——人格文件怎么拼进请求才立得住（五条判据 + 四个坑）|
-| [`docs/原理与架构.md`](docs/原理与架构.md) | 想理解四层数据、六工具与检索链路的人 |
+| [`docs/原理与架构.md`](docs/原理与架构.md) | 想理解四层数据、七工具与检索链路的人 |
 | [`docs/隐私与数据流.md`](docs/隐私与数据流.md) | 想确认什么落盘、什么会离开本机、如何删除的人 |
 | [`docs/升级与迁移.md`](docs/升级与迁移.md) | 从旧 commit／旧配置升级的人 |
 | [`docs/故障排查.md`](docs/故障排查.md) | 服务、客户端、目录或检索出问题的人 |
@@ -183,7 +183,7 @@ embedding 都是可选路线，没把语料去向念给用户听，就不出货�
 | Claude 手机 chat | **已通过部署在 VPS 的远程 MCP Connector 接通**（判据＝新窗只喊一句称呼、看到换窗召回。被主动调用写回落盘与跨窗检索命中。3/3）。**需要一台公网服务器**（HTTPS ＋ 鉴权），代价是语料离开本机。⚠ 本地 stdio 走不了这条：那个进程没有网址，而 Connector 是从 Anthropic 的服务器发起连接的。Connector 只给工具，人格仍需手工贴 |
 | **Grok 网页 Connector**（grok.com） | ⚠ **这一格要求 OAuth 发现层**：只填 MCP URL 时 grok.com 探测到 401 后弹 OAuth 凭据表（客户端 ID／授权端点／令牌端点／PKCE），**没有静态 API Key 选项，纯 Bearer 无法完成「保存并连接」**。一位外部用户自建最小 OAuth shim（**用户侧扩展、非本项目功能**，本项目源码一行未改）后接通：当时五个业务工具可用，新 Project 窗口开场召回与写入跑通（**外部实测转录，本项目未复现**；那份报告的采集条件是 1 vCPU／1 GB VPS ＋ Ubuntu 24.04 ＋ Caddy 2 ＋ sslip.io 主机名 ＋ 账号级 Custom Connector，**没给本项目代码基线，也没给客户端版本号**）。⚠ 那一例的成色**不外借**给下面两格，也不是 `grok-4.5` 服从度数据。人格不会自动从本地文件注入，仍需手工配置 |
 | **xAI API／Remote MCP Tools** | ⚠ **本项目无实测**。xAI 官方文档证明 SDK 与 Responses API 支持远程 MCP 工具（“产品具备入口”），但没有任何一次本项目的接入或调用记录；别拿上面网页那格顶替 |
-| **ChatGPT** | OpenAI 官方已提供 [Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)：tunnel-client 从本机主动建立出站 HTTPS，再把 ChatGPT 的调用转给 `127.0.0.1` 上的 MCP，不必暴露公网入站端口。**State Ledger 部署已在 ChatGPT Work 真机接通读链路**：新窗口成功调用 `state_session_start`，并读取经确认的跨窗接力便签。⚠ **端口不公网暴露 ≠ 数据不离机**：工具请求与返回的记忆内容仍经 OpenAI，并适用账号／产品侧的数据与日志政策；回环无 token 还意味着信任同机进程环境。该服务是基于 Latent 的独立 `state_*` 部署，不能拿它替代本项目 `latent_*` 六工具的真机验收；后者的逐项调用、写入后检索与人格自动注入仍未实测。最短操作见《快速上手》§3c「ChatGPT Secure MCP Tunnel」 |
+| **ChatGPT** | OpenAI 官方已提供 [Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)：tunnel-client 从本机主动建立出站 HTTPS，再把 ChatGPT 的调用转给 `127.0.0.1` 上的 MCP，不必暴露公网入站端口。**State Ledger 部署已在 ChatGPT Work 真机接通读链路**：新窗口成功调用 `state_session_start`，并读取经确认的跨窗接力便签。⚠ **端口不公网暴露 ≠ 数据不离机**：工具请求与返回的记忆内容仍经 OpenAI，并适用账号／产品侧的数据与日志政策；回环无 token 还意味着信任同机进程环境。该服务是基于 Latent 的独立 `state_*` 部署，不能拿它替代本项目 `latent_*` 七工具的真机验收；后者的逐项调用、写入后检索与人格自动注入仍未实测。最短操作见《快速上手》§3c「ChatGPT Secure MCP Tunnel」 |
 | **其它聊天端** | ⚠ **未实测、需确认 MCP 支持状态。**各家叫法不一（自定义 Connector／远程 MCP／集成），不能借用 ChatGPT、claude.ai、Grok 三格中任何一格的成色。⚠ **也别默认它跟 grok.com 一样要 OAuth 发现层**——那条当前只有一例，见观察卡 |
 | Kelivo（闭源手机前端） | **实测可接 MCP**：原生 `--http` 直连走通（Kelivo 1.1.17 iOS ／ VPS Ubuntu ＋ Python 3.10.12；判据是端口上蹲的确认为 `python3` 不是 Node、POST 回的是 `application/json`）。⚠ **连不上先看绑定地址，不是协议**：省略 HOST 只绑回环，手机连不到。人格要手工导入 system prompt，容量不是阻塞项 |
 | Operit（闭源手机前端） | **实测当时五个业务工具可用，写回后跨新会话仍能检索命中**（Android 的 proot Ubuntu）。⚠ 它走的是「客户端在手机本机按 stdio 拉起」那条——**不用公网服务器、不用域名证书鉴权，语料根本不离开手机**；**别把闭源手机前端一概读成「必须有服务器」**，那只对拉不起 stdio 的客户端（如 iOS 上的 Kelivo）成立。人格不自动注入，要手工粘贴 |

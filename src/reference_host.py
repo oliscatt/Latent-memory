@@ -179,6 +179,7 @@ def _selftest():
         try:
             assert [t["name"] for t in mcp.tools] == ["latent_search", "latent_session_start",
                                                       "latent_append", "latent_correct",
+                                                      "latent_cleanup",
                                                       "latent_unresolved",
                                                       "latent_thread_close"]
             assert "长期" in mcp.instructions, "instructions 要拿到手——坑①的宿主侧责任"
