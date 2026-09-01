@@ -36,6 +36,8 @@ stdio 只能由宿主拉起（手动 `nohup` 必崩）、懒加载每次调用�
   latent_session_start  → SessionRecall.on_session_start（thread 块 + 召回块 + 自查指令）
   latent_append  → memory_retrieval.append_record（正文层的笔）
   latent_correct → MemoryIndex.retract（+ 可选 append_record 写更正）
+  latent_cleanup → 按稳定 recordId 两阶段清理一条自写记录（先隔离备份）
+  latent_unresolved → UnresolvedStore.apply（显式维护未解决清单）
   latent_thread_close   → session_thread.close_thread + ThreadStore.append
 
 用法：
@@ -53,6 +55,7 @@ stdio 只能由宿主拉起（手动 `nohup` 必崩）、懒加载每次调用�
 
 import argparse
 import errno
+import hashlib
 import hmac
 import http.server
 import io
@@ -84,10 +87,12 @@ from chunking_experiment import chunk_body as _chunk_body, chunk_heading
 from session_recall import SessionRecall, format_recall_block, SELF_CHECK_FOOTER  # noqa: F401
 from session_thread import ThreadStore, close_thread
 from unresolved_state import (FILENAME as UNRESOLVED_FILENAME, UnresolvedRequestError,
-                              UnresolvedStore, UnresolvedStoreError, source_record_ids)
+                              UnresolvedStore, UnresolvedStoreError, source_record_ids,
+                              validate_ops)
 # 记忆所有者的时区（任务卡"写回时区与跨日归窗"）：一个进程一份，stdio 与 HTTP
 # 两种起动形态共用同一个，不各自造一份换算逻辑
-from time_context import TimeContext, detect_local_timezone, tzdb_available
+from time_context import (TimeContext, detect_local_timezone, parse_record_time_marker,
+                          tzdb_available)
 
 PROTOCOL_VERSION = "2025-06-18"   # 官方规格版本，已查证
 SERVER_INFO = {"name": "memory-protocol", "title": "记忆协议", "version": "0.1.0"}
@@ -118,6 +123,9 @@ INSTRUCTIONS = (
     "为了写新项而 correct 旧项。\n"
     "记错了的事也有出口：对方指出某段记忆不对或已经过时，**当场用 latent_correct "
     "撤回旧记录并写上更正**——只口头认错不改库，下次照样检索到错的。\n"
+    "只有在明确要清掉一次误写正文、且手上有 latent_append 返回的 recordId 时，才用 "
+    "latent_cleanup：必须先 preview，向对方展示将移除的记录，再把确认令牌逐字交回 delete；"
+    "不得按相似文字猜记录，不得跳过确认。\n"
     "⚠ 但 latent_correct 撤的是你**逐字摘的那一块**，不是「这件事」：同一说法若还写在"
     "别的记录里，那些不受影响，开场自动浮现（没有 query、按时间和权重排）可能把旧说法"
     "直接端回来。改过重要的事实后，服务端会提醒库里还有几块提到同一说法——按提示用旧"
@@ -209,7 +217,8 @@ TOOLS = [
                        "回执给 recordId 和 pending 状态；之后用同一个 latent_append 只传 "
                        "recordId＋indexEvidence 补索引，不得重复正文。旧 indexSummaries 仅兼容。"
                        "完整写回建议同时给 unresolvedOps；旧客户端省略时正文仍保存，但回执会"
-                       "明确标 not_reviewed。",
+                       "明确标 not_reviewed。想先校验、绝不写盘时传 mode=preflight；通过后省略"
+                       "mode 或改为 write 再调用，写入时仍会重新校验。",
         "annotations": {
             "readOnlyHint": False,
             "destructiveHint": False,
@@ -219,6 +228,8 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
+                "mode": {"type": "string", "enum": ["write", "preflight"],
+                         "description": "可选；默认 write。preflight 只校验并返回预计落点，绝不写盘"},
                 "text": {"type": "string",
                          "description": "发生了什么——具体动作和原话，不是概括"},
                 "current_state": {"type": "string",
@@ -285,6 +296,35 @@ TOOLS = [
         },
     },
     {
+        "name": "latent_cleanup",
+        "title": "精准清理误写记录",
+        "description": "只清理 latent_append 自己写下、且有稳定 recordId 的一条误写正文；"
+                       "同时移出它的关联索引。必须先 action=preview，向对方展示目标，"
+                       "再把返回的 confirmation 逐字用于 action=delete，并填写 reason。"
+                       "删除前会写可恢复隔离副本和审计 manifest。未解决清单仍引用该记录时"
+                       "拒绝删除，须先 latent_unresolved update／close。不得用它模糊匹配、"
+                       "批量删除或清理普通导入语料。",
+        "annotations": {
+            "readOnlyHint": False,
+            "destructiveHint": True,
+            "idempotentHint": False,
+            "openWorldHint": False,
+        },
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["preview", "delete"]},
+                "recordId": {"type": "string",
+                             "description": "latent_append 返回的 16 位小写十六进制标识"},
+                "confirmation": {"type": "string",
+                                 "description": "delete 模式必填：刚才 preview 返回的逐字确认令牌"},
+                "reason": {"type": "string",
+                           "description": "delete 模式必填：为什么清理，写入审计 manifest"},
+            },
+            "required": ["action", "recordId"],
+        },
+    },
+    {
         "name": "latent_unresolved",
         "title": "维护未解决事项",
         "description": "单独新增、更新或关闭当前未解决事项；用于没有正文要写时的明确维护，"
@@ -339,6 +379,50 @@ def _utf8_text_stream(binary, write=False):
 
 class ToolError(Exception):
     """工具执行失败（业务层），按规格回 isError:true 的正常结果，不是协议错误。"""
+
+
+_APPEND_INPUT_EXAMPLES = {
+    "full": (
+        '{"text":"她说下周要去复查"}',
+        '{"text":"她说下周要去复查","current_state":"日期还没定",'
+        '"indexEvidence":[{"type":"event","quote":"她说下周要去复查"}]}'
+    ),
+    "evidence": (
+        '{"indexEvidence":[{"type":"event","quote":"她计划下周复查"}]}',
+        '{"indexEvidence":[{"type":"event","quote":"她说下周要去复查"}]}'
+    ),
+    "summary": (
+        '{"indexSummaries":[{"summary":"只有一行","evidenceTerms":["只有一行"]}]}',
+        '{"indexSummaries":[{"summary":"' + INDEX_SUMMARY_EXAMPLE.replace("\n", "\\n")
+        + '","evidenceTerms":["下次想去看企鹅漫步","凉快的早上","新约定"]}]}'
+    ),
+    "repair": (
+        '{"recordId":"0123","text":"重复正文","indexEvidence":[]}',
+        '{"recordId":"0123456789abcdef","indexEvidence":['
+        '{"type":"event","quote":"她说下周要去复查"}]}'
+    ),
+    "mode": (
+        '{"mode":"dry-run","text":"她说下周要去复查","current_state":"日期还没定"}',
+        '{"mode":"preflight","text":"她说下周要去复查","current_state":"日期还没定"}'
+    ),
+    "unresolved": (
+        '{"unresolvedOps":[]}',
+        '{"unresolvedOps":[{"action":"none"}]}'
+    ),
+    "exclusive": (
+        '{"indexEvidence":[{"type":"event","quote":"原文"}],'
+        '"indexSummaries":[{"summary":"旧摘要","evidenceTerms":["原文"]}]}',
+        '{"indexEvidence":[{"type":"event","quote":"原文"}]}'
+    ),
+}
+
+
+def _append_input_error(message, category="full"):
+    """给模型同类最小反例与正例；所有入口共用，避免错误文案各抄一份。"""
+    if "写错：" in message and "写对：" in message:
+        return message
+    wrong, right = _APPEND_INPUT_EXAMPLES[category]
+    return f"{message}\n写错：{wrong}\n写对：{right}"
 
 
 def _content_char(ch):
@@ -521,6 +605,111 @@ def commit_memory_files(plans, replace_func=os.replace):
             temp.unlink(missing_ok=True)
 
 
+_CLEANUP_PREVIEW_LIMIT = 280
+
+
+def _atomic_write_bytes(path, content, replace_func=os.replace):
+    """同目录写临时文件后替换；清理备份、manifest 与回滚共用。"""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temp = Path(name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        replace_func(temp, path)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def commit_cleanup_changes(changes, fail_after=None, replace_func=os.replace):
+    """原子化执行“改写或删除”集合；任一步失败都恢复调用前字节快照。
+
+    `changes` 是 `{Path: bytes|None}`；None 表示删除。`fail_after` 只给自检注入故障，
+    生产不传。恢复的是全部目标，不只恢复已经走到的那几个——这样调用方不用猜失败落点。
+    """
+    changes = {Path(path): content for path, content in changes.items()}
+    snapshots = {path: (path.read_bytes() if path.exists() else None) for path in changes}
+    applied = 0
+    try:
+        for path, content in changes.items():
+            if content is None:
+                path.unlink(missing_ok=False)
+            else:
+                _atomic_write_bytes(path, content, replace_func=replace_func)
+            applied += 1
+            if fail_after is not None and applied >= int(fail_after):
+                raise OSError(f"故障注入：第 {applied} 个清理目标后失败")
+        return list(changes)
+    except Exception as original:
+        rollback_errors = []
+        for path, before in snapshots.items():
+            try:
+                if before is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    _atomic_write_bytes(path, before)
+            except Exception as rollback:
+                rollback_errors.append(f"{path}：{rollback}")
+        detail = f"；回滚也失败：{' | '.join(rollback_errors)}" if rollback_errors else ""
+        raise OSError(f"清理写入失败：{original}{detail}") from original
+
+
+def _record_section_plan(path, record_id):
+    """按 chunk 哈希把 recordId 反解到唯一 H2 记录节；返回移除计划与该节所有块哈希。"""
+    path = Path(path)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise ValueError(f"原始记录文件无法读取：{path}（{type(exc).__name__}）") from None
+    starts = [match.start() for match in re.finditer(r"(?m)^## ", text)]
+    if not starts:
+        raise ValueError("目标文件没有可清理的 ## 记录节；只支持 latent_append 写下的记录")
+    preamble = text[:starts[0]]
+    candidates = []
+    for number, start in enumerate(starts):
+        end = starts[number + 1] if number + 1 < len(starts) else len(text)
+        section = text[start:end]
+        scoped = preamble + section if number == 0 else section
+        chunks = chunk_heading(scoped)
+        hashes = tuple(_chunk_key(chunk) for chunk in chunks)
+        if record_id in hashes:
+            candidates.append({"start": start, "end": end, "section": section,
+                               "chunks": chunks, "hashes": hashes})
+    if not candidates:
+        raise ValueError("recordId 能在内存索引中看到，但无法反解到原文件的完整记录节；"
+                         "文件可能已被手工修改，请不要猜着删除")
+    if len(candidates) != 1:
+        raise ValueError(f"recordId 在原文件中对应 {len(candidates)} 个记录节，定位不唯一，拒绝删除")
+    target = candidates[0]
+    if parse_record_time_marker(target["section"]) is None:
+        raise ValueError("目标没有 Latent 写回时刻标记；只支持 latent_append 自己写下的记录，"
+                         "普通导入语料请继续用 latent_correct 撤回")
+    remaining = text[:target["start"]] + text[target["end"]:]
+    target["new_bytes"] = remaining.encode("utf-8") \
+        if re.search(r"(?m)^## ", remaining) else None
+    return target
+
+
+def _cleanup_confirmation(record_id, snapshots):
+    digest = hashlib.sha256()
+    digest.update(record_id.encode("ascii"))
+    for path, content in sorted(snapshots.items(), key=lambda row: str(row[0])):
+        digest.update(str(Path(path).resolve()).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(content)
+        digest.update(b"\0")
+    return f"DELETE-{record_id}-{digest.hexdigest()[:16]}"
+
+
+def _cleanup_preview_text(section):
+    text = re.sub(r"<!--\s*写于\s*[^>]+-->", "", section)
+    text = " ".join(text.split())
+    return text if len(text) <= _CLEANUP_PREVIEW_LIMIT else text[:_CLEANUP_PREVIEW_LIMIT] + "…"
+
+
 class MemoryServer:
     """协议层与业务层的接线。持有 index 与 thread store，工具处理器一律薄转发。"""
 
@@ -602,7 +791,7 @@ class MemoryServer:
             self.index.build()
         self.recall.index = self.index
 
-    # ---------- 六个工具：协议接线；未解决的解析与状态变化仍在独立模块 ----------
+    # ---------- 七个工具：协议接线；未解决的解析与状态变化仍在独立模块 ----------
 
     def _tool_memory_search(self, args, now=None):
         query = args.get("query")
@@ -699,7 +888,135 @@ class MemoryServer:
                 "服务器启用了 --require-unresolved-review：本次尚未写盘。请补 "
                 "unresolvedOps；无变化也要传 [{\"action\":\"none\"}]。")
 
+    def _preflight_unresolved(self, args):
+        """只验证未解决操作能否应用；不生成 ID、不调用 apply、不写 sidecar。"""
+        if "unresolvedOps" not in args:
+            if self.require_unresolved_review:
+                raise ToolError(_append_input_error(
+                    "服务器启用了 --require-unresolved-review：预检未通过。请补 unresolvedOps；"
+                    "无变化也要明确传 none。", "unresolved"))
+            return "not_reviewed"
+        try:
+            normalized = validate_ops(args.get("unresolvedOps"))
+            current = self.unresolved_store.read()
+        except UnresolvedRequestError as exc:
+            raise ToolError(_append_input_error(str(exc), "unresolved")) from None
+        except UnresolvedStoreError as exc:
+            raise ToolError(f"未解决清单无法预检：{exc}") from None
+        if normalized == [{"action": "none"}]:
+            return "reviewed"
+        if self.unresolved_store.path is None:
+            raise ToolError("未解决清单无法预检：服务器没有配置未解决清单路径")
+        known = {item.id for item in current}
+        for op in normalized:
+            if op["action"] == "open":
+                continue
+            item_id = op["id"]
+            if item_id not in known:
+                raise ToolError(_append_input_error(
+                    f"没有找到未解决事项 {item_id}", "unresolved"))
+            if op["action"] == "close":
+                known.remove(item_id)
+        return "would_update"
+
+    @staticmethod
+    def _plan_append_indexes(args, body_plan, index_write_dir):
+        """完整写回的索引计划；预检与真写共用，缺证据是合法 pending。"""
+        if args.get("indexEvidence") is not None and args.get("indexSummaries") is not None:
+            raise ValueError("indexEvidence 与旧字段 indexSummaries 只能选一个")
+        if args.get("indexEvidence") is not None:
+            evidence = validate_index_evidence(
+                args.get("indexEvidence"),
+                [args.get("text") or "", args.get("current_state") or ""])
+            summaries = [render_index_evidence(evidence, body_plan["local_date"])]
+            record_id = body_plan["record_id"]
+        elif args.get("indexSummaries") is not None:
+            summaries = validate_index_summaries(
+                args.get("indexSummaries"), args.get("text") or "",
+                args.get("current_state") or "", body_plan["local_date"])
+            record_id = None
+        else:
+            return [], "pending"
+        return (plan_index_records(
+            index_write_dir, summaries, body_plan["window"], body_plan["local_date"],
+            record_id=record_id), "indexed")
+
+    def _tool_memory_append_preflight(self, args, now, index_write_dir, fallback_index):
+        """复用真写计划但停在 commit 前；返回值明确声明零写入。"""
+        record_id_arg = args.get("recordId")
+        if record_id_arg is not None:
+            if args.get("text") is not None or args.get("current_state") is not None:
+                raise ToolError(_append_input_error(
+                    "补索引预检只传 recordId＋indexEvidence；不要重复 text 或 current_state",
+                    "repair"))
+            if not isinstance(record_id_arg, str) or not re.fullmatch(r"[0-9a-f]{16}", record_id_arg):
+                raise ToolError(_append_input_error(
+                    "recordId 必须是此前 latent_append 返回的 16 位小写十六进制标识",
+                    "repair"))
+            if list(index_write_dir.glob(f"*_record_{record_id_arg}_item_*.md")):
+                return (f"预检通过：preflightStatus=ready；recordId={record_id_arg} 已有索引，"
+                        "indexStatus=indexed；本次零写入，无需重复补索引。")
+            matches = [(chunk, meta) for chunk, meta in zip(self.index.chunks, self.index.meta)
+                       if meta.get("layer", "timeline") == "timeline"
+                       and _chunk_key(chunk) == record_id_arg]
+            if len(matches) != 1:
+                reason = "没有找到" if not matches else "找到多条"
+                raise ToolError(_append_input_error(
+                    f"按 recordId={record_id_arg} {reason}原始记录；"
+                    "正文可能被手工改过，请先 latent_search 定位，不要猜着补索引",
+                    "repair"))
+            record_text, record_meta = matches[0]
+            try:
+                evidence = validate_index_evidence(args.get("indexEvidence"), [record_text])
+                local_date = record_meta.get("local_date") or self.time_context.local_date(now)
+                summary = render_index_evidence(evidence, local_date)
+                plans = plan_index_records(
+                    index_write_dir, [summary], record_meta.get("window") or 0,
+                    local_date, record_id=record_id_arg)
+            except ValueError as exc:
+                raise ToolError(_append_input_error(str(exc), "evidence")) from None
+            except OSError as exc:
+                raise ToolError(str(exc)) from None
+            return (f"预检通过：preflightStatus=ready；补索引 recordId={record_id_arg}；"
+                    f"预计写入 {len(plans)} 个索引文件；indexStatus=indexed；本次零写入。")
+
+        try:
+            self._require_unresolved_field(args)
+        except ToolError as exc:
+            raise ToolError(_append_input_error(str(exc), "unresolved")) from None
+        try:
+            body_plan = plan_append_record(
+                self.corpus_dir, args.get("text") or "", args.get("current_state") or "",
+                window=args.get("window"), now=now, time_context=self.time_context)
+        except ValueError as exc:
+            raise ToolError(_append_input_error(str(exc), "full")) from None
+        except OSError as exc:
+            raise ToolError(str(exc)) from None
+        category = "exclusive" if (args.get("indexEvidence") is not None
+                                   and args.get("indexSummaries") is not None) \
+            else ("evidence" if args.get("indexEvidence") is not None else "summary")
+        try:
+            index_plans, index_status = self._plan_append_indexes(
+                args, body_plan, index_write_dir)
+        except ValueError as exc:
+            raise ToolError(_append_input_error(str(exc), category)) from None
+        except OSError as exc:
+            raise ToolError(str(exc)) from None
+        unresolved_status = self._preflight_unresolved(args)
+        pending = ("；写入后需只传 recordId＋indexEvidence 补索引"
+                   if index_status == "pending" else "")
+        hint = (f"；未配置 --index-dir，预计使用兼容路径 {index_write_dir}"
+                if fallback_index else "")
+        return (f"预检通过：preflightStatus=ready；预计写入第 {body_plan['window']} 个窗口"
+                f"（{body_plan['path'].name}），recordId={body_plan['record_id']}；"
+                f"预计索引文件={len(index_plans)}；indexStatus={index_status}{pending}；"
+                f"unresolvedStatus={unresolved_status}{hint}；本次零写入。")
+
     def _tool_memory_append(self, args, now=None):
+        mode = args.get("mode", "write")
+        if mode not in {"write", "preflight"}:
+            raise ToolError(_append_input_error(
+                "mode 只能是 write 或 preflight；省略时默认 write", "mode"))
         if self.corpus_dir is None:
             # 不静默写进内存了事：内存态的"记住了"会随进程一起死，那是
             # "失败得像成功"——宁可让模型看到明确的失败原因
@@ -708,12 +1025,19 @@ class MemoryServer:
         fallback_index = self.index_dir is None
         index_write_dir = Path(self.index_dir) if self.index_dir is not None \
             else Path(self.corpus_dir) / "index"
+        if mode == "preflight":
+            return self._tool_memory_append_preflight(
+                args, now, index_write_dir, fallback_index)
         record_id_arg = args.get("recordId")
         if record_id_arg is not None:
             if args.get("text") is not None or args.get("current_state") is not None:
-                raise ToolError("补索引模式只传 recordId＋indexEvidence；不要重复 text 或 current_state")
+                raise ToolError(_append_input_error(
+                    "补索引模式只传 recordId＋indexEvidence；不要重复 text 或 current_state",
+                    "repair"))
             if not isinstance(record_id_arg, str) or not re.fullmatch(r"[0-9a-f]{16}", record_id_arg):
-                raise ToolError("recordId 必须是此前 latent_append 返回的 16 位小写十六进制标识")
+                raise ToolError(_append_input_error(
+                    "recordId 必须是此前 latent_append 返回的 16 位小写十六进制标识",
+                    "repair"))
             if list(index_write_dir.glob(f"*_record_{record_id_arg}_item_*.md")):
                 return f"recordId={record_id_arg} 已有索引，未重复写入。indexStatus=indexed。"
             matches = [(chunk, meta) for chunk, meta in zip(self.index.chunks, self.index.meta)
@@ -721,8 +1045,10 @@ class MemoryServer:
                        and _chunk_key(chunk) == record_id_arg]
             if len(matches) != 1:
                 reason = "没有找到" if not matches else "找到多条"
-                raise ToolError(f"按 recordId={record_id_arg} {reason}原始记录；"
-                                "正文可能被手工改过，请先 latent_search 定位，不要猜着补索引")
+                raise ToolError(_append_input_error(
+                    f"按 recordId={record_id_arg} {reason}原始记录；"
+                    "正文可能被手工改过，请先 latent_search 定位，不要猜着补索引",
+                    "repair"))
             record_text, record_meta = matches[0]
             try:
                 evidence = validate_index_evidence(args.get("indexEvidence"), [record_text])
@@ -733,8 +1059,11 @@ class MemoryServer:
                     record_meta.get("local_date") or self.time_context.local_date(now),
                     record_id=record_id_arg)
                 paths = commit_memory_files(index_plans)
-            except (ValueError, OSError) as e:
-                raise ToolError(f"原始正文仍在，但索引补写失败：{e}")
+            except ValueError as e:
+                raise ToolError(_append_input_error(
+                    f"原始正文仍在，但索引补写失败：{e}", "evidence")) from None
+            except OSError as e:
+                raise ToolError(f"原始正文仍在，但索引补写失败：{e}") from None
             if self.loader is not None:
                 self._reload_from_disk()
             else:
@@ -745,30 +1074,23 @@ class MemoryServer:
                     "推荐配置独立 --index-dir。") if fallback_index else ""
             return (f"已为 recordId={record_id_arg} 补写 1 条原文证据索引。"
                     f"indexStatus=indexed。{hint}")
-        self._require_unresolved_field(args)
+        try:
+            self._require_unresolved_field(args)
+        except ToolError as exc:
+            raise ToolError(_append_input_error(str(exc), "unresolved")) from None
         try:
             body_plan = plan_append_record(
                 self.corpus_dir, args.get("text") or "", args.get("current_state") or "",
                 window=args.get("window"), now=now, time_context=self.time_context)
-        except (ValueError, OSError) as e:
-            raise ToolError(str(e))
+        except ValueError as e:
+            raise ToolError(_append_input_error(str(e), "full")) from None
+        except OSError as e:
+            raise ToolError(str(e)) from None
         try:
-            if args.get("indexEvidence") is not None and args.get("indexSummaries") is not None:
-                raise ValueError("indexEvidence 与旧字段 indexSummaries 只能选一个")
-            if args.get("indexEvidence") is not None:
-                evidence = validate_index_evidence(
-                    args.get("indexEvidence"),
-                    [args.get("text") or "", args.get("current_state") or ""])
-                summaries = [render_index_evidence(evidence, body_plan["local_date"])]
-            elif args.get("indexSummaries") is None:
+            index_plans, index_status = self._plan_append_indexes(
+                args, body_plan, index_write_dir)
+            if index_status == "pending":
                 raise ValueError("未提供 indexEvidence（旧客户端可继续提供 indexSummaries）")
-            else:
-                summaries = validate_index_summaries(
-                    args.get("indexSummaries"), args.get("text") or "",
-                    args.get("current_state") or "", body_plan["local_date"])
-            index_plans = plan_index_records(
-                index_write_dir, summaries, body_plan["window"], body_plan["local_date"],
-                record_id=(body_plan["record_id"] if args.get("indexEvidence") is not None else None))
             paths = commit_memory_files([body_plan] + index_plans)
         except (ValueError, OSError) as e:
             # 索引摘要是检索辅助，不是原始事实。结构或锚点失败时仍保留正文与当下状态，
@@ -870,6 +1192,173 @@ class MemoryServer:
             self.index.save_retractions(self.retractions_path)
         return msg
 
+    def _cleanup_plan(self, record_id):
+        """把稳定 recordId 收敛成一份精确、可复算的删除计划；这里只读。"""
+        if self.corpus_dir is None:
+            raise ToolError("服务器没有配置可写的语料目录（--corpus），不能清理记录")
+        if not isinstance(record_id, str) or not re.fullmatch(r"[0-9a-f]{16}", record_id):
+            raise ToolError("recordId 必须是 latent_append 返回的 16 位小写十六进制标识")
+
+        matches = [(chunk, meta) for chunk, meta in zip(self.index.chunks, self.index.meta)
+                   if meta.get("layer", "timeline") == "timeline"
+                   and _chunk_key(chunk) == record_id]
+        if len(matches) != 1:
+            reason = "没有找到" if not matches else f"找到 {len(matches)} 条"
+            raise ToolError(f"按 recordId={record_id} {reason}原始记录；"
+                            "记录可能已清理或被手工修改，请重新检索，不要猜着删除")
+
+        _, record_meta = matches[0]
+        timeline_root = (Path(self.corpus_dir) / "timeline").resolve()
+        source = (timeline_root / str(record_meta.get("source") or "")).resolve()
+        try:
+            source.relative_to(timeline_root)
+        except ValueError:
+            raise ToolError("recordId 指向的来源不在 timeline 目录，拒绝清理") from None
+        if not source.is_file():
+            raise ToolError(f"recordId 的原始记录文件不存在：{source.name}")
+        try:
+            section_plan = _record_section_plan(source, record_id)
+        except ValueError as exc:
+            raise ToolError(str(exc)) from None
+
+        index_root = Path(self.index_dir) if self.index_dir is not None \
+            else Path(self.corpus_dir) / "index"
+        linked_index = sorted(index_root.glob(f"*_record_{record_id}_item_*.md")) \
+            if index_root.is_dir() else []
+        unresolved_items = self.unresolved_store.read()
+        blocker_ids = [item.id for item in unresolved_items
+                       if record_id in source_record_ids([item])]
+
+        removed_hashes = set(section_plan["hashes"])
+        for path in linked_index:
+            try:
+                removed_hashes.update(_chunk_key(chunk) for chunk in chunk_heading(
+                    path.read_text(encoding="utf-8")))
+            except (OSError, UnicodeError) as exc:
+                raise ToolError(f"关联索引无法读取：{path.name}（{type(exc).__name__}）") from None
+
+        changes = {source: section_plan["new_bytes"]}
+        changes.update({path: None for path in linked_index})
+        for sidecar in (self.weights_path, self.retractions_path, self.entities_path):
+            if sidecar is None:
+                continue
+            path = Path(sidecar)
+            if not path.exists():
+                continue
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                raise ToolError(f"清理前无法读取 {path.name}（{type(exc).__name__}），拒绝改盘") from None
+            if not isinstance(data, dict):
+                raise ToolError(f"清理前发现 {path.name} 不是对象结构，拒绝改盘")
+            pruned = {key: value for key, value in data.items() if key not in removed_hashes}
+            if len(pruned) != len(data):
+                changes[path] = (json.dumps(pruned, ensure_ascii=False, indent=1) + "\n").encode("utf-8")
+
+        snapshots = {}
+        for path in changes:
+            try:
+                snapshots[path] = path.read_bytes()
+            except OSError as exc:
+                raise ToolError(f"清理前无法读取 {path.name}（{type(exc).__name__}），拒绝改盘") from None
+        return {
+            "record_id": record_id,
+            "source": source,
+            "section": section_plan["section"],
+            "linked_index": linked_index,
+            "blocker_ids": blocker_ids,
+            "changes": changes,
+            "snapshots": snapshots,
+            "confirmation": _cleanup_confirmation(record_id, snapshots),
+        }
+
+    def _write_cleanup_backup(self, plan, reason, now=None):
+        """先把本次会改动的全部原始字节移入隐藏隔离区，再允许碰活动文件。"""
+        now = time.time() if now is None else now
+        stamp = datetime.fromtimestamp(now, _dt_tz.utc).strftime("%Y%m%dT%H%M%SZ")
+        root = Path(self.corpus_dir) / ".cleanup-trash"
+        backup_dir = root / f"{plan['record_id']}-{stamp}"
+        suffix = 1
+        while backup_dir.exists():
+            backup_dir = root / f"{plan['record_id']}-{stamp}-{suffix:02d}"
+            suffix += 1
+        backup_dir.mkdir(parents=True, exist_ok=False)
+        entries = []
+        try:
+            corpus_root = Path(self.corpus_dir).resolve()
+            for number, (path, content) in enumerate(
+                    sorted(plan["snapshots"].items(), key=lambda row: str(row[0])), 1):
+                backup_name = f"{number:02d}-{Path(path).name}.bak"
+                _atomic_write_bytes(backup_dir / backup_name, content)
+                resolved = Path(path).resolve()
+                try:
+                    original = str(resolved.relative_to(corpus_root)).replace("\\", "/")
+                except ValueError:
+                    original = str(resolved)
+                entries.append({
+                    "original": original,
+                    "backup": backup_name,
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                })
+            manifest = {
+                "recordId": plan["record_id"],
+                "reason": reason,
+                "deletedAtUtc": datetime.fromtimestamp(now, _dt_tz.utc).isoformat(),
+                "entries": entries,
+            }
+            _atomic_write_bytes(
+                backup_dir / "manifest.json",
+                (json.dumps(manifest, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
+        except Exception as exc:
+            raise ToolError(f"隔离备份写入失败，活动文件尚未改动：{type(exc).__name__}") from None
+        return backup_dir
+
+    def _tool_memory_cleanup(self, args, now=None):
+        action = args.get("action")
+        if action not in {"preview", "delete"}:
+            raise ToolError("action 只能是 preview 或 delete")
+        plan = self._cleanup_plan(args.get("recordId"))
+        blockers = "、".join(plan["blocker_ids"])
+        if action == "preview":
+            blocker_note = (f"；当前被未解决事项引用：{blockers}，关闭或改写引用前不能删除"
+                            if blockers else "；未发现未解决事项引用")
+            return (f"清理预览：recordId={plan['record_id']}；来源={plan['source'].name}；"
+                    f"关联索引={len(plan['linked_index'])} 个{blocker_note}。\n"
+                    f"目标内容：{_cleanup_preview_text(plan['section'])}\n"
+                    f"确认令牌：{plan['confirmation']}\n"
+                    "确认目标无误后，再用 action=delete、同一 recordId、逐字 confirmation 和 reason。")
+
+        confirmation = args.get("confirmation")
+        reason = args.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ToolError("delete 模式 reason 必填：说明为什么清理，供审计追溯")
+        if not isinstance(confirmation, str) or confirmation != plan["confirmation"]:
+            raise ToolError("confirmation 不匹配：文件或关联状态可能已变化。请重新 preview，"
+                            "不要沿用旧令牌或猜令牌")
+        if plan["blocker_ids"]:
+            raise ToolError(f"记录仍被未解决事项引用（{blockers}）；请先用 latent_unresolved "
+                            "update／close，再重新 preview")
+
+        backup_dir = self._write_cleanup_backup(plan, reason.strip(), now=now)
+        try:
+            changed = commit_cleanup_changes(plan["changes"])
+        except OSError as exc:
+            raise ToolError(f"清理失败，活动文件已尝试回滚；隔离备份保留在 {backup_dir}。{exc}") from None
+        if self.loader is not None:
+            self._reload_from_disk()
+        else:
+            self.index = load_corpus(self.source_dirs).build()
+            if self.retractions_path is not None:
+                self.index.load_retractions(self.retractions_path)
+            if self.weights_path is not None:
+                self.index.load_weights(self.weights_path)
+            if self.entities_path is not None and self.index.load_entities(self.entities_path):
+                self.index.build()
+            self.recall.index = self.index
+        self.written_paths.update(str(path) for path in changed)
+        return (f"已精准清理 recordId={plan['record_id']}：正文记录 1 条、关联索引 "
+                f"{len(plan['linked_index'])} 个；隔离备份与审计 manifest 位于 {backup_dir}。")
+
     def _tool_thread_close(self, args, now=None):
         self._require_unresolved_field(args)
         now = time.time() if now is None else now
@@ -909,6 +1398,7 @@ class MemoryServer:
             "latent_session_start": self._tool_session_start,
             "latent_append": self._tool_memory_append,
             "latent_correct": self._tool_memory_correct,
+            "latent_cleanup": self._tool_memory_cleanup,
             "latent_unresolved": self._tool_unresolved,
             "latent_thread_close": self._tool_thread_close,
         }
@@ -1562,9 +2052,14 @@ def make_http_server(server, host="127.0.0.1", port=8765, token=None,
                     # 顺带：只读请求（latent_search 是绝大多数）written_paths 是空的，
                     # 这里整个跳过，不再每个请求 stat 全库两遍
                     base = {p: (m, s) for p, m, s in state["sig"]}
-                    for p, m, s in _corpus_signature(server.source_dirs):
-                        if p in server.written_paths:
-                            base[p] = (m, s)
+                    current = {p: (m, s) for p, m, s in _corpus_signature(server.source_dirs)}
+                    for path in server.written_paths:
+                        if path in current:
+                            base[path] = current[path]
+                        else:
+                            # latent_cleanup 会删除活动文件；旧基线也得去掉该路径，
+                            # 否则下一次请求会把自己的删除误判成外部变化、多重读一遍。
+                            base.pop(path, None)
                     state["sig"] = tuple(sorted((p, m, s) for p, (m, s) in base.items()))
                     server.written_paths = set()
             if resp is None:
@@ -2458,10 +2953,11 @@ def _selftest():
     assert srv.handle({"jsonrpc": "2.0", "method": "notifications/initialized"}) is None, \
         "initialized 是通知，回响应会让客户端收到一条没人等的野生响应"
 
-    # 2. tools/list：六个工具，schema 字段名照规格（name/inputSchema）
+    # 2. tools/list：七个工具，schema 字段名照规格（name/inputSchema）
     tools = srv.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})["result"]["tools"]
     assert [t["name"] for t in tools] == ["latent_search", "latent_session_start",
                                           "latent_append", "latent_correct",
+                                          "latent_cleanup",
                                           "latent_unresolved",
                                           "latent_thread_close"]
     for t in tools:
@@ -2480,29 +2976,38 @@ def _selftest():
                           "idempotentHint": False, "openWorldHint": False},
         "latent_correct": {"readOnlyHint": False, "destructiveHint": True,
                            "idempotentHint": False, "openWorldHint": False},
+        "latent_cleanup": {"readOnlyHint": False, "destructiveHint": True,
+                           "idempotentHint": False, "openWorldHint": False},
         "latent_unresolved": {"readOnlyHint": False, "destructiveHint": True,
                               "idempotentHint": False, "openWorldHint": False},
         "latent_thread_close": {"readOnlyHint": False, "destructiveHint": False,
                                 "idempotentHint": False, "openWorldHint": False},
     }
     assert {t["name"]: t.get("annotations") for t in tools} == expected_annotations, \
-        "六个工具的 annotations 必须按真实副作用逐项声明"
-    assert tools[5]["inputSchema"]["required"] == ["window", "current_state"], "当下状态必填要写进 schema"
+        "七个工具的 annotations 必须按真实副作用逐项声明"
+    assert tools[6]["inputSchema"]["required"] == ["window", "current_state"], "当下状态必填要写进 schema"
     assert tools[3]["inputSchema"]["required"] == ["quote", "reason"], \
         "更正工具必填 quote+reason——没有原因的撤回不可追溯"
     append_tool = tools[2]
     append_schema = append_tool["inputSchema"]
-    append_fields = {"text", "current_state", "window", "recordId", "indexEvidence",
+    append_fields = {"mode", "text", "current_state", "window", "recordId", "indexEvidence",
                      "unresolvedOps"}
     root_combinators = {"anyOf", "oneOf", "allOf"}
     assert append_schema["type"] == "object" \
         and append_fields <= set(append_schema["properties"]) \
         and not root_combinators.intersection(append_schema), \
-        "latent_append 必须发布无根级组合器的平面对象 schema，并保留六个现行字段"
+        "latent_append 必须发布无根级组合器的平面对象 schema，并保留现行字段与可选预检模式"
+    assert append_schema["properties"]["mode"]["enum"] == ["write", "preflight"] \
+        and "mode=preflight" in append_tool["description"] \
+        and append_tool["annotations"]["readOnlyHint"] is False, \
+        "预检必须留在现有写工具的平面 schema；工具整体不能冒充只读"
     assert "unresolvedOps" not in append_schema.get("required", []), \
         "兼容模式下 unresolvedOps 不得成为 latent_append 的 schema 必填字段"
-    assert "unresolvedOps" in tools[5]["inputSchema"]["properties"] \
-        and "unresolvedOps" not in tools[5]["inputSchema"].get("required", []), \
+    assert tools[4]["inputSchema"]["required"] == ["action", "recordId"] \
+        and tools[4]["annotations"]["destructiveHint"] is True, \
+        "latent_cleanup 必须暴露两阶段精确清理 schema，并明确标为破坏性工具"
+    assert "unresolvedOps" in tools[6]["inputSchema"]["properties"] \
+        and "unresolvedOps" not in tools[6]["inputSchema"].get("required", []), \
         "latent_thread_close 也要暴露可选 unresolvedOps，不能截断旧客户端"
 
     # 2b.【Kelivo PC schema 兼容】复刻 Kelivo
@@ -2996,6 +3501,278 @@ def _selftest():
                               fallback_root9.glob(f"*_record_{pending_id.group(1)}_item_*.md")}
         assert repeated_repair["isError"] is False and "已有索引" in repeated_repair["content"][0]["text"]
         assert index_after_repeat == index_before_repeat, "重复补索引必须幂等，不能追加第二份"
+
+    # 9a.【latent_append 预检与可修复报错】判据与采集条件：Windows 11、Python
+    #     3.12.10、main@29a1b094 起分支、stdlib only。通过＝预检复用真写计划，
+    #     timeline/index/未解决 sidecar/内存索引/written_paths 零变化；参数错误同时给
+    #     写错与写对；把预检误接 commit 或 unresolved apply 时本段立即红。
+    with tempfile.TemporaryDirectory() as td:
+        root9a = _P(td)
+        corpus9a, index9a = root9a / "corpus", root9a / "index"
+        corpus9a.mkdir()
+        index9a.mkdir()
+        source_dirs9a, loader9a = make_corpus_loader(corpus9a, index9a)
+        s9a = MemoryServer(
+            index=loader9a(), thread_store=ThreadStore(), corpus_dir=corpus9a,
+            index_dir=index9a, source_dirs=source_dirs9a, loader=loader9a)
+
+        def snapshot9a():
+            return {p.relative_to(root9a): p.read_bytes()
+                    for p in root9a.rglob("*") if p.is_file()}
+
+        before_files9a = snapshot9a()
+        before_chunks9a = list(s9a.index.chunks)
+        before_meta9a = [dict(row) for row in s9a.index.meta]
+        before_written9a = set(s9a.written_paths)
+        original_commit9a = globals()["commit_memory_files"]
+        original_apply9a = s9a.unresolved_store.apply
+
+        def forbidden_commit9a(*_args, **_kwargs):
+            raise AssertionError("预检误调用 commit_memory_files")
+
+        def forbidden_apply9a(*_args, **_kwargs):
+            raise AssertionError("预检误调用 UnresolvedStore.apply")
+
+        globals()["commit_memory_files"] = forbidden_commit9a
+        s9a.unresolved_store.apply = forbidden_apply9a
+        indexed_args9a = {
+            "mode": "preflight",
+            "text": "她说下周要去复查。",
+            "current_state": "日期还没定。",
+            "indexEvidence": [
+                {"type": "event", "quote": "她说下周要去复查"},
+                {"type": "state", "quote": "日期还没定"},
+            ],
+            "unresolvedOps": [{"action": "none"}],
+        }
+        try:
+            ready9a = call(s9a, "latent_append", indexed_args9a, now)
+        finally:
+            globals()["commit_memory_files"] = original_commit9a
+            s9a.unresolved_store.apply = original_apply9a
+        ready_text9a = ready9a["content"][0]["text"]
+        assert ready9a["isError"] is False and "preflightStatus=ready" in ready_text9a \
+            and "indexStatus=indexed" in ready_text9a and "本次零写入" in ready_text9a
+        ready_id9a = re.search(r"recordId=([0-9a-f]{16})", ready_text9a).group(1)
+        assert snapshot9a() == before_files9a \
+            and s9a.index.chunks == before_chunks9a and s9a.index.meta == before_meta9a \
+            and s9a.written_paths == before_written9a, \
+            "预检必须连临时文件、未解决清单、内存索引与 written_paths 都不改"
+
+        write_args9a = dict(indexed_args9a)
+        write_args9a.pop("mode")
+        written9a = call(s9a, "latent_append", write_args9a, now)
+        assert written9a["isError"] is False and f"recordId={ready_id9a}" in written9a["content"][0]["text"], \
+            "同参数的预检与真写必须共用计划，预计 recordId 不能漂"
+
+        pending_args9a = {
+            "mode": "preflight", "text": "她改约到星期五。",
+            "current_state": "对方还没回复。", "unresolvedOps": [{"action": "none"}],
+        }
+        before_pending_preflight9a = snapshot9a()
+        pending_preview9a = call(s9a, "latent_append", pending_args9a, now + 1)
+        assert pending_preview9a["isError"] is False \
+            and "indexStatus=pending" in pending_preview9a["content"][0]["text"] \
+            and "补索引" in pending_preview9a["content"][0]["text"]
+        assert snapshot9a() == before_pending_preflight9a, "pending 预检也必须零写入"
+        pending_write_args9a = dict(pending_args9a)
+        pending_write_args9a.pop("mode")
+        pending_written9a = call(s9a, "latent_append", pending_write_args9a, now + 1)
+        pending_id9a = re.search(
+            r"recordId=([0-9a-f]{16})", pending_written9a["content"][0]["text"]).group(1)
+
+        repair_args9a = {
+            "mode": "preflight", "recordId": pending_id9a,
+            "indexEvidence": [{"type": "event", "quote": "她改约到星期五"}],
+        }
+        before_repair_preflight9a = snapshot9a()
+        repair_preview9a = call(s9a, "latent_append", repair_args9a, now + 1)
+        assert repair_preview9a["isError"] is False \
+            and "补索引" in repair_preview9a["content"][0]["text"] \
+            and "preflightStatus=ready" in repair_preview9a["content"][0]["text"]
+        assert snapshot9a() == before_repair_preflight9a, "补索引预检不得写 index"
+        unknown_preview9a = call(s9a, "latent_append", {
+            "mode": "preflight", "recordId": "0000000000000000",
+            "indexEvidence": [{"type": "event", "quote": "不存在"}]}, now + 1)
+        assert unknown_preview9a["isError"] is True \
+            and all(label in unknown_preview9a["content"][0]["text"]
+                    for label in ("没有找到", "写错：", "写对："))
+        repair_write_args9a = dict(repair_args9a)
+        repair_write_args9a.pop("mode")
+        assert call(s9a, "latent_append", repair_write_args9a, now + 1)["isError"] is False
+        indexed_preview9a = call(s9a, "latent_append", repair_args9a, now + 1)
+        assert indexed_preview9a["isError"] is False \
+            and "已有索引" in indexed_preview9a["content"][0]["text"] \
+            and "无需重复" in indexed_preview9a["content"][0]["text"]
+
+        bad_calls9a = [
+            {"mode": "preflight", "text": "缺状态"},
+            {"mode": "preflight", "text": "她说下周要去复查。",
+             "current_state": "日期还没定。",
+             "indexEvidence": [{"type": "event", "quote": "她计划下周复查"}]},
+            {"mode": "preflight", "text": "只有一行", "current_state": "仍在处理",
+             "indexSummaries": [{"summary": "只有一行", "evidenceTerms": ["只有一行"]}]},
+            {"mode": "preflight", "text": "原文", "current_state": "有效",
+             "indexEvidence": [{"type": "event", "quote": "原文"}],
+             "indexSummaries": [{"summary": "旧摘要", "evidenceTerms": ["原文"]}]},
+        ]
+        before_bad_calls9a = snapshot9a()
+        for bad_args9a in bad_calls9a:
+            bad_result9a = call(s9a, "latent_append", bad_args9a, now + 2)
+            bad_text9a = bad_result9a["content"][0]["text"]
+            assert bad_result9a["isError"] is True \
+                and "写错：" in bad_text9a and "写对：" in bad_text9a, bad_text9a
+        strict9a = MemoryServer(
+            index=loader9a(), thread_store=ThreadStore(), corpus_dir=corpus9a,
+            index_dir=index9a, source_dirs=source_dirs9a, loader=loader9a,
+            require_unresolved_review=True)
+        strict_bad9a = call(strict9a, "latent_append", {
+            "mode": "preflight", "text": "严格模式", "current_state": "待复核"}, now + 2)
+        assert strict_bad9a["isError"] is True \
+            and all(label in strict_bad9a["content"][0]["text"]
+                    for label in ("unresolvedOps", "写错：", "写对："))
+        assert snapshot9a() == before_bad_calls9a, "所有参数错误都必须在零写入状态返回"
+
+    # 9b.【工具级精准清理】判据与采集条件：stdlib 服务端、临时双层语料，先用当前
+    #     latent_append 在同一窗口写两条（目标有 recordId 关联索引、相邻记录保留），
+    #     再覆盖 preview 零写入、旧令牌失效、未解决引用阻断、sidecar 去键、隔离备份
+    #     不回灌，以及无索引 pending 记录也能按 ID 精确清理。通过＝每条断言均成立。
+    with tempfile.TemporaryDirectory() as td:
+        corpus9b = _P(td) / "corpus"
+        index9b = _P(td) / "index"
+        corpus9b.mkdir()
+        index9b.mkdir()
+        source_dirs9b, loader9b = make_corpus_loader(corpus9b, index9b)
+        weights9b = corpus9b / ".weights.json"
+        retractions9b = corpus9b / ".retractions.json"
+        entities9b = corpus9b / ".entities.json"
+        s9b = MemoryServer(
+            index=loader9b(), thread_store=ThreadStore(), corpus_dir=corpus9b,
+            index_dir=index9b, source_dirs=source_dirs9b, loader=loader9b,
+            weights_path=weights9b, retractions_path=retractions9b,
+            entities_path=entities9b)
+        first9b = call(s9b, "latent_append", {
+            "text": "误写：把蓝色雨伞记成了绿色雨伞。", "current_state": "刚写入，等待核对。",
+            "indexEvidence": [
+                {"type": "event", "quote": "把蓝色雨伞记成了绿色雨伞"},
+                {"type": "state", "quote": "刚写入，等待核对"},
+            ]}, now)
+        second9b = call(s9b, "latent_append", {
+            "text": "相邻正确记录：门票放在书桌抽屉。", "current_state": "仍然有效。",
+            "indexEvidence": [
+                {"type": "event", "quote": "门票放在书桌抽屉"},
+                {"type": "state", "quote": "仍然有效"},
+            ]}, now + 1)
+        rid9b = re.search(r"recordId=([0-9a-f]{16})", first9b["content"][0]["text"]).group(1)
+        keep9b = re.search(r"recordId=([0-9a-f]{16})", second9b["content"][0]["text"]).group(1)
+        target_path9b = next((corpus9b / "timeline").glob("*.md"))
+        target_section9b = _record_section_plan(target_path9b, rid9b)
+        target_hash9b = next(iter(target_section9b["hashes"]))
+        weights9b.write_text(json.dumps({target_hash9b: 2.5}, ensure_ascii=False), encoding="utf-8")
+        retractions9b.write_text(json.dumps({target_hash9b: {"reason": "测试"}}, ensure_ascii=False),
+                                 encoding="utf-8")
+        entities9b.write_text(json.dumps({target_hash9b: ["雨伞"]}, ensure_ascii=False),
+                              encoding="utf-8")
+
+        before_preview9b = {p.relative_to(td): p.read_bytes()
+                            for p in _P(td).rglob("*") if p.is_file()}
+        preview9b = call(s9b, "latent_cleanup", {"action": "preview", "recordId": rid9b}, now)
+        after_preview9b = {p.relative_to(td): p.read_bytes()
+                           for p in _P(td).rglob("*") if p.is_file()}
+        assert preview9b["isError"] is False and "绿色雨伞" in preview9b["content"][0]["text"]
+        assert before_preview9b == after_preview9b, "preview 必须纯读，连隔离目录都不能提前创建"
+        token9b = re.search(r"确认令牌：(DELETE-[0-9a-f]{16}-[0-9a-f]{16})",
+                            preview9b["content"][0]["text"]).group(1)
+        wrong_token9b = call(s9b, "latent_cleanup", {
+            "action": "delete", "recordId": rid9b, "confirmation": "DELETE-wrong",
+            "reason": "清理误写"}, now)
+        unknown9b = call(s9b, "latent_cleanup", {
+            "action": "preview", "recordId": "0000000000000000"}, now)
+        assert wrong_token9b["isError"] is True and "confirmation 不匹配" in wrong_token9b["content"][0]["text"] \
+            and unknown9b["isError"] is True and "没有找到" in unknown9b["content"][0]["text"], \
+            "错误确认令牌与未知 recordId 都必须明确失败"
+        assert not (corpus9b / ".cleanup-trash").exists(), \
+            "确认失败不得提前创建隔离目录或改动活动文件"
+        no_reason9b = call(s9b, "latent_cleanup", {
+            "action": "delete", "recordId": rid9b, "confirmation": token9b}, now)
+        assert no_reason9b["isError"] is True and "reason 必填" in no_reason9b["content"][0]["text"]
+
+        # 外部手工改动发生在 preview 与 delete 之间：即使改的只是文件尾，旧令牌也失效。
+        timeline_before_touch9b = target_path9b.read_bytes()
+        target_path9b.write_bytes(timeline_before_touch9b + b"\n")
+        stale9b = call(s9b, "latent_cleanup", {
+            "action": "delete", "recordId": rid9b, "confirmation": token9b,
+            "reason": "清理误写"}, now)
+        assert stale9b["isError"] is True and "重新 preview" in stale9b["content"][0]["text"], \
+            "preview 后文件变化必须令旧 confirmation 失效"
+        target_path9b.write_bytes(timeline_before_touch9b)
+
+        _, opened9b = s9b.unresolved_store.apply(
+            [{"action": "open", "summary": "先确认雨伞颜色"}],
+            f"timeline/{target_path9b.name}#record={rid9b}")
+        blocked_preview9b = call(s9b, "latent_cleanup",
+                                 {"action": "preview", "recordId": rid9b}, now)
+        blocked_token9b = re.search(r"确认令牌：(DELETE-[0-9a-f]{16}-[0-9a-f]{16})",
+                                    blocked_preview9b["content"][0]["text"]).group(1)
+        blocked9b = call(s9b, "latent_cleanup", {
+            "action": "delete", "recordId": rid9b, "confirmation": blocked_token9b,
+            "reason": "清理误写"}, now)
+        assert blocked9b["isError"] is True and opened9b[0] in blocked9b["content"][0]["text"], \
+            "未解决事项仍引用 recordId 时必须点名阻断，不能自动关单"
+        s9b.unresolved_store.apply([{"action": "close", "id": opened9b[0]}], "manual")
+        ready9b = call(s9b, "latent_cleanup", {"action": "preview", "recordId": rid9b}, now)
+        ready_token9b = re.search(r"确认令牌：(DELETE-[0-9a-f]{16}-[0-9a-f]{16})",
+                                  ready9b["content"][0]["text"]).group(1)
+        deleted9b = call(s9b, "latent_cleanup", {
+            "action": "delete", "recordId": rid9b, "confirmation": ready_token9b,
+            "reason": "颜色属于误写"}, now)
+        assert deleted9b["isError"] is False, deleted9b
+        active_text9b = target_path9b.read_text(encoding="utf-8")
+        assert "绿色雨伞" not in active_text9b and "门票放在书桌抽屉" in active_text9b, \
+            "只移除目标 H2 记录节，相邻记录必须逐字保留"
+        assert not list(index9b.glob(f"*_record_{rid9b}_item_*.md")) \
+            and list(index9b.glob(f"*_record_{keep9b}_item_*.md")), \
+            "只移除目标 recordId 的关联索引"
+        for sidecar9b in (weights9b, retractions9b, entities9b):
+            assert target_hash9b not in json.loads(sidecar9b.read_text(encoding="utf-8")), \
+                f"{sidecar9b.name} 必须同步去掉被清记录的内容哈希"
+        trash9b = corpus9b / ".cleanup-trash"
+        backup_dirs9b = [p for p in trash9b.iterdir() if p.is_dir()]
+        assert len(backup_dirs9b) == 1 and (backup_dirs9b[0] / "manifest.json").is_file()
+        assert list(backup_dirs9b[0].glob("*.bak")) and not list(backup_dirs9b[0].glob("*.md")), \
+            "隔离副本必须可恢复，但扩展名不能被 Markdown 语料扫描器重新载入"
+        reloaded9b = load_corpus(source_dirs9b)
+        assert all("绿色雨伞" not in chunk for chunk in reloaded9b.chunks) \
+            and any("门票放在书桌抽屉" in chunk for chunk in reloaded9b.chunks), \
+            "重载后误写不能从隔离备份回灌，相邻正确记录仍可检索"
+
+        pending9b = call(s9b, "latent_append", {
+            "text": "另一条误写：会议被记到了星期二。", "current_state": "等待清理。"}, now + 2)
+        pending_rid9b = re.search(r"recordId=([0-9a-f]{16})", pending9b["content"][0]["text"]).group(1)
+        assert "indexStatus=pending" in pending9b["content"][0]["text"] \
+            and not list(index9b.glob(f"*_record_{pending_rid9b}_item_*.md"))
+        pending_preview9b = call(s9b, "latent_cleanup", {
+            "action": "preview", "recordId": pending_rid9b}, now + 2)
+        pending_token9b = re.search(r"确认令牌：(DELETE-[0-9a-f]{16}-[0-9a-f]{16})",
+                                    pending_preview9b["content"][0]["text"]).group(1)
+        pending_delete9b = call(s9b, "latent_cleanup", {
+            "action": "delete", "recordId": pending_rid9b, "confirmation": pending_token9b,
+            "reason": "星期写错"}, now + 2)
+        assert pending_delete9b["isError"] is False and "关联索引 0 个" in pending_delete9b["content"][0]["text"], \
+            "没有索引的 pending 正文也必须能按稳定 recordId 清理"
+
+    with tempfile.TemporaryDirectory() as td:
+        rollback_a9b, rollback_b9b = _P(td) / "a.md", _P(td) / "b.md"
+        rollback_a9b.write_bytes(b"A-before")
+        rollback_b9b.write_bytes(b"B-before")
+        try:
+            commit_cleanup_changes({rollback_a9b: None, rollback_b9b: None}, fail_after=1)
+            assert False, "故障注入必须触发"
+        except OSError:
+            pass
+        assert rollback_a9b.read_bytes() == b"A-before" \
+            and rollback_b9b.read_bytes() == b"B-before", \
+            "多目标清理中途失败必须恢复全部调用前字节"
 
     # 10.【变异靶心：用进撑过重启】权重持久化接线——同一份语料+权重文件，
     #     新起一个 server（模拟客户端重启 stdio 进程），命中过的块权重仍在
@@ -4520,7 +5297,9 @@ def _selftest():
 
     print("selftest ok（24项断言：握手 / 工具表 / 调用往返 / 薄适配层 / 错误分层（含 "
           "session_start 读取异常只重试一次、未预料异常不空断、写工具不重放）/ "
-          "完整链路 / stdio / UTF-8 / 写回当场可查 / 用进撑过重启 / "
+          "完整链路 / stdio / UTF-8 / 写回当场可查 / 写回预检（零写入、补索引预检、"
+          "参数错误写错／写对对照）/ 精准清理（两阶段确认、引用阻断、"
+          "隔离备份不回灌、sidecar 同步与故障回滚）/ 用进撑过重启 / "
           "无可靠命中明确说 / 撤回更正闭环 / 撤回粒度提醒（块级撤回、事实跨块：命中多块"
           "给总数＋最近定位、0 命中不冒提示且变异去 exclude 转红、只提示不自动撤）/ "
           "缺失率标注接线 / 实体标注接线 / "

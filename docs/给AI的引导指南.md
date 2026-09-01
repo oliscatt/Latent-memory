@@ -197,7 +197,7 @@ tunnel-client 主动建立出站 HTTPS，把 ChatGPT 请求转给 `127.0.0.1` �
 tunnel ID 与运行时 key 只从 OpenAI Platform 原始页面取，**不写入仓库或聊天记录**。
 
 基于 Latent 的独立 State Ledger 部署已由 ChatGPT Work 新窗口通过 Connector
-成功调用 `state_session_start` 并读取跨窗接力便签，因此可以说“ChatGPT Secure MCP Tunnel 已有真机读链路记录”。⚠ 该记录使用 `state_*`，不等于本项目 `latent_*` 六工具全量验收：逐个工具调用、`latent_append` 写入后的跨窗 `latent_search` 命中，以及人格自动注入仍无证据，不能借本次结果补齐。
+成功调用 `state_session_start` 并读取跨窗接力便签，因此可以说“ChatGPT Secure MCP Tunnel 已有真机读链路记录”。⚠ 该记录使用 `state_*`，不等于本项目 `latent_*` 七工具全量验收：逐个工具调用、`latent_append` 写入后的跨窗 `latent_search` 命中，以及人格自动注入仍无证据，不能借本次结果补齐。
 
 #### 其它 AI 聊天端 → **未实测、需确认 MCP 支持状态**
 
@@ -750,6 +750,9 @@ python <src路径>/mcp_server.py --doctor --corpus <TA的叙事语料目录> --i
 2. **人格文件是 TA 的**，随时可以自己改。改重了、改具体了都好——它一开始比较短是正常的，东西是慢慢长出来的。
    ⚠ **只有一处要提醒**：改的时候别删 `##` 标题行。归节靠标题做锚点，删一行标题会让那一节的正文顺延塌进上一节。真删了也不会没声——下次 `--step inspect` 会摊开「上次 N 块 → 这次 M 块」的差异表，整节塌空直接拦下（见第 1 步）。⚠ **但这只在「已经跑过一次、有基线可比」时成立**：第一次跑就删错、或产出目录被删掉重来，都没有上一次可比，照旧静默（同见第 1 步那条边界）。
 3. **新增记忆正文必达，索引必须闭环**。`latent_append` 交付正文、当下状态和 `indexEvidence[{type,quote}]`；quote 只摘原文，type 取 event／feeling／reason／state／context。服务端统一渲染索引，不再让模型猜日期、粗体和两行四段。证据不合格时正文照常写进 timeline，回执给 `recordId` 与 `indexStatus=pending`；之后仍用 `latent_append`，只传 `recordId＋indexEvidence` 补索引，绝不重复正文。服务端只容忍空白、全半角与引号标点形态差异，最终进入 index 的始终是重新定位出的原文。配了独立 `--index-dir` 就写到该目录；旧部署未配时兼容写到 `<corpus>/index/` 并在回执提醒升级。检索层在 timeline 与 index 都有可靠候选时至少各保留一条，避免短摘要整层挤掉原始记录。`README.txt` 不进库；旧 `indexSummaries` 只作兼容。
+   拿不准参数时，先把同一份参数加 `mode=preflight`：它会复用真实写入校验并返回预计落点，
+   但 timeline、index 与未解决清单零写入。通过后删除 mode 或改成 `write` 再调；真正写入仍
+   会重新校验。报错中的“写错／写对”是同类最小输入，按它修字段，不要把报错重试冒充预检。
    这里的只读承诺专指 ship 与 `--doctor` 不改语料；`latent_append` 属运行期写回。
    兼容落点只在未配 `--index-dir` 时生效，且只新增自动摘要，不迁移、不复制、
    不覆盖、不重排已有 `<corpus>/index/` 文件。

@@ -10,6 +10,8 @@ init_state.json
 threads.jsonl
 # 未解决事项 sidecar：正文就是用户当前仍未结束的事情
 未解决.md
+# 精准清理的隔离备份与恢复清单：可能包含用户语料原文
+.cleanup-trash/
 
 # 用户自己的产出物绝不该进这个仓库
 CLAUDE.md

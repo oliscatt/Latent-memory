@@ -81,8 +81,9 @@ INDEX_SUMMARY_EXAMPLE = (
 INDEX_SUMMARY_FORMAT_GUIDE = (
     "固定格式（换行也必须保留）：\n"
     f"{INDEX_SUMMARY_TEMPLATE}\n"
-    "YYYY.MM.DD 必须换成服务端本地当天日期。合法样例：\n"
-    f"{INDEX_SUMMARY_EXAMPLE}"
+    "YYYY.MM.DD 必须换成服务端本地当天日期。\n"
+    "写错：只有一行，没有固定日期、换行和当下段。\n"
+    f"写对：{INDEX_SUMMARY_EXAMPLE}"
 )
 
 # recall_recent 的半衰期默认值（天）：经验值——timeline 语料按天/窗口推进，一周前的
