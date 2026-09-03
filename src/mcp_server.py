@@ -2685,6 +2685,74 @@ def write_startup_log(report, exc, path=None):
         return None
 
 
+class StderrTee:
+    """把 stderr 原样转发到终端，同时追加落盘一份。`--log-file` 的全部实现。
+
+    治的是 issue #20 那个形状：stdio 传输下 stderr 由客户端接管，而**客户端
+    经常直接丢弃**（本文件另一处注释早就写了这件事）。于是子进程崩没崩、什么时候重启的、
+    堆栈是什么，全都没有落点——报告人只能靠回头翻 token 账单发现某段前缀被重复计费，
+    倒推"是不是重启过"。那是成本层面的事后取证，定位不到任何东西。
+
+    ⚠ 选择"换掉 `sys.stderr`"而不是改几十个 `print(..., file=sys.stderr)` 调用点：
+    `print` 每次调用都现取 `sys.stderr`，换掉全局引用就等于全部接管，且解释器抛
+    未捕获异常时也走同一个口子（堆栈一起落盘）。改调用点则必漏——本文件里光是
+    `print(..., file=sys.stderr)` 就散在启动、拒绝、异常、横幅四类路径上。
+
+    ⚠ 写盘失败一律吞掉、退回纯终端输出：这东西是排查用的旁路，绝不许因为日志写不进去
+    反过来把服务弄崩（同 write_startup_log 那条约束）。"""
+
+    def __init__(self, stream, handle):
+        self._stream = stream
+        self._handle = handle
+
+    def write(self, text):
+        written = self._stream.write(text)
+        try:
+            self._handle.write(text)
+            self._handle.flush()      # 崩溃前最后几行不许留在缓冲区里
+        except (ValueError, OSError):
+            pass
+        return written
+
+    def flush(self):
+        try:
+            self._stream.flush()
+        except (ValueError, OSError):
+            pass
+        try:
+            self._handle.flush()
+        except (ValueError, OSError):
+            pass
+
+    def isatty(self):
+        try:
+            return self._stream.isatty()
+        except (ValueError, OSError):
+            return False
+
+
+def install_stderr_tee(path, stream=None, now=None):
+    """按 `--log-file` 接上 tee，返回接好的流；接不上就原样返回、只抱怨一句。
+
+    每次进程起来都先写一行带 pid 和时间的横幅——**这一行本身就是 issue #20 要的证据**：
+    同一个 `--log-file` 里出现第二条横幅，就说明子进程确实重启过一次，不必再靠
+    token 账单倒推。"""
+    stream = stream or sys.stderr
+    stamp = (now or datetime.now(_dt_tz.utc)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        p = Path(path)
+        if p.parent != Path(""):
+            p.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(p, "a", encoding="utf-8")
+        handle.write(f"\n===== 进程启动 pid={os.getpid()} {stamp} =====\n")
+        handle.flush()
+    except OSError as e:
+        print(f"⚠ --log-file 写不进去（{type(e).__name__}: {e}），"
+              f"这次只往终端打；服务照常起。", file=stream)
+        return stream
+    return StderrTee(stream, handle)
+
+
 def slow_load_notice(stream=None, thresholds=_SLOW_LOAD_NOTICE_SECONDS):
     """加载慢过门槛就说一句话，返回一个「加载完了叫我」的取消函数。
 
@@ -5295,7 +5363,51 @@ def _selftest():
         assert code23b != 0 and "记忆协议服务端没能起来" in err23b, \
             f"--http 档失败要在 stderr 给人话并非零退出：{err23b!r}"
 
-    print("selftest ok（24项断言：握手 / 工具表 / 调用往返 / 薄适配层 / 错误分层（含 "
+    # 24.【--log-file：stderr 那条路要留得下痕，且重启看得出来】
+    #     （2026.09.03，issue #20）。缺口：stdio 形态下 stderr 由客户端接管、
+    #     经常被直接丢弃，子进程崩没崩／何时重启没有任何落点，报告人只能靠回头翻
+    #     token 账单发现某段前缀被重复计费、倒推"是不是重启过"。
+    #     ⚠ **必须起真进程**：tee 装在 `__main__` 的 args 解析之后，纯函数断言盖不到。
+    #     ⚠ 判据分两条，b) 才是这张卡真正要的东西：
+    #        a) 配了 --log-file，本该只走 stderr 的诊断（这里借启动失败那段人话）落进文件；
+    #        b) **同一个文件跑第二次 → 两条进程横幅**，即"重启过"可以被直接读出来。
+    #     变异（照 23 的规矩留）：把 `sys.stderr = install_stderr_tee(...)` 那行删掉
+    #        → a) 必转红（文件里只剩横幅、没有那段人话）。不转红等于没测。
+    with tempfile.TemporaryDirectory() as td24:
+        corpus24 = _P(td24) / "corpus"
+        (corpus24 / "timeline").mkdir(parents=True)
+        (corpus24 / "timeline" / "window_01_2026-06-01.md").write_text(
+            "## 留痕那天\n从前 stderr 掉进黑洞，这次要落盘。\n", encoding="utf-8")
+        log24 = _P(td24) / "logs" / "mcp.log"      # 父目录故意不存在：顺带验它会自建
+
+        def run_log24():
+            """起真进程，走一条必然失败的启动（认不出的时区），看它往日志里留了什么。"""
+            p24 = subprocess.run(
+                [sys.executable, str(here / "mcp_server.py"),
+                 "--corpus", str(corpus24), "--timezone", "Asia/Nowhere",
+                 "--log-file", str(log24), "--http", "127.0.0.1:0"],
+                capture_output=True, text=True, encoding="utf-8",
+                env=dict(os.environ, MEMORY_MCP_LOG_DIR=str(_P(td24) / "startuplog")),
+                timeout=90)
+            return p24.returncode
+
+        run_log24()
+        assert log24.exists(), f"配了 --log-file 就要把文件建出来（父目录也要自建）：{log24}"
+        body24a = log24.read_text(encoding="utf-8")
+        #    a) 靶心：本该只走 stderr 的那段人话，确实落进了文件
+        assert "记忆协议服务端没能起来" in body24a, \
+            f"stderr 上的诊断要同时落盘，不能只留横幅：{body24a!r}"
+        assert "进程启动 pid=" in body24a, f"每次启动要写一行带 pid 的横幅：{body24a!r}"
+
+        #    b) 靶心（issue #20 真正要的）：再跑一次 → 同一个文件里两条横幅＝重启看得出来
+        run_log24()
+        body24b = log24.read_text(encoding="utf-8")
+        assert body24b.count("进程启动 pid=") == 2, \
+            ("同一个 --log-file 跑两次要留下两条横幅（这正是“子进程重启过”的直接证据），"
+             f"实际 {body24b.count('进程启动 pid=')} 条")
+        assert body24b.startswith(body24a), "追加写：第二次不许把第一次的内容截掉"
+
+    print("selftest ok（25项断言：握手 / 工具表 / 调用往返 / 薄适配层 / 错误分层（含 "
           "session_start 读取异常只重试一次、未预料异常不空断、写工具不重放）/ "
           "完整链路 / stdio / UTF-8 / 写回当场可查 / 写回预检（零写入、补索引预检、"
           "参数错误写错／写对对照）/ 精准清理（两阶段确认、引用阻断、"
@@ -5330,7 +5442,10 @@ def _selftest():
           "开满 4 条回 405，--no-sse-stream 退回恒 405。"
           "⚠ 这验的是「服务端形态已具备」，「哪个客户端接上了」要真机）/ "
           "被拒 405 GET 那行按三种原因各说各的（只要 JSON＝这不是错误、"
-          "长流被关掉＝指出口、开满＝说开满），且三句都不许糊到别的被拒行上）")
+          "长流被关掉＝指出口、开满＝说开满），且三句都不许糊到别的被拒行上）/ "
+          "--log-file 让 stderr 留得下痕·真进程（诊断人话落盘、父目录自建、"
+          "每次启动一条带 pid 的横幅，同一文件跑两次＝两条横幅且追加不截断——"
+          "「子进程重启过」由此可直接读出，不必再靠 token 账单倒推）")
 
 
 if __name__ == "__main__":
@@ -5380,7 +5495,18 @@ if __name__ == "__main__":
     ap.add_argument("--token",
                     help="HTTP 传输的 Bearer token（也可用环境变量 MEMORY_HTTP_TOKEN；"
                          "客户端侧填进 bearerToken/Authorization 头）")
+    ap.add_argument("--log-file", dest="log_file", metavar="路径",
+                    help="把本该只走 stderr 的诊断输出（启动横幅、拒绝记录、异常堆栈）"
+                         "同时追加落盘一份。stdio 形态下 stderr 由客户端接管、经常被直接"
+                         "丢弃，不配这个就等于没有任何排查落点。文件按追加写，每次进程"
+                         "启动写一行带 pid 的横幅——同一个文件里出现第二条横幅即可证明"
+                         "子进程重启过")
     args = ap.parse_args()
+
+    # ⚠ 紧跟在 parse 之后：再往下就是 config／load／bind 三段，那几段的失败正是最需要
+    # 落盘的一类。装晚一行，就漏掉一类。
+    if args.log_file:
+        sys.stderr = install_stderr_tee(args.log_file)
 
     # 这次运行最终会不会把 stdout 交给 MCP 协议流？只有它为真，启动失败才需要走协议
     # 降级壳；这条谓词跟失败发生在哪一行无关（任务卡「stdio 档启动失败无出口」第一节）。
