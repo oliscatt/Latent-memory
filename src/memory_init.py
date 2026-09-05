@@ -139,9 +139,15 @@ def guidance_text(persona_path):
         raise ValueError(f"引导句里的路径必须是绝对路径：{p}")
     text = GUIDANCE_TEMPLATE.format(path=p)
     if len(text) > GUIDANCE_LIMIT:
+        # 报错要给**能照着做的数**（公开仓 issue #17 第 1 条：Android/proot 的深工作区
+        # 必现，报错只说"多半是路径太长"，不说到底长多少、要砍到多短）。
+        # ⚠ 不去分"路径长"和"模板啰嗦"两种成因：模板固定开销才二十来字，
+        #   总长要过 100 就意味着路径至少八十几字——**成因只有一种**，分支是死的。
         raise ValueError(
-            f"引导句超长（{len(text)} > {GUIDANCE_LIMIT} 字）——它该是一句指针，"
-            f"不该这么长。多半是产出目录路径太长——把产出目录挪浅一点再出货。")
+            f"引导句超长（{len(text)} > {GUIDANCE_LIMIT} 字）——它该是一句指针，不该这么长。"
+            f"其中产出目录路径就占了 {len(str(p))} 字，"
+            f"至少要砍掉 {len(text) - GUIDANCE_LIMIT} 字：把产出目录挪浅一点再出货"
+            f"（Android/proot 这类深工作区尤其容易撞上，换到 /sdcard 下这种短路径）。")
     return text
 
 # ---------- 协议层默认值：系统填，不问用户 ----------
@@ -887,6 +893,10 @@ def export_llm_prompt(questions, corpus_note="", pronouns=None):
         "4. 我答不上来或说跳过就跳过，不要替我编——宁可短且真，不要长而空。",
         "5. 全部问完后，把结果整理成“题号 → 我选的选项键（pick 题给原文）”的清单，",
         "   原样回给我，不要加你自己的评价。",
+        f"6. 我如果在某题上多说了一句、选项装不下的，写成“题号. 选项键（补充：那句话）”，",
+        f"   引导词只认**补充／另外／备注／补一句**，后面跟中文或英文冒号，"
+        f"   且只取 {FREEFORM_MAX_CHARS} 字以内。",
+        "   ⚠ 补充必须挂在这一行里；单独另起一行写感想会被判成读不懂的行、整行丢掉。",
         (f"\n背景：{corpus_note}" if corpus_note else ""),
         "\n问卷：",
         format_questionnaire(questions, pronouns=pronouns),
@@ -3498,6 +3508,11 @@ def _selftest():
         assert False, "超长引导句没被拦住——超长时必须明说，不许静默出货"
     except ValueError as e:
         assert "产出目录" in str(e), "超长的错误信息没告诉用户怎么修"
+        #     ⚠ 还要给**能照着做的数**（公开仓 issue #17 第 1 条）：光说"太长了、挪浅点"
+        #     不告诉人路径占了多少、要砍掉多少，在深工作区下等于让人瞎试。
+        #     判据＝报错里同时出现「路径占了多少字」和「至少要砍掉多少字」两个数。
+        assert "字，" in str(e) and "至少要砍掉" in str(e), \
+            f"超长报错要给出路径占用与需砍掉的字数，不能只说太长：{e}"
 
     # 10. 人格不完整时拒绝出货——缺检索约定/最终约定这类必填项不能悄悄放行
     p6 = Persona("partner")
