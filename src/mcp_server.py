@@ -685,7 +685,12 @@ def commit_cleanup_changes(changes, fail_after=None, replace_func=os.replace):
 
 
 def _record_section_plan(path, record_id):
-    """按 chunk 哈希把 recordId 反解到唯一 H2 记录节；返回移除计划与该节所有块哈希。"""
+    """按 recordId 反解到唯一 H2 记录节；未命中时返回 ``None``。
+
+    早期 recordId 是切块文本的哈希。删掉同一窗口的前一条记录后，原本第二条会继承 H1
+    前导文本，重切块后的哈希改变；因此同时按“现文件切块”与“不带前导文本的本节切块”
+    查找。真正清理 sidecar 时只移除现文件仍在使用的哈希。
+    """
     path = Path(path)
     try:
         text = path.read_text(encoding="utf-8")
@@ -702,12 +707,12 @@ def _record_section_plan(path, record_id):
         scoped = preamble + section if number == 0 else section
         chunks = chunk_heading(scoped)
         hashes = tuple(_chunk_key(chunk) for chunk in chunks)
-        if record_id in hashes:
+        bare_hashes = tuple(_chunk_key(chunk) for chunk in chunk_heading(section))
+        if record_id in set(hashes) | set(bare_hashes):
             candidates.append({"start": start, "end": end, "section": section,
                                "chunks": chunks, "hashes": hashes})
     if not candidates:
-        raise ValueError("recordId 能在内存索引中看到，但无法反解到原文件的完整记录节；"
-                         "文件可能已被手工修改，请不要猜着删除")
+        return None
     if len(candidates) != 1:
         raise ValueError(f"recordId 在原文件中对应 {len(candidates)} 个记录节，定位不唯一，拒绝删除")
     target = candidates[0]
@@ -744,7 +749,7 @@ class MemoryServer:
                  corpus_dir=None, weights_path=None, retractions_path=None,
                  entities_path=None, loader=None, time_context=None,
                  source_dirs=None, index_dir=None, startup_notice=None,
-                 require_unresolved_review=False):
+                 require_unresolved_review=False, write_dir=None):
         # 两个 topN 分开（2026.07.31 真实语料冒烟后拆的）：显式检索是用户/模型
         # 主动问一件事，多给几条值；开场召回每次换窗都付一遍，条数要克制
         self.index = index if index is not None else MemoryIndex().build()
@@ -774,6 +779,11 @@ class MemoryServer:
         # corpus_dir 是写回的落点，没配就明确拒写；weights_path 没配则权重只活在
         # 内存里（selftest/临时用法），配了就启动时载入、每次检索命中后落盘
         self.index_dir = index_dir
+        # write_dir：这支笔自己写的正文落哪个目录。没配就退回旧行为
+        # <corpus>/timeline，配了就与语料里别处（宿主客户端自动记的那一档）物理
+        # 分开。它只搬**写**的落点，读仍由 --corpus 递归覆盖——所以它必须落在
+        # corpus 里面，否则会出现"写得进、检索读不到"这种不报错的失败
+        self.write_dir = write_dir
         # source_dirs 只管读取与 HTTP 指纹；它可以包含独立索引目录，但绝不能替代
         # corpus_dir 成为写回落点。未传时退回旧行为，只监听主语料。
         default_dirs = [path for path in (corpus_dir, index_dir) if path is not None]
@@ -1014,7 +1024,8 @@ class MemoryServer:
         try:
             body_plan = plan_append_record(
                 self.corpus_dir, args.get("text") or "", args.get("current_state") or "",
-                window=args.get("window"), now=now, time_context=self.time_context)
+                window=args.get("window"), now=now, time_context=self.time_context,
+                write_dir=self.write_dir)
         except ValueError as exc:
             raise ToolError(_append_input_error(str(exc), "full")) from None
         except OSError as exc:
@@ -1108,7 +1119,8 @@ class MemoryServer:
         try:
             body_plan = plan_append_record(
                 self.corpus_dir, args.get("text") or "", args.get("current_state") or "",
-                window=args.get("window"), now=now, time_context=self.time_context)
+                window=args.get("window"), now=now, time_context=self.time_context,
+                write_dir=self.write_dir)
         except ValueError as e:
             raise ToolError(_append_input_error(str(e), "full")) from None
         except OSError as e:
@@ -1178,7 +1190,7 @@ class MemoryServer:
                 path, chunk_text, meta = append_record(
                     self.corpus_dir, f"【更正】{correction}",
                     args.get("current_state") or "", now=now,
-                    time_context=self.time_context)
+                    time_context=self.time_context, write_dir=self.write_dir)
             except (ValueError, OSError) as e:
                 if self.retractions_path is not None:
                     self.index.save_retractions(self.retractions_path)
@@ -1226,27 +1238,23 @@ class MemoryServer:
         if not isinstance(record_id, str) or not re.fullmatch(r"[0-9a-f]{16}", record_id):
             raise ToolError("recordId 必须是 latent_append 返回的 16 位小写十六进制标识")
 
-        matches = [(chunk, meta) for chunk, meta in zip(self.index.chunks, self.index.meta)
-                   if meta.get("layer", "timeline") == "timeline"
-                   and _chunk_key(chunk) == record_id]
-        if len(matches) != 1:
-            reason = "没有找到" if not matches else f"找到 {len(matches)} 条"
+        timeline_root = (Path(self.write_dir) if self.write_dir is not None
+                         else Path(self.corpus_dir) / "timeline").resolve()
+        if not timeline_root.is_dir():
+            raise ToolError("写回目录不存在，找不到可清理记录")
+        candidates = []
+        for source in sorted(timeline_root.glob("window_*.md")):
+            try:
+                section_plan = _record_section_plan(source, record_id)
+            except ValueError as exc:
+                raise ToolError(str(exc)) from None
+            if section_plan is not None:
+                candidates.append((source, section_plan))
+        if len(candidates) != 1:
+            reason = "没有找到" if not candidates else f"找到 {len(candidates)} 条"
             raise ToolError(f"按 recordId={record_id} {reason}原始记录；"
                             "记录可能已清理或被手工修改，请重新检索，不要猜着删除")
-
-        _, record_meta = matches[0]
-        timeline_root = (Path(self.corpus_dir) / "timeline").resolve()
-        source = (timeline_root / str(record_meta.get("source") or "")).resolve()
-        try:
-            source.relative_to(timeline_root)
-        except ValueError:
-            raise ToolError("recordId 指向的来源不在 timeline 目录，拒绝清理") from None
-        if not source.is_file():
-            raise ToolError(f"recordId 的原始记录文件不存在：{source.name}")
-        try:
-            section_plan = _record_section_plan(source, record_id)
-        except ValueError as exc:
-            raise ToolError(str(exc)) from None
+        source, section_plan = candidates[0]
 
         index_root = Path(self.index_dir) if self.index_dir is not None \
             else Path(self.corpus_dir) / "index"
@@ -2172,7 +2180,7 @@ def make_corpus_loader(corpus_dir, index_dir=None, embed=False, provider=None):
 
 
 def diagnose(corpus_dir, threads_path=None, embed=False, time_context=None,
-             index_dir=None, require_unresolved_review=False):
+             index_dir=None, require_unresolved_review=False, write_dir=None):
     """体检语料目录与接线，返回 [{level,title,detail}, ...]。**纯读，不写盘。**
 
     检的是"配好了没有"，不是"检索好不好"——后者归回归集（regression_set.py）。
@@ -2405,14 +2413,31 @@ def diagnose(corpus_dir, threads_path=None, embed=False, time_context=None,
 
     # 写回落点：latent_append/latent_correct 要往这里写。只用 os.access 判，
     # 不试写——试写就破了只读
-    if os.access(root, os.W_OK):
-        # 落点要报到层：写回永远进 timeline 层（append_record 构造上锁死的），
-        # 人格文件里「按需读取指针」必须盖住这个目录——用户拿这行对自己的指针，
-        # 指漏了的症状是"新长出来的记忆按需读不到"，而且不报错
-        add(OK, "写回落点", f"{root}/timeline 可写（latent_append 按窗口号+日期"
-            f"往这里加文件；人格文件的「按需读取指针」要盖住这个目录）")
+    write_root = Path(write_dir).resolve() if write_dir is not None else root / "timeline"
+    probe = write_root if write_root.is_dir() else write_root.parent
+    outside = False
+    if write_dir is not None:
+        try:
+            write_root.relative_to(root)
+        except ValueError:
+            outside = True
+    if outside:
+        # 不报错的失败里最贵的一种：写盘成功、回执正常，但 --corpus 递归读不到它，
+        # 于是"记下了"之后永远检索不到自己刚写的东西
+        add(FAIL, "写回落点", f"--write-dir {write_root} 不在 --corpus {root} 之内："
+            "写得进去，但检索只按 --corpus 递归读，刚写的记忆一条都查不回来。")
+    elif os.access(probe, os.W_OK):
+        # 落点要报到层：写回只进这一个目录（append_record 构造上锁死的，调用方
+        # 传不了路径），人格文件里「按需读取指针」必须盖住它——用户拿这行对自己的
+        # 指针，指漏了的症状是"新长出来的记忆按需读不到"，而且不报错
+        hint = "" if write_dir is not None else \
+            "；未配 --write-dir，用的是缺省落点 <corpus>/timeline。" \
+            "要把这支笔写的记录跟语料里别处（例如宿主客户端自动记的那一档）分开，" \
+            "就显式配一个 --write-dir，它必须仍落在 --corpus 之内"
+        add(OK, "写回落点", f"{write_root} 可写（latent_append 按窗口号+日期"
+            f"往这里加文件；人格文件的「按需读取指针」要盖住这个目录）{hint}")
     else:
-        add(FAIL, "写回落点", f"{root} 不可写——模型会说“记下了”，但每一次写回都失败。")
+        add(FAIL, "写回落点", f"{probe} 不可写——模型会说“记下了”，但每一次写回都失败。")
 
     # thread 落点：没配 --threads 时 latent_thread_close 只活在内存里，进程一退就没了，
     # 下个会话的开场召回接不上上一次聊到哪
@@ -3604,6 +3629,48 @@ def _selftest():
         assert repeated_repair["isError"] is False and "已有索引" in repeated_repair["content"][0]["text"]
         assert index_after_repeat == index_before_repeat, "重复补索引必须幂等，不能追加第二份"
 
+    # 9w.【--write-dir 真接线：正文搬家、检索照读、清理跟着搬】
+    #     判据（先写下来再数）：配了 write_dir 之后 ① <corpus>/timeline 逐字节零变化，
+    #     ② 正文只出现在 write_dir 下且窗口号仍按整个语料续排，③ 同一条 latent_search
+    #     查得回来（落点在 --corpus 之内，检索范围不变），④ latent_cleanup preview 认得
+    #     出它。采集条件：stdlib only、无 embedding、固定 now、临时目录。
+    #     变异：删掉 MemoryServer 对 plan_append_record 的 write_dir 透传 → ①② 转红；
+    #     把 _tool_memory_cleanup 的 timeline_root 改回写死 <corpus>/timeline → ④ 转红。
+    with tempfile.TemporaryDirectory() as td:
+        corpusw = _P(td) / "corpus"
+        notebook = corpusw / "vps" / "notebook" / "timeline"
+        indexw = corpusw / "vps" / "notebook" / "index"
+        host_timeline = corpusw / "timeline"
+        host_timeline.mkdir(parents=True)
+        (host_timeline / "window_01_2026-06-17.md").write_text(
+            "# 第1个窗口 · 2026-06-17\n\n## 2026-06-17 记\n"
+            "宿主客户端自动记的那一档。\n当下状态：还在记。\n", encoding="utf-8")
+        notebook.mkdir(parents=True)
+        indexw.mkdir(parents=True)
+        source_dirsw, loaderw = make_corpus_loader(corpusw, indexw)
+        srvw = MemoryServer(index=loaderw(), thread_store=ThreadStore(),
+                            corpus_dir=corpusw, index_dir=indexw, write_dir=notebook,
+                            source_dirs=source_dirsw, loader=loaderw)
+        host_before = {p.name: p.read_bytes() for p in host_timeline.rglob("*") if p.is_file()}
+        okw = call(srvw, "latent_append",
+                   _append_args("她把电子琴修好了，说周末弹给我听。", "约定成立，还没弹。"),
+                   now)
+        assert okw["isError"] is False, f"配了 write_dir 的正常写回不该失败：{okw}"
+        assert {p.name: p.read_bytes() for p in host_timeline.rglob("*") if p.is_file()} \
+            == host_before, "配了 write_dir 之后，正文一个字节都不该再落进 <corpus>/timeline"
+        written = sorted(notebook.glob("*.md"))
+        assert len(written) == 1 and written[0].name.startswith("window_02_"), \
+            f"正文该只落在 write_dir 下、窗口号按整个语料续排：{[p.name for p in written]}"
+        hitw = call(srvw, "latent_search", {"query": "电子琴"}, now)
+        assert hitw["isError"] is False and "电子琴" in hitw["content"][0]["text"], \
+            f"搬走的正文仍在 --corpus 之内，检索必须照读得到：{hitw}"
+        record_idw = re.search(r"recordId=([0-9a-f]{16})", okw["content"][0]["text"])
+        assert record_idw, f"回执里要有 recordId：{okw['content'][0]['text']}"
+        previeww = call(srvw, "latent_cleanup",
+                        {"recordId": record_idw.group(1), "action": "preview"}, now)
+        assert previeww["isError"] is False, \
+            f"清理根没跟着 write_dir 搬时这里会说“不在 timeline 目录”：{previeww}"
+
     # 9a.【latent_append 预检与可修复报错】判据与采集条件：Windows 11、Python
     #     3.12.10、main@29a1b094 起分支、stdlib only。通过＝预检复用真写计划，
     #     timeline/index/未解决 sidecar/内存索引/written_paths 零变化；参数错误同时给
@@ -3847,6 +3914,19 @@ def _selftest():
         assert all("绿色雨伞" not in chunk for chunk in reloaded9b.chunks) \
             and any("门票放在书桌抽屉" in chunk for chunk in reloaded9b.chunks), \
             "重载后误写不能从隔离备份回灌，相邻正确记录仍可检索"
+
+        # 同一窗口先删靠前记录后，后续记录会从第二节变成首节、继承 H1 前导文本；
+        # 旧 recordId 仍必须能定位到它，不能只剩检索可见、cleanup 却失效。
+        keep_preview9b = call(s9b, "latent_cleanup", {"action": "preview", "recordId": keep9b}, now + 1)
+        assert keep_preview9b["isError"] is False and "门票放在书桌抽屉" in keep_preview9b["content"][0]["text"], \
+            "先删同窗口前一条后，后续记录的旧 recordId 仍必须能 preview"
+        keep_token9b = re.search(r"确认令牌：(DELETE-[0-9a-f]{16}-[0-9a-f]{16})",
+                                 keep_preview9b["content"][0]["text"]).group(1)
+        keep_deleted9b = call(s9b, "latent_cleanup", {
+            "action": "delete", "recordId": keep9b, "confirmation": keep_token9b,
+            "reason": "相邻记录也需清理"}, now + 1)
+        assert keep_deleted9b["isError"] is False and not target_path9b.exists(), \
+            "后续记录按旧 recordId 清理后，空窗口文件应一并移除"
 
         pending9b = call(s9b, "latent_append", {
             "text": "另一条误写：会议被记到了星期二。", "current_state": "等待清理。"}, now + 2)
@@ -5499,6 +5579,11 @@ if __name__ == "__main__":
     ap.add_argument("--corpus", help="md 语料目录")
     ap.add_argument("--index-dir",
                     help="独立索引摘要目录（推荐；未配时 latent_append 兼容写入 <corpus>/index）")
+    ap.add_argument("--write-dir",
+                    help="latent_append／latent_correct 的正文落点（未配时用 "
+                         "<corpus>/timeline）。**必须仍在 --corpus 之内**，检索范围只按 "
+                         "--corpus 递归；配它是为了把这支笔写的记录跟语料里别处"
+                         "（例如宿主客户端自动记的那一档）物理分开")
     ap.add_argument("--threads", help="会话线索 jsonl 路径（省略则内存态）")
     ap.add_argument("--require-unresolved-review", action="store_true",
                     help="严格要求完整 append／thread_close 显式提供 unresolvedOps；"
@@ -5596,7 +5681,8 @@ if __name__ == "__main__":
             ap.error("--doctor 要跟 --corpus 一起用：体检的就是它指向的那个目录")
         checks = diagnose(args.corpus, threads_path=args.threads, embed=args.embed,
                           time_context=time_ctx, index_dir=args.index_dir,
-                          require_unresolved_review=args.require_unresolved_review)
+                          require_unresolved_review=args.require_unresolved_review,
+                          write_dir=args.write_dir)
         print(format_doctor_report(checks))
         # 退出码给自动化用：有 ✗ 就非零，⚠ 不算失败（那些是"能用但会悄悄变差"）
         sys.exit(1 if any(c["level"] == FAIL for c in checks) else 0)
@@ -5616,6 +5702,7 @@ if __name__ == "__main__":
                                entities_path=Path(args.corpus) / ".entities.json",
                                loader=loader, time_context=time_ctx,
                                source_dirs=source_dirs, index_dir=args.index_dir,
+                               write_dir=args.write_dir,
                                startup_notice=timezone_notice,
                                require_unresolved_review=args.require_unresolved_review)
         except Exception as e:                       # noqa: BLE001（裸堆栈正是本卡要消灭的）
