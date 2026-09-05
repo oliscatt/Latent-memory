@@ -1356,13 +1356,14 @@ def load_corpus(corpus_dir, embed=False, recursive=True, provider=None, cache_pa
 # ---------- 写回：记忆库正文层的笔（任务卡"记忆写回与权重持久化"） ----------
 
 def append_record(corpus_dir, text, current_state, window=None, now=None,
-                  time_context=None):
+                  time_context=None, write_dir=None):
     """把"刚发生的值得记的事"落成 timeline 记录 → (path, chunk_text, meta)。
 
     这是记忆库自己生长的那半支笔（thread 是会话状态层，这里是正文层）。
     确认分级（规格 §7）：记忆库正文自动写，所以这里没有确认关卡；人格 md 任何
     改动必须用户确认，所以这支笔构造上就够不着它——写哪个文件由这里按窗口号+
-    日期生成，调用方（MCP 工具）不传路径，永远只落在语料目录的 timeline 层。
+    日期生成，调用方（MCP 工具）不传文件路径，只能通过服务端启动参数
+    （`write_dir`，缺省 `<corpus>/timeline`）决定落在哪个目录。
 
     三条规则：
       当下状态必填（病灶迁移，同 close_thread）——没有状态的记录，未来重读时
@@ -1390,7 +1391,8 @@ def append_record(corpus_dir, text, current_state, window=None, now=None,
         raise ValueError("当下状态必填（病灶迁移）：这件事现在是什么状态？"
                          "不写的话，未来重读会把它当成正在发生的事")
     plan = plan_append_record(corpus_dir, text, current_state, window=window,
-                              now=now, time_context=time_context)
+                              now=now, time_context=time_context,
+                              write_dir=write_dir)
     plan["path"].parent.mkdir(parents=True, exist_ok=True)
     plan["path"].write_text(plan["content"], encoding="utf-8")
     chunks = chunk_heading(plan["content"])
@@ -1398,11 +1400,17 @@ def append_record(corpus_dir, text, current_state, window=None, now=None,
 
 
 def plan_append_record(corpus_dir, text, current_state, window=None, now=None,
-                       time_context=None):
+                       time_context=None, write_dir=None):
     """只计算正文写回目标与完整新内容，不写盘。
 
     `append_record()` 保留旧接口；本函数同时返回文件态块与稳定 record_id，供
     `latent_append` 在索引失败后按原记录补写，不需要重复正文。
+
+    `write_dir` 是正文落点，缺省为 `<corpus>/timeline`（旧行为一字不变）。配了它，
+    这支笔写的记录就与语料目录下别处（例如宿主客户端自动记的那一档）物理分开，
+    检索范围仍由 `--corpus` 决定——**所以 write_dir 必须落在 corpus 的递归范围内，
+    否则写得进、检索读不到**。窗口号仍取整个语料的最大值 +1，不按落点分号段：
+    同一个记忆库里两套窗口号会让"第几个窗口"这句话失去唯一含义。
     """
     if not (isinstance(text, str) and text.strip()):
         raise ValueError("写回内容不能为空")
@@ -1412,7 +1420,8 @@ def plan_append_record(corpus_dir, text, current_state, window=None, now=None,
     now = time.time() if now is None else now
     tc = time_context if time_context is not None else TimeContext.default()
     day = tc.local_date(now)
-    timeline = Path(corpus_dir) / "timeline"
+    timeline = Path(write_dir) if write_dir is not None \
+        else Path(corpus_dir) / "timeline"
 
     known = [w for w in (parse_window_no(p.name) for p in corpus_files(corpus_dir))
              if w is not None]
@@ -2333,6 +2342,33 @@ def _selftest(embed=False):
         assert all("措辞不太对" not in x["text"]
                    for x in idxB.retrieve("那条临时记录写了什么", topN=5)), \
             "被撤回的旧说法重启后不许再被召回——'撤回成功'不许只活一个进程"
+
+    # 17b.【写回落点可配·靶心】write_dir 把这支笔的正文搬到语料里的一个独立目录，
+    #    好让它跟宿主客户端自动记的那一档物理分开；不传时必须一字不差还是老落点。
+    #    变异：把 plan_append_record 里的 write_dir 分支删掉（写死
+    #    `Path(corpus_dir) / "timeline"`）→ 下面第二批断言全红；
+    #    反过来把缺省分支也改成 write_dir → 第一批全红。
+    with tempfile.TemporaryDirectory() as td:
+        t17 = TimeContext.default().midnight_epoch("2026-07-31") + 21 * 3600
+        #   回归：不传 write_dir，落点仍是 <corpus>/timeline
+        pd, _, _ = append_record(td, "缺省落点这一条。", "记完了。", now=t17)
+        assert pd.parent == Path(td) / "timeline", f"不传 write_dir 该保持旧落点：{pd.parent}"
+        #   传了：正文进指定目录，文件名与窗口号规则一个字没变
+        note = Path(td) / "vps" / "notebook" / "timeline"
+        pn, chunk_n, meta_n = append_record(td, "搬走之后这一条。", "记完了。",
+                                            now=t17 + 86400, write_dir=note)
+        assert pn.parent == note, f"配了 write_dir 该落到它：{pn.parent}"
+        assert pn.name == "window_02_2026-08-01.md", f"命名规则不该变：{pn.name}"
+        #   窗口号跨落点连号：max 取自整个语料，不按落点各排各的
+        assert meta_n["window"] == 2, f"窗口号该接着整个语料往下排：{meta_n['window']}"
+        #   落点在 corpus 之内 → 检索照旧读得到（这就是 write_dir 必须内嵌的理由）
+        rt17 = load_corpus(td)
+        assert sum("搬走之后" in c for c in rt17.chunks) == 1, "搬走的正文仍要能被检索到"
+        assert chunk_n in rt17.chunks, "内存态＝文件态这条在新落点上同样成立"
+        #   同一落点内的"同天进同一个窗口"也照旧
+        pn2, _, meta_n2 = append_record(td, "同一天的第二条。", "继续。",
+                                        now=t17 + 86400 + 600, write_dir=note)
+        assert pn2 == pn and meta_n2["window"] == 2, "同天写回仍该进同一个窗口文件"
 
     # 18.【跨时区归窗·靶心】（2026.08.04 手机 Connector 真机事故，任务卡
     #    「写回时区与跨日归窗」）：**"今天是几号"必须按记忆所有者的时区算，不是按
