@@ -25,7 +25,7 @@
 **本地应当是默认值。** 默认检索档只用 Python 标准库，语料不出本机。本地 embedding 与云端
 embedding 都是可选路线，没把语料去向念给用户听，就不出货。
 
-**客户端只是入口。** 六个 `latent_` MCP 工具同时支持本地 stdio 与远程 HTTP；初始化器可以
+**客户端只是入口。** 七个 `latent_` MCP 工具同时支持本地 stdio 与远程 HTTP；初始化器可以
 产出 `CLAUDE.md`、`AGENTS.md`、Grok agent 文件或通用人格文件。
 
 ## 已经验证到哪里

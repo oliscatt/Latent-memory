@@ -54,6 +54,7 @@ stdio 只能由宿主拉起（手动 `nohup` 必崩）、懒加载每次调用�
 """
 
 import argparse
+import difflib
 import errno
 import hashlib
 import hmac
@@ -233,7 +234,10 @@ TOOLS = [
                 "text": {"type": "string",
                          "description": "发生了什么——具体动作和原话，不是概括"},
                 "current_state": {"type": "string",
-                                  "description": "这件事现在的状态"},
+                                  "description": "**必填**：这件事现在的状态（约定成立／还在处理／"
+                                                 "已解决……）。不写会被拒绝；写了才分得清"
+                                                 "「当时发生过」和「现在还在进行」——"
+                                                 "缺了它未来重读会把旧事当成正在发生"},
                 "window": {"type": "integer",
                            "description": "第几个窗口（可省略，按日期自动归窗）"},
                 "recordId": {"type": "string",
@@ -329,7 +333,11 @@ TOOLS = [
         "title": "维护未解决事项",
         "description": "单独新增、更新或关闭当前未解决事项；用于没有正文要写时的明确维护，"
                        "或 append／thread_close 回执为 blocked 后只重试清单操作。"
-                       "关闭只删除清单行，不撤回 timeline 原始事实。",
+                       "关闭只删除清单行，不撤回 timeline 原始事实。"
+                       "⚠ **这是只写工具，没有「查看」动作**：action 只有 open（新增一条）／"
+                       "update（改一条）／close（关掉一条），**没有 list**，"
+                       "且 open 是往清单里写一条、不是列出清单。"
+                       "要看当前未解决什么，调 latent_session_start——它开场就先给【当前未解决】那一段。",
         "annotations": {"readOnlyHint": False, "destructiveHint": True,
                         "idempotentHint": False, "openWorldHint": False},
         "inputSchema": {
@@ -452,6 +460,21 @@ def _canonical_quote(value):
     return "".join(chars), positions
 
 
+def _closest_source_span(needle, sources, window=12):
+    """定位失败时给出原文里最像的一段：省掉「重新 search 整段原文再抠字」那一轮
+    （外部反馈 #23：为拿到能过逐字校验的证据而反复拉原文，单轮上下文能涨十万级）。"""
+    best = None
+    for source in sources:
+        haystack, positions = _canonical_quote(source)
+        matcher = difflib.SequenceMatcher(None, haystack, needle, autojunk=False)
+        match = matcher.find_longest_match(0, len(haystack), 0, len(needle))
+        if match.size and (best is None or match.size > best[0]):
+            start = positions[match.a]
+            end = positions[match.a + match.size - 1]
+            best = (match.size, source[max(0, start - window):end + 1 + window].strip())
+    return best[1] if best else None
+
+
 def validate_index_evidence(items, source_texts):
     """把容忍排版差异的 quote 映射回原文；绝不把模型改写直接写进索引。"""
     if not isinstance(items, list) or not items:
@@ -478,8 +501,12 @@ def validate_index_evidence(items, source_texts):
                 original = source[positions[pos]:positions[pos + len(needle) - 1] + 1]
                 break
         if original is None:
+            hint = _closest_source_span(needle, sources)
             raise ValueError(f"索引证据第 {number} 条无法映射回原文：{quote}。"
-                             "只允许空白、全半角和中英文引号／标点形态不同，不能同义改写")
+                             "只允许空白、全半角和中英文引号／标点形态不同，不能同义改写"
+                             + (f"。原文里最接近的一段是：{hint}"
+                                "——请直接从这一段里逐字摘，不必重新检索原文"
+                                if hint else ""))
         row = {"type": kind, "quote": original.strip()}
         if row not in resolved:
             resolved.append(row)
@@ -2955,6 +2982,13 @@ def _selftest():
         assert False, "同义改写不得冒充原文证据"
     except ValueError as exc:
         assert "无法映射回原文" in str(exc)
+    try:
+        validate_index_evidence([{"type": "event", "quote": "代号是 LT-9999"}],
+                                ['临时测试代号是“LT-3289”。'])
+        assert False, "改写过的编号不得冒充原文证据"
+    except ValueError as exc:
+        assert "原文里最接近的一段是" in str(exc) and "LT-3289" in str(exc), (
+            f"定位失败要回最接近的原文片段，模型才不用重拉原文：{exc}")
     with tempfile.TemporaryDirectory() as td_summary:
         root_summary = Path(td_summary)
         timeline_summary = root_summary / "timeline"
