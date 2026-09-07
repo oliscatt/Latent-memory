@@ -129,8 +129,8 @@ INSTRUCTIONS = (
     "不得按相似文字猜记录，不得跳过确认。\n"
     "⚠ 但 latent_correct 撤的是你**逐字摘的那一块**，不是「这件事」：同一说法若还写在"
     "别的记录里，那些不受影响，开场自动浮现（没有 query、按时间和权重排）可能把旧说法"
-    "直接端回来。改过重要的事实后，服务端会提醒库里还有几块提到同一说法——按提示用旧"
-    "说法再查一次、逐条撤掉，才算干净。\n"
+    "直接端回来。改过重要的事实后，服务端会提醒库里还有几块与它共享词面——可以用旧"
+    "说法再查一次看看还有没有；不必、也不该逐条撤。\n"
     "查过但确实没有的，就如实说没找到——查过之后的“没有”是诚实，查之前的“没有”才是错。\n"
     "第一次检索没找到、或返回内容明显对不上时，最多再查一次：保留原 query，把更具体的"
     "说法放进 queryVariant（补名字、物件、地点或记录里可能用过的词）；服务器会融合两种"
@@ -138,10 +138,20 @@ INSTRUCTIONS = (
     "新会话开场先调一次 latent_session_start，会话结束前调一次 latent_thread_close。"
 )
 
-# 撤回粒度提醒：命中「同一说法」的其它块可能上百（报告方 1729 块），提示里只列
+# 撤回粒度提醒：与被撤块「共享词面」的其它块可能上百（报告方 1729 块），提示里只列
 # 最近这么几条定位信息。⚠ 这是**输出预算**（别把提醒撑爆上下文），**不是判据**
 # ——判据是 same_claim_survivors 里的区分性 token，与这个数无关。
 _SURVIVOR_PREVIEW = 3
+
+# 超比例降级门槛：survivors 占全库块数 > 20% 时不报精确条数（任务卡 16.1）。
+# ⚠ 这个 20% 是**复用同一比例**、不是实测选出的阈值：`_distinctive_df()` 的
+# max(3, N//5) 已经用「最多出现在 20% 的块里」定义了「一个词面还算不算区分性」；
+# 出口这一侧说的是同一句话的另一半——共享词面的块若超过全库 20%，这个「说法」按本项目
+# 自己的判据就已经不具区分性，报个精确数字只会假装它有定位价值。本项目没有能标定这个
+# 比例的评测集（EMBED_HIT_FLOOR 与 GRAPH_RRF_K 两次的教训见各自注释），不新造常数。
+# ⚠ 诚实边界：它只挡得住并集爆炸那一档（外部报告 34.1% ⇒ 触发）。占比落在 10%～20%
+# 之间时照样会报出一个没有定位价值的精确数字——这是「把最坏的一档挡掉」，不是「修好了」。
+_SURVIVOR_RATIO_DEN = 5
 
 # JSON-RPC 标准错误码（规格"Error Handling"一节：未知工具/参数非法走协议错误）
 E_METHOD_NOT_FOUND = -32601
@@ -275,7 +285,7 @@ TOOLS = [
                        "足够长能唯一定位那条记录。只口头认错不调这个工具的话，"
                        "库没变，下次照样检索到错的。⚠ 撤的是你摘的**那一块**，"
                        "不是「这件事」——同一说法若散在别的记录里不受影响；"
-                       "撤回后服务端会告诉你库里还有几块提到同一说法，按提示逐条撤才干净。"
+                       "撤回后服务端会告诉你库里还有几块与它共享词面，可以再查一次看看，不必逐条撤。"
                        "处理单值事实的当前值变化时，本次先只撤旧值（省略 correction），"
                        "再单独调 latent_append 写新值；这样动作顺序可见，不会被误做成纯 append。",
         "annotations": {
@@ -1206,7 +1216,8 @@ class MemoryServer:
         else:
             correction_idx = None
         # 撤回粒度提醒（岔口 2）：撤回是块级的、事实是跨块的——刚撤的只是这一块，
-        # 同一说法若散在别的记录里，那些块不受影响；主动检索通常问不到它们，但开场
+        # 同一说法若散在别的记录里，那些块不受影响（服务端只认得出「共享词面」，
+        # 认不出「是不是同一件事」）；主动检索通常问不到它们，但开场
         # 自动浮现按时间/权重排、没有 query，旧说法可能被直接端出来。这里顺手扫一遍，
         # 命中未撤的其它块就把缺口在**用户改错的当下**说出来。
         # ⚠ 只提示、绝不自动撤：区分性词面命中 ≠ 讲同一件事，误撤没兜底（same_claim_
@@ -1219,13 +1230,21 @@ class MemoryServer:
             for i in survivors[:_SURVIVOR_PREVIEW]:
                 m = self.index.meta[i]
                 labels.append(m.get("heading") or m.get("source") or f"块{i}")
-            more = "" if len(survivors) <= _SURVIVOR_PREVIEW \
-                else f"（另有 {len(survivors) - _SURVIVOR_PREVIEW} 条未列出）"
-            msg += (f" ⚠ 但撤回是块级的：库里还有 {len(survivors)} 块提到同一说法"
-                    f"（最近：{'、'.join(labels)}{more}），它们**没被这次撤回影响**。"
+            # 超比例降级（任务卡 16.1）：占比 > 20% 就不报精确条数。降级档连
+            # 「另有 N 条未列出」也不给，否则精确规模从后门漏回去。
+            if len(survivors) * _SURVIVOR_RATIO_DEN > len(self.index.chunks):
+                head = (" ⚠ 但撤回是块级的：库里相当一部分记录与它共享词面，"
+                        "占比过高、这个数没有定位价值，所以不报具体条数"
+                        f"（最近：{'、'.join(labels)}）")
+            else:
+                more = "" if len(survivors) <= _SURVIVOR_PREVIEW \
+                    else f"（另有 {len(survivors) - _SURVIVOR_PREVIEW} 条未列出）"
+                head = (f" ⚠ 但撤回是块级的：库里还有 {len(survivors)} 块与它共享词面"
+                        f"（最近：{'、'.join(labels)}{more}）")
+            msg += (head + "，它们**没被这次撤回影响**。"
                     "主动检索通常问不到它们，但开场自动浮现没有 query、按时间和权重排，"
-                    "旧说法可能被直接端出来。要彻底改掉，请用旧说法再 latent_search 一次、"
-                    "把还提到它的记录逐条撤掉——服务端只提示、不会替你自动撤"
+                    "旧说法可能被直接端出来。可以用旧说法再 latent_search 一次看看还有"
+                    "没有；不必、也不该逐条撤——服务端只提示、不会替你自动撤"
                     "（词面命中不等于讲的是同一件事，撤错比给旧值更糟）。")
         if self.retractions_path is not None:
             self.index.save_retractions(self.retractions_path)
@@ -3999,11 +4018,11 @@ def _selftest():
                      "current_state": "新机运行正常。"}, now)
         assert ok12["isError"] is False and "已撤回" in ok12["content"][0]["text"]
         #    【撤回粒度提醒·0 命中 = 文本不变 + 变异靶心（坑 1）】薄荷块与咖啡机块
-        #    不共享任何区分性词面 → 没有别的块提到同一说法，提示一个字都不该冒出来。
+        #    不共享任何区分性词面 → 没有别的块与它共享词面，提示一个字都不该冒出来。
         #    ⚠ 变异：把 same_claim_survivors 里的 exclude 去掉，更正块正文含"咖啡机"
         #    会命中自己 → 提示恒真 → 这条断言转红。这就是"恒真的提示等于没提示"。
-        assert "同一说法" not in ok12["content"][0]["text"], \
-            "无其它块提到时不该有提醒（变异靶心：去掉 exclude 更正块自命中→此条转红）"
+        assert "共享词面" not in ok12["content"][0]["text"], \
+            "无其它块共享词面时不该有提醒（变异靶心：去掉 exclude 更正块自命中→此条转红）"
         after = call(s12, "latent_search", {"query": "咖啡机"}, now)
         assert after["isError"] is False
         assert "保险丝熔断" not in after["content"][0]["text"] and \
@@ -4014,7 +4033,7 @@ def _selftest():
         assert json.loads(rp.read_text(encoding="utf-8")), "账本文件要真在盘上（可追溯）"
 
     # 12d.【撤回粒度提醒·命中多块：撤回是块级、事实是跨块的】旧名散在 3 块，用户只
-    #      逐字摘了其中一块 → 撤回成功后，返回文本要点出"库里还有 N 块提到同一说法"。
+    #      逐字摘了其中一块 → 撤回成功后，返回文本要点出"库里还有 N 块与它共享词面"。
     #      采集条件（写在断言旁）：合成 20 块 → 更正后 21 块，_distinctive_df()=
     #      max(3,21//5)=4；旧名的区分性 token 命中 4 块（3 史 + 1 更正块），df=4≤4 才算
     #      区分性——⚠ 块数不够会掉进常数支 3、旧名被判成"太常见"而漏报（实施计划坑 2/
@@ -4038,10 +4057,67 @@ def _selftest():
                       "current_state": "现在统一叫来福。"}, now)
         assert ok12d["isError"] is False, ok12d
         t12d = ok12d["content"][0]["text"]
-        assert "已撤回" in t12d and "还有 2 块提到同一说法" in t12d, \
-            f"撤一块后要点出另外两块仍讲同一说法（块级撤回、事实跨块），实得：{t12d}"
+        # 【第 1 档·不触发降级】先算后验：更正后 N=21、survivors=2 ⇒ 2/21≈9.5% ≤ 20%，
+        # 所以走"报精确数字"这一档。⚠ 这一格是任务卡 16.5 第 3 条，算在前、验在后。
+        assert len(s12d.index.chunks) == 21, ("降级门槛的分母：这份夹具更正后必须是 21 块，"
+                                              f"变了就得重算占比，实得 {len(s12d.index.chunks)}")
+        assert "已撤回" in t12d and "还有 2 块与它共享词面" in t12d, \
+            f"撤一块后要点出另外两块仍共享词面（块级撤回、事实跨块），实得：{t12d}"
+        # 口径已松开（任务卡 16.3）：旧措辞与那条走不通的出路要整句消失。
+        # ⚠ 与卡里 16.5 第 1 条的字面有一处冲突：16.3 定的新文案本身就含"逐条撤"三个字
+        # （"不必、也不该逐条撤"），所以这里判的是**祈使句消失、否定句在场**，
+        # 不是"逐条撤"三个字不出现。冲突按 16.3 的替换文案为准。
+        for _gone in ("同一说法", "才算干净", "才干净", "逐条撤掉"):
+            assert _gone not in t12d, f"旧口径残留：{_gone}（实得：{t12d}）"
+        assert "不必、也不该逐条撤" in t12d, "新口径要明说不必逐条撤"
         assert "体检" in t12d and "喂食" in t12d, "提示要给出定位（最近若干条 heading）"
         assert "只提示" in t12d and "自动撤" in t12d, "边界要写进返回：只提示、绝不自动撤（坑 3）"
+
+    # 12e.【撤回粒度提醒·超比例降级：共享词面的块多到没有定位价值】（任务卡 16.1/16.5）
+    #      外部报告在 19566 块真实语料上量到：撤一块后 survivors=6672＝全库 34.1%，
+    #      而正确答案是 0——**纯假阳性**。报一个精确的"还有 6672 块"只会假装它有定位
+    #      价值。门槛复用 _distinctive_df() 的同一个 20%（见 _SURVIVOR_RATIO_DEN 注释）。
+    #      采集条件（写在断言旁）：N=10 块、不写 correction（省略 ⇒ 不新增块，分母仍是 10），
+    #      chunk0 的三个区分性词面各自散在两块里 ⇒ survivors 是并集 6 块 ⇒ 60% > 20%。
+    #      ⚠ 并集是关键：单个词面 df ≤ max(3, N//5) 天然就 ≤20%，**只有并集能过线**，
+    #      这也正是报告方那 34.1% 的成因。
+    with tempfile.TemporaryDirectory() as td12e:
+        idx12e = MemoryIndex()
+        idx12e.add("## 遛狗\n那只边牧旺财今天在公园撒欢跑了一下午。",
+                   {"heading": "遛狗", "timestamp": now - 600})                                     # 0 待撤
+        idx12e.add("## 体检\n旺财上周体检结果一切合格。", {"heading": "体检", "timestamp": now - 500})   # 1 旺财
+        idx12e.add("## 喂食\n旺财这几天胃口特别好。", {"heading": "喂食", "timestamp": now - 400})       # 2 旺财
+        idx12e.add("## 郊游\n周末去公园放了风筝。", {"heading": "郊游", "timestamp": now - 300})         # 3 公园
+        idx12e.add("## 晨练\n每天绕着公园走两圈。", {"heading": "晨练", "timestamp": now - 200})         # 4 公园
+        idx12e.add("## 犬展\n那场展会上边牧最多。", {"heading": "犬展", "timestamp": now - 100})         # 5 边牧
+        idx12e.add("## 领养\n朋友也想养只边牧。", {"heading": "领养", "timestamp": now - 50})            # 6 边牧
+        for _t in ("买了牛奶", "修好单车", "煮锅绿豆"):
+            idx12e.add(f"## 杂记·{_t}\n顺手记一笔，{_t}。",
+                       {"heading": f"杂记·{_t}", "timestamp": now - 1000})                          # 7~9 无关
+        idx12e.build()
+        s12e = MemoryServer(index=idx12e, thread_store=ThreadStore(),
+                            corpus_dir=td12e, retractions_path=_P(td12e) / ".retractions.json")
+        ok12e = call(s12e, "latent_correct",
+                     {"quote": "旺财今天在公园撒欢", "reason": "记错了名字"}, now)   # 省略 correction
+        assert ok12e["isError"] is False, ok12e
+        t12e = ok12e["content"][0]["text"]
+        # 先把这一格的占比钉死：省略 correction ⇒ 不新增块，分母就是这 10 块
+        assert len(s12e.index.chunks) == 10, f"分母必须是 10 块，实得 {len(s12e.index.chunks)}"
+        surv12e = s12e.index.same_claim_survivors(0)
+        assert len(surv12e) * _SURVIVOR_RATIO_DEN > 10, \
+            f"这份夹具要跨过 20% 才测得到降级档，实得 survivors={len(surv12e)}/10"
+        # 【变异靶心·降级档不许印数字】判据写死成正则，不靠人眼看措辞：
+        # ⚠ 变异①把 _SURVIVOR_RATIO_DEN 改成 1（等于降级永不触发）、②给降级档也印上
+        # len(survivors)，这条都必红。
+        assert re.search(r"还有\s*\d+\s*块", t12e) is None, \
+            f"超比例时不许报精确条数（变异靶心：门槛改 1 或降级档印数字→此条转红），实得：{t12e}"
+        assert "共享词面" in t12e and "没有定位价值" in t12e, \
+            f"降级档仍要报、要说清为什么不给数（冻结方案要求「要报」），实得：{t12e}"
+        assert "领养" in t12e and "犬展" in t12e and "晨练" in t12e, \
+            f"降级档仍列 _SURVIVOR_PREVIEW 条定位（按 timestamp 倒序＝最近三条），实得：{t12e}"
+        assert "未列出" not in t12e, "降级档连「另有 N 条未列出」也不给，否则精确规模从后门漏回去"
+        for _gone in ("同一说法", "才算干净", "才干净", "逐条撤掉"):
+            assert _gone not in t12e, f"旧口径残留：{_gone}（实得：{t12e}）"
 
     # 12c.【同会话 append→撤回，重启仍生效·变异靶心】（2026.08.03 外部缺陷报告，
     #      真机 7232 块语料上抓到）：新建窗口文件的首块，手拼返回值与重启重切的
@@ -5527,7 +5603,8 @@ def _selftest():
           "参数错误写错／写对对照）/ 精准清理（两阶段确认、引用阻断、"
           "隔离备份不回灌、sidecar 同步与故障回滚）/ 用进撑过重启 / "
           "无可靠命中明确说 / 撤回更正闭环 / 撤回粒度提醒（块级撤回、事实跨块：命中多块"
-          "给总数＋最近定位、0 命中不冒提示且变异去 exclude 转红、只提示不自动撤）/ "
+          "给总数＋最近定位、0 命中不冒提示且变异去 exclude 转红、只提示不自动撤；"
+          "超全库 20% 降级不报精确条数、仍报仍给三条定位）/ "
           "缺失率标注接线 / 实体标注接线 / "
           "部署体检只读 / 部署体检走真进程（相对路径解析开、空语料非零退出、"
           "每句一个 `##` 的导出要报切块警告）/ HTTP 传输真端口往返（鉴权 401、"
