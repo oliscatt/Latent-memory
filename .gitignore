@@ -3,6 +3,7 @@ __pycache__/
 .weights.json
 .retractions.json
 .supersessions.json
+.passive.json
 .entities.json
 # 块向量缓存（云端/本地 embedding 档建库时算一次、缓存在本机）——
 # 它带着语料内容的指纹，跟上面几个 sidecar 一样不该被谁误提交进来

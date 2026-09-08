@@ -98,6 +98,8 @@ from time_context import (TimeContext, detect_local_timezone, parse_record_time_
                           tzdb_available)
 from passive_recall import (PassiveRecallRequestError, PassiveRecallService,
                             TOOL_NAME as PASSIVE_RECALL_TOOL)
+from passive_metadata import (FILENAME as PASSIVE_METADATA_FILENAME,
+                              PassiveMetadataStore, source_signature, validate_passive)
 
 PROTOCOL_VERSION = "2025-06-18"   # 官方规格版本，已查证
 SERVER_INFO = {"name": "memory-protocol", "title": "记忆协议", "version": "0.1.0"}
@@ -275,6 +277,29 @@ TOOLS = [
                         "evidenceTerms": {"type": "array", "minItems": 1,
                                           "items": {"type": "string"}},
                     }, "required": ["summary", "evidenceTerms"]},
+                },
+                "passive": {
+                    "type": "object",
+                    "description": "可选的自动浮现证据与触发元数据；只在原文和来源校验通过后写入辅助账本",
+                    "properties": {
+                        "trigger_terms": {"type": "array", "items": {"type": "string"}},
+                        "short_trigger_terms": {"type": "array", "items": {"type": "string"}},
+                        "kind": {"type": "string", "enum": ["meme", "event", "fact", "unknown"]},
+                        "scope": {"type": "string"},
+                        "episode_id": {"type": "string"},
+                        "source_ranges": {"type": "array", "items": {
+                            "type": "object", "properties": {
+                                "type": {"type": "string", "enum": ["formation", "support", "revision"]},
+                                "quote": {"type": "string"}}, "required": ["type", "quote"]}},
+                        "context_refs": {"type": "array", "items": {
+                            "type": "object", "properties": {
+                                "recordId": {"type": "string"},
+                                "source_ranges": {"type": "array", "items": {
+                                    "type": "object", "properties": {
+                                        "type": {"type": "string", "enum": ["formation", "support", "revision"]},
+                                        "quote": {"type": "string"}}, "required": ["type", "quote"]}}},
+                            "required": ["recordId", "source_ranges"]}},
+                    },
                 },
                 "unresolvedOps": _UNRESOLVED_OPS_SCHEMA,
             },
@@ -845,6 +870,8 @@ class MemoryServer:
         self.index = index if index is not None else MemoryIndex().build()
         self.thread_store = thread_store if thread_store is not None else ThreadStore()
         self.corpus_dir = corpus_dir
+        self.passive_metadata = PassiveMetadataStore(
+            Path(corpus_dir) / PASSIVE_METADATA_FILENAME if corpus_dir is not None else None)
         self.unresolved_store = UnresolvedStore(
             Path(corpus_dir) / UNRESOLVED_FILENAME if corpus_dir is not None else None)
         self.require_unresolved_review = bool(require_unresolved_review)
@@ -1123,6 +1150,78 @@ class MemoryServer:
                 known.remove(item_id)
         return "would_update"
 
+    def _record_for_passive(self, record_id, *, error_category="repair"):
+        """按权威正文与撤回状态定位唯一记录；不拿 sidecar 或相似文本补位。"""
+        matches = [(idx, chunk, meta) for idx, (chunk, meta) in enumerate(
+            zip(self.index.chunks, self.index.meta))
+            if meta.get("layer", "timeline") == "timeline" and _chunk_key(chunk) == record_id]
+        if len(matches) != 1:
+            reason = "没有找到" if not matches else "找到多条"
+            raise ToolError(_append_input_error(
+                f"按 recordId={record_id} {reason}原始记录；正文可能被手工改过，"
+                "请先 latent_search 定位，不要猜着补辅助内容", error_category))
+        idx, text, meta = matches[0]
+        if idx in self.index.retracted:
+            raise ToolError(_append_input_error(
+                f"recordId={record_id} 已撤回，passiveStatus=invalidated；不能补辅助内容",
+                error_category))
+        return idx, text, meta
+
+    def _passive_record_lookup(self, record_id):
+        matches = [(idx, chunk, meta) for idx, (chunk, meta) in enumerate(
+            zip(self.index.chunks, self.index.meta)) if _chunk_key(chunk) == record_id]
+        if len(matches) != 1:
+            return None
+        idx, text, meta = matches[0]
+        try:
+            passive_scope = self.passive_metadata.read().get(record_id, {}).get("scope", "general")
+        except ValueError:
+            return None
+        return {"state": "retracted" if idx in self.index.retracted else "active",
+                "text": text, "meta": meta, "scope": passive_scope,
+                "sourceSignature": source_signature(text)}
+
+    @staticmethod
+    def _record_index_status(index_write_dir, record_id, record_text):
+        """只把能逐条映回当前正文的推荐索引算作可核验，不信文件名本身。"""
+        paths = list(index_write_dir.glob(f"*_record_{record_id}_item_*.md"))
+        if not paths:
+            return "missing"
+        reverse_labels = {value: key for key, value in _INDEX_EVIDENCE_LABELS.items()}
+        found = False
+        try:
+            for path in paths:
+                content = path.read_text(encoding="utf-8")
+                if "原文证据索引" not in content:
+                    return "unverified"
+                for line in content.splitlines()[1:]:
+                    if "：" not in line:
+                        continue
+                    label, values = line.split("：", 1)
+                    kind = reverse_labels.get(label)
+                    if kind is None:
+                        return "unverified"
+                    for quote in values.split("；"):
+                        validate_index_evidence([{"type": kind, "quote": quote}], [record_text])
+                        found = True
+        except (OSError, UnicodeError, ValueError):
+            return "unverified"
+        return "verified" if found else "unverified"
+
+    def _plan_passive(self, args, record_id, record_text, *, evidence_ready):
+        """返回完整 sidecar 替换计划；校验失败前不产生半份账本。"""
+        if args.get("passive") is None:
+            return None, "not_requested", None
+        if not evidence_ready:
+            raise ValueError("passive 需要可核验的 indexEvidence；请按同一 recordId 补齐")
+        records = self.passive_metadata.read()
+        entry = validate_passive(
+            args.get("passive"), record_id=record_id, record_text=record_text,
+            record_lookup=self._passive_record_lookup,
+            allowed_scopes=self.passive_metadata.allowed_scopes,
+            prior=records.get(record_id), known_records=records.values())
+        return self.passive_metadata.plan_put(entry), "ready", entry
+
     @staticmethod
     def _plan_append_indexes(args, body_plan, index_write_dir):
         """完整写回的索引计划；预检与真写共用，缺证据是合法 pending。"""
@@ -1151,38 +1250,47 @@ class MemoryServer:
         if record_id_arg is not None:
             if args.get("text") is not None or args.get("current_state") is not None:
                 raise ToolError(_append_input_error(
-                    "补索引预检只传 recordId＋indexEvidence；不要重复 text 或 current_state",
+                    "补齐预检只传 recordId＋indexEvidence／passive；不要重复 text 或 current_state",
                     "repair"))
             if not isinstance(record_id_arg, str) or not re.fullmatch(r"[0-9a-f]{16}", record_id_arg):
                 raise ToolError(_append_input_error(
                     "recordId 必须是此前 latent_append 返回的 16 位小写十六进制标识",
                     "repair"))
-            if list(index_write_dir.glob(f"*_record_{record_id_arg}_item_*.md")):
-                return (f"预检通过：preflightStatus=ready；recordId={record_id_arg} 已有索引，"
-                        "indexStatus=indexed；本次零写入，无需重复补索引。")
-            matches = [(chunk, meta) for chunk, meta in zip(self.index.chunks, self.index.meta)
-                       if meta.get("layer", "timeline") == "timeline"
-                       and _chunk_key(chunk) == record_id_arg]
-            if len(matches) != 1:
-                reason = "没有找到" if not matches else "找到多条"
+            _, record_text, record_meta = self._record_for_passive(record_id_arg)
+            index_source_status = self._record_index_status(
+                index_write_dir, record_id_arg, record_text)
+            indexed = index_source_status == "verified"
+            if index_source_status == "unverified":
                 raise ToolError(_append_input_error(
-                    f"按 recordId={record_id_arg} {reason}原始记录；"
-                    "正文可能被手工改过，请先 latent_search 定位，不要猜着补索引",
-                    "repair"))
-            record_text, record_meta = matches[0]
+                    "已有索引无法逐条映回当前正文，拒绝把它当作 passive 来源；"
+                    "请先修复冲突索引", "evidence"))
+            if indexed and args.get("passive") is None:
+                return (f"预检通过：preflightStatus=ready；recordId={record_id_arg} 已有索引，"
+                        "indexStatus=indexed；passiveStatus=not_requested；本次零写入，"
+                        "无需重复补索引。")
             try:
-                evidence = validate_index_evidence(args.get("indexEvidence"), [record_text])
                 local_date = record_meta.get("local_date") or self.time_context.local_date(now)
-                summary = render_index_evidence(evidence, local_date)
-                plans = plan_index_records(
-                    index_write_dir, [summary], record_meta.get("window") or 0,
-                    local_date, record_id=record_id_arg)
+                plans = []
+                if args.get("indexEvidence") is not None:
+                    evidence = validate_index_evidence(args.get("indexEvidence"), [record_text])
+                    if not indexed:
+                        plans = plan_index_records(
+                            index_write_dir, [render_index_evidence(evidence, local_date)],
+                            record_meta.get("window") or 0, local_date,
+                            record_id=record_id_arg)
+                elif not indexed and args.get("passive") is None:
+                    validate_index_evidence(None, [record_text])
+                passive_plan, passive_status, entry = self._plan_passive(
+                    args, record_id_arg, record_text,
+                    evidence_ready=indexed or args.get("indexEvidence") is not None)
             except ValueError as exc:
                 raise ToolError(_append_input_error(str(exc), "evidence")) from None
             except OSError as exc:
                 raise ToolError(str(exc)) from None
-            return (f"预检通过：preflightStatus=ready；补索引 recordId={record_id_arg}；"
-                    f"预计写入 {len(plans)} 个索引文件；indexStatus=indexed；本次零写入。")
+            revision = f"；revision={entry['revision']}" if entry else ""
+            return (f"预检通过：preflightStatus=ready；补索引／元数据 recordId={record_id_arg}；"
+                    f"预计写入 {len(plans)} 个索引文件；indexStatus=indexed；"
+                    f"passiveStatus={passive_status}{revision}；本次零写入。")
 
         try:
             self._require_unresolved_field(args)
@@ -1203,6 +1311,9 @@ class MemoryServer:
         try:
             index_plans, index_status = self._plan_append_indexes(
                 args, body_plan, index_write_dir)
+            _, passive_status, entry = self._plan_passive(
+                args, body_plan["record_id"], body_plan["record_text"],
+                evidence_ready=args.get("indexEvidence") is not None)
         except ValueError as exc:
             raise ToolError(_append_input_error(str(exc), category)) from None
         except OSError as exc:
@@ -1210,11 +1321,13 @@ class MemoryServer:
         unresolved_status = self._preflight_unresolved(args)
         pending = ("；写入后需只传 recordId＋indexEvidence 补索引"
                    if index_status == "pending" else "")
+        revision = f"；revision={entry['revision']}" if entry else ""
         hint = (f"；未配置 --index-dir，预计使用兼容路径 {index_write_dir}"
                 if fallback_index else "")
         return (f"预检通过：preflightStatus=ready；预计写入第 {body_plan['window']} 个窗口"
                 f"（{body_plan['path'].name}），recordId={body_plan['record_id']}；"
                 f"预计索引文件={len(index_plans)}；indexStatus={index_status}{pending}；"
+                f"passiveStatus={passive_status}{revision}；"
                 f"unresolvedStatus={unresolved_status}{hint}；本次零写入。")
 
     def _tool_memory_append(self, args, now=None):
@@ -1237,44 +1350,59 @@ class MemoryServer:
         if record_id_arg is not None:
             if args.get("text") is not None or args.get("current_state") is not None:
                 raise ToolError(_append_input_error(
-                    "补索引模式只传 recordId＋indexEvidence；不要重复 text 或 current_state",
+                    "补齐模式只传 recordId＋indexEvidence／passive；不要重复 text 或 current_state",
                     "repair"))
             if not isinstance(record_id_arg, str) or not re.fullmatch(r"[0-9a-f]{16}", record_id_arg):
                 raise ToolError(_append_input_error(
                     "recordId 必须是此前 latent_append 返回的 16 位小写十六进制标识",
                     "repair"))
-            if list(index_write_dir.glob(f"*_record_{record_id_arg}_item_*.md")):
-                return f"recordId={record_id_arg} 已有索引，未重复写入。indexStatus=indexed。"
-            matches = [(chunk, meta) for chunk, meta in zip(self.index.chunks, self.index.meta)
-                       if meta.get("layer", "timeline") == "timeline"
-                       and _chunk_key(chunk) == record_id_arg]
-            if len(matches) != 1:
-                reason = "没有找到" if not matches else "找到多条"
+            _, record_text, record_meta = self._record_for_passive(record_id_arg)
+            index_source_status = self._record_index_status(
+                index_write_dir, record_id_arg, record_text)
+            indexed = index_source_status == "verified"
+            if index_source_status == "unverified":
                 raise ToolError(_append_input_error(
-                    f"按 recordId={record_id_arg} {reason}原始记录；"
-                    "正文可能被手工改过，请先 latent_search 定位，不要猜着补索引",
-                    "repair"))
-            record_text, record_meta = matches[0]
+                    "已有索引无法逐条映回当前正文，拒绝把它当作 passive 来源；"
+                    "请先修复冲突索引", "evidence"))
+            if indexed and args.get("passive") is None:
+                return f"recordId={record_id_arg} 已有索引，未重复写入。indexStatus=indexed。"
             try:
-                evidence = validate_index_evidence(args.get("indexEvidence"), [record_text])
-                summary = render_index_evidence(
-                    evidence, record_meta.get("local_date") or self.time_context.local_date(now))
-                index_plans = plan_index_records(
-                    index_write_dir, [summary], record_meta.get("window") or 0,
-                    record_meta.get("local_date") or self.time_context.local_date(now),
-                    record_id=record_id_arg)
-                paths = commit_memory_files(index_plans)
+                local_date = record_meta.get("local_date") or self.time_context.local_date(now)
+                index_plans = []
+                if args.get("indexEvidence") is not None:
+                    evidence = validate_index_evidence(args.get("indexEvidence"), [record_text])
+                    if not indexed:
+                        index_plans = plan_index_records(
+                            index_write_dir, [render_index_evidence(evidence, local_date)],
+                            record_meta.get("window") or 0, local_date,
+                            record_id=record_id_arg)
+                elif not indexed:
+                    validate_index_evidence(None, [record_text])
+                passive_plan, passive_status, entry = self._plan_passive(
+                    args, record_id_arg, record_text,
+                    evidence_ready=indexed or args.get("indexEvidence") is not None)
+                paths = commit_memory_files(index_plans) if index_plans else []
             except ValueError as e:
                 raise ToolError(_append_input_error(
-                    f"原始正文仍在，但索引补写失败：{e}", "evidence")) from None
+                    f"原始正文与已有索引仍在，但辅助内容补写失败：{e}", "evidence")) from None
             except OSError as e:
-                raise ToolError(f"原始正文仍在，但索引补写失败：{e}") from None
+                raise ToolError(f"原始正文与已有索引仍在，但辅助内容补写失败：{e}") from None
+            if passive_plan is not None:
+                try:
+                    paths += commit_memory_files([passive_plan])
+                except OSError as e:
+                    self._refresh_after_write()
+                    self.written_paths.update(str(path) for path in paths)
+                    return (f"recordId={record_id_arg} 的正文与索引仍在。bodyStatus=saved；"
+                            f"indexStatus=indexed；passiveStatus=pending：{e}；"
+                            "请只传 recordId＋passive 重试。")
             self._refresh_after_write()
             self.written_paths.update(str(path) for path in paths)
             hint = (f" 未配置 --index-dir，索引已落到兼容路径 {index_write_dir}；"
                     "推荐配置独立 --index-dir。") if fallback_index else ""
-            return (f"已为 recordId={record_id_arg} 补写 1 条原文证据索引。"
-                    f"indexStatus=indexed。{hint}")
+            revision = f" revision={entry['revision']}。" if entry else ""
+            return (f"已为 recordId={record_id_arg} 补齐辅助内容。bodyStatus=saved；"
+                    f"indexStatus=indexed；passiveStatus={passive_status}。{revision}{hint}")
         try:
             self._require_unresolved_field(args)
         except ToolError as exc:
@@ -1291,9 +1419,6 @@ class MemoryServer:
         try:
             index_plans, index_status = self._plan_append_indexes(
                 args, body_plan, index_write_dir)
-            if index_status == "pending":
-                raise ValueError("未提供 indexEvidence（旧客户端可继续提供 indexSummaries）")
-            paths = commit_memory_files([body_plan] + index_plans)
         except (ValueError, OSError) as e:
             # 索引摘要是检索辅助，不是原始事实。结构或锚点失败时仍保留正文与当下状态，
             # 让后续检索回到可核对的原记录；绝不把未验摘要写进 index 层。
@@ -1306,9 +1431,68 @@ class MemoryServer:
             unresolved = self._unresolved_after_core(
                 args, f"timeline/{paths[0].name}#record={body_plan['record_id']}")
             return (f"正文已写进第 {body_plan['window']} 个窗口（{paths[0].name}），"
-                    f"recordId={body_plan['record_id']}。索引尚未写入：{e} "
-                    "indexStatus=pending；不要重复正文，之后用本工具传 recordId＋indexEvidence 补齐。 "
+                    f"recordId={body_plan['record_id']}。bodyStatus=saved；索引尚未写入：{e} "
+                    f"indexStatus=pending；passiveStatus={'pending' if args.get('passive') is not None else 'not_requested'}；"
+                    "不要重复正文，之后用本工具传 recordId＋indexEvidence＋passive 补齐。 "
                     + unresolved)
+        if index_status == "pending":
+            try:
+                paths = commit_memory_files([body_plan])
+            except OSError as write_error:
+                raise ToolError(str(write_error))
+            self._refresh_after_write()
+            self.written_paths.update(str(path) for path in paths)
+            unresolved = self._unresolved_after_core(
+                args, f"timeline/{paths[0].name}#record={body_plan['record_id']}")
+            return (f"正文已写进第 {body_plan['window']} 个窗口（{paths[0].name}），"
+                    f"recordId={body_plan['record_id']}。bodyStatus=saved；indexStatus=pending；"
+                    f"passiveStatus={'pending' if args.get('passive') is not None else 'not_requested'}；"
+                    "未提供 indexEvidence；不要重复正文，之后用本工具传 "
+                    "recordId＋indexEvidence＋passive 补齐。 "
+                    + unresolved)
+        try:
+            passive_plan, passive_status, entry = self._plan_passive(
+                args, body_plan["record_id"], body_plan["record_text"],
+                evidence_ready=args.get("indexEvidence") is not None)
+        except (ValueError, OSError) as e:
+            # 推荐索引已经通过时单独保留它；passive 失败不得把有效索引和正文一起回滚。
+            try:
+                paths = commit_memory_files([body_plan] + index_plans)
+            except OSError as write_error:
+                raise ToolError(str(write_error))
+            self._refresh_after_write()
+            self.written_paths.update(str(path) for path in paths)
+            unresolved = self._unresolved_after_core(
+                args, f"timeline/{paths[0].name}#record={body_plan['record_id']}")
+            return (f"正文与索引已写入，recordId={body_plan['record_id']}。bodyStatus=saved；"
+                    f"indexStatus=indexed；passiveStatus=pending：{e}；"
+                    "请只传 recordId＋passive 重试，不要重复正文或更正。 " + unresolved)
+        try:
+            paths = commit_memory_files([body_plan] + index_plans)
+        except OSError as e:
+            # 多文件核心提交失败后仍沿用旧语义：只要正文能独立落盘，就明确降级为 pending。
+            try:
+                paths = commit_memory_files([body_plan])
+            except OSError as write_error:
+                raise ToolError(str(write_error)) from None
+            self._refresh_after_write()
+            self.written_paths.update(str(path) for path in paths)
+            unresolved = self._unresolved_after_core(
+                args, f"timeline/{paths[0].name}#record={body_plan['record_id']}")
+            return (f"正文已保存，recordId={body_plan['record_id']}。bodyStatus=saved；"
+                    f"indexStatus=pending；passiveStatus={'pending' if passive_plan else passive_status}：{e}；"
+                    "请按同一 recordId 补齐，不要重复正文。 " + unresolved)
+        if passive_plan is not None:
+            try:
+                paths += commit_memory_files([passive_plan])
+            except OSError as e:
+                self._refresh_after_write()
+                self.written_paths.update(str(path) for path in paths)
+                unresolved = self._unresolved_after_core(
+                    args, f"timeline/{paths[0].name}#record={body_plan['record_id']}")
+                return (f"正文与索引已保存，recordId={body_plan['record_id']}。"
+                        f"bodyStatus=saved；indexStatus=indexed；passiveStatus=pending：{e}；"
+                        "请只传 recordId＋passive 重试，不要重复正文。 " + unresolved)
         # 写完立刻进内存索引并重建，本会话的 latent_search 就能查到——
         # 不然"我记下了"之后当场问它还查不到，模型会顺势说"没有记录"
         self._refresh_after_write()
@@ -1319,7 +1503,8 @@ class MemoryServer:
             args, f"timeline/{paths[0].name}#record={body_plan['record_id']}")
         return (f"已写进第 {body_plan['window']} 个窗口（{paths[0].name}），"
                 f"recordId={body_plan['record_id']}，并写入 {len(index_plans)} 条索引摘要。"
-                f"indexStatus=indexed。{hint} {unresolved}")
+                f"bodyStatus=saved；indexStatus=indexed；passiveStatus={passive_status}。"
+                f"{(' revision=' + entry['revision'] + '。') if entry else ''}{hint} {unresolved}")
 
     def _tool_memory_supersede(self, args, now=None):
         """原子写入新事实与双向变迁链；correct 的撤回账本完全不参与。"""
@@ -1392,7 +1577,9 @@ class MemoryServer:
                                             args.get("reason") or "", now=now)
         except ValueError as e:
             raise ToolError(str(e))
-        msg = "已撤回那段旧记录：检索不会再返回它（原文件保留，撤回原因入账可追溯）。"
+        old_record_id = _chunk_key(self.index.chunks[old_idx])
+        msg = ("已撤回那段旧记录：检索不会再返回它（原文件保留，撤回原因入账可追溯）。"
+               f" retractionStatus=applied；旧 recordId={old_record_id} 的 passiveStatus=invalidated。")
         if correction:
             if self.corpus_dir is None:
                 # 撤回已生效但更正写不进去——明确报出来，不静默丢（同 append 的理由）
@@ -1416,7 +1603,11 @@ class MemoryServer:
             # 追溯链补上：让账本能回答"哪条记录改了哪条"，不只是"这条被撤了"。
             # 只能在更正写完之后回填——新块的内容哈希这时才存在
             self.index.link_correction(old_idx, chunk_text)
-            msg += f" 更正已写进第 {meta['window']} 个窗口（{path.name}）。"
+            new_record_id = _chunk_key(chunk_text)
+            msg += (f" 更正已写进第 {meta['window']} 个窗口（{path.name}），"
+                    f"bodyStatus=saved；新 recordId={new_record_id}；indexStatus=pending；"
+                    "passiveStatus=pending。请用新 recordId 补 indexEvidence／passive，"
+                    "不要重复 correction。")
         else:
             correction_idx = None
         # 撤回粒度提醒（岔口 2）：撤回是块级的、事实是跨块的——刚撤的只是这一块，
@@ -1515,6 +1706,14 @@ class MemoryServer:
             pruned = {key: value for key, value in data.items() if key not in removed_hashes}
             if len(pruned) != len(data):
                 changes[path] = (json.dumps(pruned, ensure_ascii=False, indent=1) + "\n").encode("utf-8")
+
+        # 被动账本不是权威正文，但 cleanup 后也不能留下还能触发的孤儿元数据。
+        try:
+            passive_plan = self.passive_metadata.plan_remove(record_id)
+        except ValueError as exc:
+            raise ToolError(f"清理前无法核验 {PASSIVE_METADATA_FILENAME}：{exc}，拒绝改盘") from None
+        if passive_plan is not None:
+            changes[Path(passive_plan["path"])] = passive_plan["content"].encode("utf-8")
 
         snapshots = {}
         for path in changes:
