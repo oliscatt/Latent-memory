@@ -197,7 +197,7 @@ tunnel-client 主动建立出站 HTTPS，把 ChatGPT 请求转给 `127.0.0.1` �
 tunnel ID 与运行时 key 只从 OpenAI Platform 原始页面取，**不写入仓库或聊天记录**。
 
 基于 Latent 的独立 State Ledger 部署已由 ChatGPT Work 新窗口通过 Connector
-成功调用 `state_session_start` 并读取跨窗接力便签，因此可以说“ChatGPT Secure MCP Tunnel 已有真机读链路记录”。⚠ 该记录使用 `state_*`，不等于本项目 `latent_*` 七工具全量验收：逐个工具调用、`latent_append` 写入后的跨窗 `latent_search` 命中，以及人格自动注入仍无证据，不能借本次结果补齐。
+成功调用 `state_session_start` 并读取跨窗接力便签，因此可以说“ChatGPT Secure MCP Tunnel 已有真机读链路记录”。⚠ 该记录使用 `state_*`，不等于本项目 `latent_*` 八工具全量验收：逐个工具调用、`latent_append` 写入后的跨窗 `latent_search` 命中，以及人格自动注入仍无证据，不能借本次结果补齐。
 
 #### 其它 AI 聊天端 → **未实测、需确认 MCP 支持状态**
 

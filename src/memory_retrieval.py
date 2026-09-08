@@ -179,6 +179,14 @@ EMBED_HIT_FLOOR = get_hit_floor(DEFAULT_LOCAL_MODEL)
 # 必须重量，同 EMBED_HIT_FLOOR 换模型要重量的先例。
 MISS_RATE_FLAG = 0.35
 
+# 明确历史意图才让 superseded 事实进入候选；保持短而可核对，不让模型自由猜。
+HISTORY_INTENT_TERMS = ("以前", "曾经", "搬家前", "变迁", "什么时候变", "何时变",
+                        "之前", "从前", "当时", "历史")
+
+
+def has_history_intent(query):
+    return isinstance(query, str) and any(term in query for term in HISTORY_INTENT_TERMS)
+
 
 def tokenize(text: str):
     """BM25 用的中文零依赖分词：清标点/空白后取字符 bigram 当词。"""
@@ -296,14 +304,23 @@ class MemoryIndex:
         self.date_order = None
         self.retracted = set()          # chunk 下标
         self.retraction_log = {}        # 内容哈希 → {reason, time, source, heading}
+        # 事实变迁与“从未真实过”的纠错分账：supersession 只让旧事实退出默认检索，
+        # 历史意图下仍可沿双向链取回；retraction 则任何检索都不返回。
+        # 账本键是 timeline recordId，index 摘要通过文件名里的来源 recordId 跟随正文状态。
+        self.superseded = set()         # chunk 下标（含关联 index 摘要）
+        self.supersession_log = {}      # recordId → {status, supersedes, superseded_by, ...}
         # 实体标注（图谱层可插拔升级路径，任务卡"图谱实体抽取可插拔"）：
         # chunk 下标 → 实体集合。默认空——图谱走零依赖词面代理；用户花 LLM 调用
         # 抽取过实体（load_entities 接入 .entities.json）后，实体边并进图谱
         self._entities = {}
 
     def add(self, text, meta=None):
+        meta = dict(meta or {})
+        meta.setdefault("record_id", _chunk_key(text))
+        meta.setdefault("record_id_aliases", _record_id_aliases(text))
+        meta.setdefault("status", "current")
         self.chunks.append(text)
-        self.meta.append(meta or {})
+        self.meta.append(meta)
         self.weights.append(1.0)
 
     def build(self):
@@ -430,7 +447,7 @@ class MemoryIndex:
         now = time.time() if now is None else now
         scored = []
         for i, meta in enumerate(self.meta):
-            if i in self.retracted:   # 撤回的块不参与召回（同 retrieve）
+            if i in self.retracted or i in self.superseded:  # 默认召回只看 current
                 continue
             ts = meta.get("timestamp")
             if ts is None:
@@ -575,7 +592,7 @@ class MemoryIndex:
             return []
         skip = set(exclude) | {chunk_idx}
         out = [i for i, tf in enumerate(self._bm25.tf)
-               if i not in skip and i not in self.retracted
+               if i not in skip and i not in self.retracted and i not in self.superseded
                and any(t in tf for t in distinctive)]
         out.sort(key=lambda i: (-(self.meta[i].get("timestamp") or 0), i))
         return out
@@ -596,9 +613,14 @@ class MemoryIndex:
                 present.add(missing_layer)
         return selected
 
-    def retrieve(self, query, topN=5, reranker=None, coarse_topM=20, routes=None):
+    def retrieve(self, query, topN=5, reranker=None, coarse_topM=20, routes=None,
+                 include_superseded=False):
         """query → 前 topN 个相关片段 [{id, text, meta, score, weight}]。
         命中的片段权重 +weight_boost（用进废退），作为副作用记在 index 上。
+
+        自动浮现／影子查询不得调用本入口；它们使用 ``retrieve_candidates``。两条
+        路径共用下面同一套排序实现，区别只在最终是否写权重，不能靠检索后恢复
+        weights 快照冒充只读——那会覆盖并发主动搜索已经产生的合法增量。
 
         二阶段检索（设计笔记 待验证问题 2，任务卡"粗筛重排序两阶段"）：
         reranker 可插拔（同 draft_extraction.llm_call 的先例）——不传行为不变
@@ -617,6 +639,27 @@ class MemoryIndex:
         历史量具传入 weight 时保持兼容，但该键不再改变 retrieve 排序。
         注意可靠命中门槛不受 routes 影响——门槛问的是"这个块跟 query 有没有关系"，
         跟"用哪几路排序"是两件事。"""
+        return self._retrieve_ranked(query, topN=topN, reranker=reranker,
+                                     coarse_topM=coarse_topM, routes=routes,
+                                     update_weights=True,
+                                     include_superseded=include_superseded)
+
+    def retrieve_candidates(self, query, topN=5, reranker=None, coarse_topM=20,
+                            routes=None):
+        """返回与 ``retrieve`` 同序同形的纯候选，不修改任何活跃度状态。
+
+        这是自动浮现和影子评估的唯一查询入口。结果里的 ``weight`` 只是读取本轮
+        排序时已有值；本方法不写 weights、不写权重 sidecar，也不改内容时间。
+        """
+        return self._retrieve_ranked(query, topN=topN, reranker=reranker,
+                                     coarse_topM=coarse_topM, routes=routes,
+                                     update_weights=False,
+                                     include_superseded=False)
+
+    def _retrieve_ranked(self, query, topN=5, reranker=None, coarse_topM=20,
+                         routes=None, update_weights=False,
+                         include_superseded=False):
+        """共用检索排序核心；``update_weights`` 只允许主动入口传 True。"""
         routes = {"bm25", "vector", "graph"} if routes is None else set(routes)
         bm_scores = self._bm25.scores(tokenize(query))
         vec_scores = self._vector_scores(query)
@@ -659,6 +702,7 @@ class MemoryIndex:
             vec_admit = lambda i: _vec_admit_raw(i) and i in lex_ok  # noqa: E731
         scored_ok = [i for i in range(len(self.chunks))
                      if i not in self.retracted
+                     and (include_superseded or i not in self.superseded)
                      and (bm_admit(i) or vec_admit(i))]
         ok = set(scored_ok)
         bm_ranks = [i for i in ranked(bm_scores) if i in ok]
@@ -685,7 +729,8 @@ class MemoryIndex:
         graph_route = list(seeds)
         for seed in seeds:
             for nb in self.graph_neighbors(seed):
-                if nb not in graph_route and nb not in self.retracted:
+                if (nb not in graph_route and nb not in self.retracted
+                        and (include_superseded or nb not in self.superseded)):
                     graph_route.append(nb)
         # 带出了新关联块才追加，没有就退回两路融合
         if "graph" in routes and len(graph_route) > len(seeds):
@@ -719,11 +764,13 @@ class MemoryIndex:
             "score": score,
             "weight": self.weights[idx],  # 本次排序所用的权重（+0.05 前）
         } for idx, score in fused]
-        for idx, _ in fused:
-            self.weights[idx] += self.weight_boost  # 用进废退：命中即加权
+        if update_weights:
+            for idx, _ in fused:
+                self.weights[idx] += self.weight_boost  # 用进废退：命中即加权
         return results
 
-    def retrieve_queries(self, queries, topN=5, candidate_topM=20):
+    def retrieve_queries(self, queries, topN=5, candidate_topM=20,
+                         include_superseded=False):
         """原查询＋至多一个改述查询 → RRF 融合后的前 topN 个片段。
 
         改述由宿主模型给，不在这里内置同义词表或调用模型。两条查询分别走完整的
@@ -757,7 +804,8 @@ class MemoryIndex:
         try:
             for query in cleaned:
                 self.weights[:] = baseline
-                rows = self.retrieve(query, topN=pool_n)
+                rows = self.retrieve(query, topN=pool_n,
+                                     include_superseded=include_superseded)
                 rank_lists.append([row["id"] for row in rows])
         finally:
             # 内部查询即使异常，也不能把跑到一半的候选权重留在索引上。
@@ -841,7 +889,7 @@ class MemoryIndex:
         if not (isinstance(quote, str) and quote.strip()):
             raise ValueError("quote 必填：从检索结果里逐字摘一段要撤回的原文")
         if not (isinstance(reason, str) and reason.strip()):
-            raise ValueError("reason 必填（追溯用）：为什么撤回——记错了/已过时/对方更正了……")
+            raise ValueError("reason 必填（追溯用）：为什么撤回——记错了/从未真实过/对方更正了……")
         quote = quote.strip()
         matches = [i for i, c in enumerate(self.chunks)
                    if quote in c and i not in self.retracted]
@@ -892,6 +940,164 @@ class MemoryIndex:
                 self.retracted.add(i)
                 n += 1
         return n
+
+    # ---------- 事实变迁与双向追溯 ----------
+
+    def load_supersessions(self, path):
+        """载入事实变迁账本；文件不存在＝全部老数据默认 current。
+
+        账本不改正文，因此 recordId、权重、撤回与索引引用都不会因为迁移而漂移。
+        status 也写进每块 meta，调用方不必把“没出现于账本”误解成未知状态。
+        """
+        self.superseded.clear()
+        self.supersession_log = {}
+        for meta in self.meta:
+            meta["status"] = "current"
+        p = Path(path)
+        if not p.exists():
+            return 0
+        raw = json.loads(p.read_text(encoding="utf-8"))
+        records = raw.get("records", raw) if isinstance(raw, dict) else None
+        if not isinstance(records, dict):
+            raise ValueError("事实变迁账本格式错误：records 必须是对象")
+        for rid, entry in records.items():
+            if not isinstance(rid, str) or not re.fullmatch(r"[0-9a-f]{16}", rid):
+                raise ValueError("事实变迁账本格式错误：recordId 必须是 16 位小写十六进制")
+            if not isinstance(entry, dict) or entry.get("status") not in {"current", "superseded"}:
+                raise ValueError(f"事实变迁账本格式错误：{rid} 缺合法 status")
+            for link in ("supersedes", "superseded_by"):
+                target = entry.get(link)
+                if target is not None and target not in records:
+                    raise ValueError(f"事实变迁账本断链：{rid}.{link} 指向不存在的 {target}")
+        for rid, entry in records.items():
+            previous, following = entry.get("supersedes"), entry.get("superseded_by")
+            if previous and records[previous].get("superseded_by") != rid:
+                raise ValueError(f"事实变迁账本双向链接不一致：{previous} → {rid}")
+            if following and records[following].get("supersedes") != rid:
+                raise ValueError(f"事实变迁账本双向链接不一致：{rid} → {following}")
+            if bool(following) != (entry.get("status") == "superseded"):
+                raise ValueError(f"事实变迁账本状态与链接不一致：{rid}")
+        self.supersession_log = records
+        for rid in records:
+            self.chain_record_ids(rid)  # 启动时拒绝有环账本，不把损坏拖到某次历史查询
+        for i, meta in enumerate(self.meta):
+            rid = meta.get("record_id")
+            matched = next((alias for alias in meta.get("record_id_aliases", [rid])
+                            if alias in records), rid)
+            if matched in records:
+                meta["record_id"] = matched
+            entry = records.get(matched, {})
+            meta["supersedes"] = entry.get("supersedes")
+            meta["superseded_by"] = entry.get("superseded_by")
+            meta["superseded_at"] = entry.get("superseded_at")
+            if entry.get("status") == "superseded":
+                meta["status"] = "superseded"
+                self.superseded.add(i)
+        return len(records)
+
+    def supersession_plan(self, old_record_id, new_record_id, now=None):
+        """校验一次 current→new 变迁并返回新版账本数据，不修改内存。"""
+        if not isinstance(old_record_id, str) or not re.fullmatch(r"[0-9a-f]{16}", old_record_id):
+            raise ValueError("supersedes 必须是 latent_search／latent_append 返回的 16 位 recordId")
+        old = [i for i, meta in enumerate(self.meta)
+               if meta.get("layer", "timeline") == "timeline"
+               and old_record_id in meta.get("record_id_aliases", [meta.get("record_id")])]
+        if len(old) != 1:
+            reason = "没有找到" if not old else "找到多条"
+            raise ValueError(f"按 supersedes={old_record_id} {reason} timeline 记录，拒绝猜测")
+        if old[0] in self.retracted:
+            raise ValueError("目标记录已经被 correct 撤回，不能再作为真实历史被取代")
+        old_entry = self.supersession_log.get(old_record_id, {})
+        if old_entry.get("status", "current") != "current" or old_entry.get("superseded_by"):
+            raise ValueError("目标记录已经被后续事实取代；请沿 superseded_by 使用当前链尾")
+        if old_record_id == new_record_id:
+            raise ValueError("新旧 recordId 相同，不能建立自指变迁")
+        if any(meta.get("layer", "timeline") == "timeline"
+               and meta.get("record_id") == new_record_id for meta in self.meta):
+            raise ValueError("新事实与现有 timeline 记录重复，拒绝建立歧义链")
+        at = time.time() if now is None else now
+        records = json.loads(json.dumps(self.supersession_log, ensure_ascii=False))
+        old_copy = dict(records.get(old_record_id, {}))
+        old_copy.update({"status": "superseded", "superseded_by": new_record_id,
+                         "superseded_at": at})
+        old_copy.setdefault("supersedes", None)
+        old_copy.setdefault("recorded_at", self.meta[old[0]].get("timestamp"))
+        records[old_record_id] = old_copy
+        records[new_record_id] = {
+            "status": "current", "supersedes": old_record_id,
+            "superseded_by": None, "recorded_at": at,
+        }
+        return {"version": 1, "records": records}
+
+    def chain_record_ids(self, record_id):
+        """从链中任一 recordId 返回 root→current 的完整有序 ID。"""
+        if record_id not in self.supersession_log:
+            return [record_id]
+        seen = set()
+        root = record_id
+        while self.supersession_log.get(root, {}).get("supersedes"):
+            if root in seen:
+                raise ValueError("事实变迁账本存在环")
+            seen.add(root)
+            root = self.supersession_log[root]["supersedes"]
+        out, cursor, seen = [], root, set()
+        while cursor:
+            if cursor in seen:
+                raise ValueError("事实变迁账本存在环")
+            seen.add(cursor)
+            out.append(cursor)
+            cursor = self.supersession_log.get(cursor, {}).get("superseded_by")
+        return out
+
+    def expand_supersession_chains(self, results):
+        """命中链中任一节点后，用 timeline 正文替换摘要并补齐整链。"""
+        expanded, emitted = [], set()
+        for row in results:
+            rid = row["meta"].get("record_id")
+            if rid in self.supersession_log:
+                chain = tuple(self.chain_record_ids(rid))
+                marker = chain[0]
+                if marker in emitted:
+                    continue
+                emitted.add(marker)
+                by_id = {meta.get("record_id"): i for i, meta in enumerate(self.meta)
+                         if meta.get("layer", "timeline") == "timeline"
+                         and i not in self.retracted}
+                for chain_id in chain:
+                    idx = by_id.get(chain_id)
+                    if idx is None:
+                        continue
+                    expanded.append({"id": idx, "text": self.chunks[idx],
+                                     "meta": self.meta[idx], "score": row["score"],
+                                     "weight": self.weights[idx]})
+            else:
+                marker = ("row", row["id"])
+                if marker not in emitted:
+                    emitted.add(marker)
+                    expanded.append(row)
+        return expanded
+
+    def matching_supersession_roots(self, query):
+        """同一显式链里至少两个 recordId 获得可靠词面命中时，返回链根。
+
+        这是“同一实体同一字段命中多条”的保守代理：只认写入时已经确认过的
+        supersession 链，不从自由文本另猜 entity／field，也不额外请求 embedding。
+        """
+        if not self.supersession_log:
+            return set()
+        bm_scores = self._bm25.scores(tokenize(query))
+        lex_ok = self.lexical_admit(tokenize(query))
+        matched = set()
+        for i, meta in enumerate(self.meta):
+            rid = meta.get("record_id")
+            if (rid in self.supersession_log and i not in self.retracted
+                    and bm_scores[i] > 0 and i in lex_ok):
+                matched.add(rid)
+        by_root = defaultdict(set)
+        for rid in matched:
+            chain = self.chain_record_ids(rid)
+            by_root[chain[0]].add(rid)
+        return {root for root, ids in by_root.items() if len(ids) >= 2}
 
     # ---------- 实体标注接入（图谱层可插拔升级路径） ----------
 
@@ -997,6 +1203,17 @@ def _chunk_key(text):
     return hashlib.md5(text.encode("utf-8")).hexdigest()[:16]
 
 
+def _record_id_aliases(text):
+    """完整切块与去掉 H1 前导后的两种稳定 ID；兼容同窗口清理后的边界漂移。"""
+    ids = [_chunk_key(text)]
+    h2 = re.search(r"(?m)^## ", text or "")
+    if h2 and h2.start() > 0:
+        bare = _chunk_key(text[h2.start():])
+        if bare not in ids:
+            ids.append(bare)
+    return ids
+
+
 # ---------- chunk 时间戳（recall_recent 按新鲜度排序的前提，任务卡第 1 条） ----------
 
 # 文件名里的完整日期：2026-07-29 / 2026.7.29 / 20260729 / 2026年7月29日 都认
@@ -1020,6 +1237,7 @@ _DATE_SHORT_RE = re.compile(r"(?<![\d.])(\d{1,2})\s*[.月]\s*(\d{1,2})(?![\d.])"
 # 真实语料实测 36/36 可解析——比日期可靠得多，所以它同时兼任"呈现用的定位标签"
 # （规格 §3.2：静态文件里用窗口号）和"没有日期时的时序信号"
 _WINDOW_RE = re.compile(r"window[_\-]?(\d{1,4})", re.I)
+_SOURCE_RECORD_RE = re.compile(r"_record_([0-9a-f]{16})_item_", re.I)
 
 
 def parse_window_no(filename):
@@ -1340,6 +1558,14 @@ def load_corpus(corpus_dir, embed=False, recursive=True, provider=None, cache_pa
         info = file_info[p]
         for chunk, meta in timeline_chunks(info["text"], p.name, info["mtime"], date_order):
             meta["window"], meta["layer"] = info["window"], info["layer"]
+            source_record = _SOURCE_RECORD_RE.search(p.name) if info["layer"] == "index" else None
+            # timeline 自己的内容哈希就是 recordId；索引摘要沿用文件名里的来源 recordId。
+            # 没有来源标识的老 index 仍给自身哈希，兼容读取但不冒充关联正文。
+            meta["record_id"] = (source_record.group(1).lower() if source_record
+                                 else _chunk_key(chunk))
+            meta["record_id_aliases"] = ([meta["record_id"]] if source_record
+                                         else _record_id_aliases(chunk))
+            meta["status"] = "current"
             if meta["timestamp_source"] == "mtime":
                 borrowed = window_ts.get(info["window"])
                 if borrowed is not None:
@@ -1464,7 +1690,8 @@ def plan_append_record(corpus_dir, text, current_state, window=None, now=None,
             "timestamp_source": "append", "window": window, "layer": "timeline",
             # 排序看 timestamp（epoch），展示与归窗看 local_date（用户自然日）——
             # 两者分开是这张卡的第二节：一个数管排序，一个数管"这是哪天的事"
-            "local_date": day, "timezone": tc.name or ""}
+            "local_date": day, "timezone": tc.name or "", "record_id": record_id,
+            "record_id_aliases": _record_id_aliases(record_text), "status": "current"}
     return {"path": path, "content": content, "meta": meta, "local_date": day,
             "window": window, "record_text": record_text, "record_id": record_id}
 

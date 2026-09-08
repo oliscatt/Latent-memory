@@ -13,6 +13,8 @@ latent_session_start / latent_thread_close 都不由宿主代调——模型主�
 用法：
   python reference_host.py <产出目录>    # 目录里要有 persona.md 与 mcp-config.json
   python reference_host.py --selftest   # 不联网不要 key：契约逐条断言 + 真起一次 server
+自动浮现选择：产出目录可放 passive-recall.json；缺省即关闭，启用时必须明确选择
+  temporary／retained。W1 入口尚未随 server 提供时会暂停，不会静默改走主动搜索。
 环境变量：HOST_API_KEY（必填；key 只从环境读，不写进任何文件——凭证不入库）、
   HOST_API_BASE（默认 https://api.deepseek.com/v1）、HOST_MODEL（默认 deepseek-chat）。
 """
@@ -21,9 +23,13 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from pathlib import Path
+
+from passive_recall_host import (HIDDEN_TOOL, PassiveRecallAdapter,
+                                 PassiveRecallConfigError, load_config)
 
 API_BASE = os.environ.get("HOST_API_BASE", "https://api.deepseek.com/v1")
 MODEL = os.environ.get("HOST_MODEL", "deepseek-chat")
@@ -40,31 +46,71 @@ class McpClient:
                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      encoding="utf-8")
         self._id = 0
+        self._send_lock = threading.Lock()
+        self._response_ready = threading.Condition()
+        self._responses = {}
+        self._abandoned = set()
+        self._reader_closed = False
+        self._reader = threading.Thread(target=self._read_responses, daemon=True)
+        self._reader.start()
         init = self._rpc("initialize", {"protocolVersion": "2025-06-18",
                                         "clientInfo": {"name": "reference-host"}})
         # instructions 拿到手就要递给模型（进易变块）——坑①说的"很多前端不递"，
         # 参考宿主不能自己就是反面教材
         self.instructions = init.get("instructions", "")
         self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
-        self.tools = self._rpc("tools/list")["tools"]
+        self.server_tools = self._rpc("tools/list")["tools"]
+        # 自动入口由宿主调度，不能转交聊天模型。旧 server 没有该入口时列表逐项不变。
+        self.tools = [tool for tool in self.server_tools if tool["name"] != HIDDEN_TOOL]
 
     def _send(self, msg):
-        self.proc.stdin.write(json.dumps(msg, ensure_ascii=False) + "\n")
-        self.proc.stdin.flush()
+        with self._send_lock:
+            self.proc.stdin.write(json.dumps(msg, ensure_ascii=False) + "\n")
+            self.proc.stdin.flush()
 
-    def _rpc(self, method, params=None):
-        self._id += 1
-        self._send({"jsonrpc": "2.0", "id": self._id, "method": method, "params": params or {}})
+    def _read_responses(self):
         for line in self.proc.stdout:
-            msg = json.loads(line)
-            if msg.get("id") == self._id:
-                if "error" in msg:
-                    raise RuntimeError(msg["error"]["message"])
-                return msg["result"]
-        raise RuntimeError("server 进程退出，没等到响应")
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if "id" in msg:
+                with self._response_ready:
+                    if msg["id"] in self._abandoned:
+                        self._abandoned.remove(msg["id"])
+                    else:
+                        self._responses[msg["id"]] = msg
+                    self._response_ready.notify_all()
+        with self._response_ready:
+            self._reader_closed = True
+            self._response_ready.notify_all()
+
+    def _rpc(self, method, params=None, timeout=None):
+        with self._response_ready:
+            self._id += 1
+            request_id = self._id
+        self._send({"jsonrpc": "2.0", "id": request_id,
+                    "method": method, "params": params or {}})
+        deadline = None if timeout is None else time.monotonic() + float(timeout)
+        with self._response_ready:
+            while request_id not in self._responses and not self._reader_closed:
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    self._abandoned.add(request_id)
+                    raise TimeoutError(f"{method} 等待响应超时")
+                self._response_ready.wait(remaining)
+            msg = self._responses.pop(request_id, None)
+        if msg is None:
+            raise RuntimeError("server 进程退出，没等到响应")
+        if "error" in msg:
+            raise RuntimeError(msg["error"]["message"])
+        return msg["result"]
+
+    def call_result(self, name, args, timeout=None):
+        return self._rpc("tools/call", {"name": name, "arguments": args}, timeout=timeout)
 
     def call(self, name, args):
-        r = self._rpc("tools/call", {"name": name, "arguments": args})
+        r = self.call_result(name, args)
         return r["content"][0]["text"]   # isError 的文本也原样交给模型——它要看到失败原因
 
 
@@ -101,25 +147,42 @@ def run_turn(mcp, persona, history, transport=chat):
     """一轮对话：模型要用工具就转发给 server，直到它给出文字回答。"""
     while True:
         volatile = mcp.instructions + "\n当前时间：" + time.strftime("%Y-%m-%d %H:%M")
-        msg = transport(build_request(persona, volatile, history, mcp.tools))
+        request_history = (mcp.passive.messages_for_request(history)
+                           if getattr(mcp, "passive", None) else history)
+        msg = transport(build_request(persona, volatile, request_history, mcp.tools))
         history.append(msg)
         if not msg.get("tool_calls"):
             return msg.get("content") or ""
         for c in msg["tool_calls"]:
             print(f"  [工具] {c['function']['name']}", file=sys.stderr)
             try:
-                text = mcp.call(c["function"]["name"],
-                                json.loads(c["function"]["arguments"] or "{}"))
+                result = mcp.call_result(c["function"]["name"],
+                                         json.loads(c["function"]["arguments"] or "{}"))
+                text = result["content"][0]["text"]
             except Exception as e:   # 工具坏了如实告诉模型，不吞掉装没事
+                result = None
                 text = f"工具调用失败：{e}"
             history.append({"role": "tool", "tool_call_id": c["id"], "content": text})
+            # 必须在真实 tool 消息落入 history 之后再追加失效通知，不能插断
+            # assistant(tool_calls)／tool 配对。
+            if result is not None and getattr(mcp, "passive", None):
+                mcp.passive.observe_tool_result(result)
 
 
 def main(out_dir):
     if not os.environ.get("HOST_API_KEY"):
         sys.exit("先设 HOST_API_KEY 环境变量（key 只从环境读，不写进任何文件）。")
     persona = read_persona(out_dir)
+    try:
+        config = load_config(Path(out_dir) / "passive-recall.json")
+    except (OSError, json.JSONDecodeError, PassiveRecallConfigError) as exc:
+        sys.exit(f"自动浮现配置无效：{exc}")
     mcp = McpClient(Path(out_dir) / "mcp-config.json")
+    hidden_available = any(tool["name"] == HIDDEN_TOOL for tool in mcp.server_tools)
+    fetch = (lambda request, timeout: mcp.call_result(
+        HIDDEN_TOOL, request, timeout=timeout).get("structuredContent", {})) \
+        if hidden_available else None
+    mcp.passive = PassiveRecallAdapter(config=config, fetch=fetch)
     print(f"参考宿主就绪：{MODEL} @ {API_BASE}，工具 {len(mcp.tools)} 个。exit / Ctrl-D 结束。")
     history = []
     while True:
@@ -130,7 +193,17 @@ def main(out_dir):
         if not line or line == "exit":
             break
         history.append({"role": "user", "content": line})
-        print("模型> " + run_turn(mcp, persona, history))
+        delivery_id = f"reference:{len([m for m in history if m.get('role') == 'user'])}"
+        passive_status = mcp.passive.begin_turn(
+            history, session_id="reference-process", turn_id=delivery_id,
+            delivery_id=delivery_id, user_input=line)
+        if config.enabled and passive_status not in {"ready", "candidate", "empty"}:
+            detail = f"：{mcp.passive.paused_reason}" if mcp.passive.paused_reason else ""
+            print(f"  [自动浮现] 本轮未交付（{passive_status}）{detail}", file=sys.stderr)
+        try:
+            print("模型> " + run_turn(mcp, persona, history))
+        finally:
+            mcp.passive.finish_turn()
     mcp.proc.terminate()
 
 
@@ -178,7 +251,8 @@ def _selftest():
         mcp = McpClient(cfgp)
         try:
             assert [t["name"] for t in mcp.tools] == ["latent_search", "latent_session_start",
-                                                      "latent_append", "latent_correct",
+                                                      "latent_append", "latent_supersede",
+                                                      "latent_correct",
                                                       "latent_cleanup",
                                                       "latent_unresolved",
                                                       "latent_thread_close"]
@@ -202,6 +276,48 @@ def _selftest():
                 "回路里每一轮请求的第一条消息都必须是逐字 persona（契约二）"
         finally:
             mcp.proc.terminate()
+
+    # W0 真超时：读取泵必须在截止点放行正常对话，并把迟到响应按 id 丢掉；
+    # 后续工具调用仍能收到自己的响应，不能被迟到包串走。
+    with tempfile.TemporaryDirectory() as td:
+        fake_server = Path(td) / "slow_mcp.py"
+        fake_server.write_text('''import json, sys, time
+for line in sys.stdin:
+    msg = json.loads(line)
+    if "id" not in msg:
+        continue
+    method = msg.get("method")
+    if method == "initialize":
+        result = {"instructions": "慢服务夹具"}
+    elif method == "tools/list":
+        result = {"tools": [
+            {"name": "latent_passive_recall", "description": "宿主入口", "inputSchema": {"type": "object"}},
+            {"name": "ping", "description": "普通工具", "inputSchema": {"type": "object"}}]}
+    else:
+        name = msg.get("params", {}).get("name")
+        if name == "latent_passive_recall":
+            time.sleep(0.15)
+        result = {"content": [{"type": "text", "text": name or "ok"}], "isError": False}
+    print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": result}), flush=True)
+''', encoding="utf-8")
+        cfgp = Path(td) / "mcp-config.json"
+        cfgp.write_text(json.dumps({"mcpServers": {"memory": {
+            "command": sys.executable, "args": [str(fake_server)]}}}), encoding="utf-8")
+        slow_mcp = McpClient(cfgp)
+        try:
+            assert [tool["name"] for tool in slow_mcp.tools] == ["ping"], \
+                "宿主隐藏入口不能出现在聊天模型工具表"
+            started = time.monotonic()
+            try:
+                slow_mcp.call_result(HIDDEN_TOOL, {}, timeout=0.02)
+                raise AssertionError("慢调用必须在截止点超时")
+            except TimeoutError:
+                pass
+            assert time.monotonic() - started < 0.1, "超时不能等迟到响应回来才放行"
+            assert slow_mcp.call_result("ping", {}, timeout=0.5)["content"][0]["text"] == "ping", \
+                "迟到响应不得串给后续普通工具"
+        finally:
+            slow_mcp.proc.terminate()
     print("selftest 通过：契约五条 + MCP 桥 + 工具回路")
 
 
