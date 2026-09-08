@@ -891,7 +891,9 @@ class MemoryServer:
         self.recall = SessionRecall(self.index, topN=recall_topN, thread_store=self.thread_store,
                                     time_context=self.time_context,
                                     unresolved_store=self.unresolved_store)
-        self.passive = PassiveRecallService(self.index) if enable_passive_recall else None
+        self.passive = PassiveRecallService(
+            self.index, metadata_reader=self.passive_metadata.read
+        ) if enable_passive_recall else None
         self.tools = list(TOOLS) + ([PASSIVE_RECALL_TOOL_SCHEMA] if self.passive else [])
         self.initialized = False
         # 写回与权重持久化（任务卡"记忆写回与权重持久化"）：
@@ -1050,7 +1052,7 @@ class MemoryServer:
         return {"text": text, "structuredContent": self.passive.search_metadata(results)}
 
     def _tool_passive_recall(self, args, now=None):
-        """宿主隐藏入口；策略与组装未完成前只返回结构化 candidate。"""
+        """宿主隐藏入口；W3 完成程序准入，W4 组装前仍只返回结构化 candidate。"""
         if self.passive is None:
             raise ToolError("自动浮现宿主入口未启用")
         try:
