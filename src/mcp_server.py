@@ -35,6 +35,7 @@ stdio 只能由宿主拉起（手动 `nohup` 必崩）、懒加载每次调用�
   latent_search  → MemoryIndex.retrieve
   latent_session_start  → SessionRecall.on_session_start（thread 块 + 召回块 + 自查指令）
   latent_append  → memory_retrieval.append_record（正文层的笔）
+  latent_supersede → append_record + .supersessions.json（真实事实的变迁链）
   latent_correct → MemoryIndex.retract（+ 可选 append_record 写更正）
   latent_cleanup → 按稳定 recordId 两阶段清理一条自写记录（先隔离备份）
   latent_unresolved → UnresolvedStore.apply（显式维护未解决清单）
@@ -81,7 +82,8 @@ from memory_retrieval import (MemoryIndex, load_corpus, append_record, corpus_fi
                               plan_append_record, plan_index_records,
                               query_miss_rate, miss_rate_note, annotate_block,
                               _chunk_key, INDEX_SUMMARY_TEMPLATE,
-                              INDEX_SUMMARY_EXAMPLE, INDEX_SUMMARY_FORMAT_GUIDE)
+                              INDEX_SUMMARY_EXAMPLE, INDEX_SUMMARY_FORMAT_GUIDE,
+                              has_history_intent)
 from embedding_provider import resolve_provider
 # 切块下界与体检的切块成色检查**共用同一个判据**，不各抄一份
 from chunking_experiment import chunk_body as _chunk_body, chunk_heading
@@ -94,6 +96,8 @@ from unresolved_state import (FILENAME as UNRESOLVED_FILENAME, UnresolvedRequest
 # 两种起动形态共用同一个，不各自造一份换算逻辑
 from time_context import (TimeContext, detect_local_timezone, parse_record_time_marker,
                           tzdb_available)
+from passive_recall import (PassiveRecallRequestError, PassiveRecallService,
+                            TOOL_NAME as PASSIVE_RECALL_TOOL)
 
 PROTOCOL_VERSION = "2025-06-18"   # 官方规格版本，已查证
 SERVER_INFO = {"name": "memory-protocol", "title": "记忆协议", "version": "0.1.0"}
@@ -117,13 +121,14 @@ INSTRUCTIONS = (
     "open；仍没结束但缺口变了用 update；明确完成、取消或不再继续才 close；没有变化传 "
     "none。不要按关键词或内容相似自动关闭。thread 只是上个窗口的历史快照，当前仍未解决"
     "什么只看清单。单独维护或失败重试用 latent_unresolved，不要重复 append 正文。\n"
-    "但状态变化不总是直接追加：对方说出住址、当前职业、当前状态这类同一时刻只能有"
-    "一个答案的事实，而 latent_search 查到的旧值与新说法互斥时，先用 latent_correct "
-    "让旧值退出检索，再用 latent_append 写新值；不要只 append 造成并存。冲突用常识判断，"
+    "但状态变化不总是直接追加：住址、当前职业、当前状态这类单值事实若旧值当时真实、"
+    "后来发生变化，用 latent_supersede 写新值并链接旧 recordId；不要 correct 掉历史。"
+    "冲突用常识判断，"
     "不要预先给每句话分类。喜欢的电影、去过的地方、多个朋友这类并列事实应当共存，不得"
     "为了写新项而 correct 旧项。\n"
-    "记错了的事也有出口：对方指出某段记忆不对或已经过时，**当场用 latent_correct "
-    "撤回旧记录并写上更正**——只口头认错不改库，下次照样检索到错的。\n"
+    "记错了的事也有出口：对方指出某段记忆从未真实过，**当场用 latent_correct "
+    "撤回旧记录并写上更正**——只口头认错不改库，下次照样检索到错的；后来才变化"
+    "则用 latent_supersede。\n"
     "只有在明确要清掉一次误写正文、且手上有 latent_append 返回的 recordId 时，才用 "
     "latent_cleanup：必须先 preview，向对方展示将移除的记录，再把确认令牌逐字交回 delete；"
     "不得按相似文字猜记录，不得跳过确认。\n"
@@ -218,8 +223,8 @@ TOOLS = [
         "title": "写回记忆",
         "description": "把值得长期记住的事写进记忆库。**对话里出现新约定、重要事件、"
                        "状态变化，或对方明确说要记住的——当场调用，不用请示，也不用等"
-                       "会话结束**。若 latent_search 里已有与新说法互斥的单值事实，必须先"
-                       "latent_correct 旧值，不得只调本工具；可并列的喜好、经历与人际事实则"
+                       "会话结束**。若旧单值事实当时真实、后来变化，必须改用 latent_supersede；"
+                       "只有旧值从未真实过才 latent_correct。可并列的喜好、经历与人际事实则"
                        "直接追加，不得撤旧项。写发生了什么和原话（纪录片写法，不写评语）；"
                        "current_state 必填：这件事现在的状态（约定成立/还在处理/"
                        "已解决……）——不写的话，未来重读会把它当成正在发生的事。"
@@ -276,18 +281,66 @@ TOOLS = [
         },
     },
     {
+        "name": "latent_supersede",
+        "title": "登记事实变迁",
+        "description": "旧事实当时真实、后来发生变化时使用。写入新事实，并用 supersedes "
+                       "指定被取代的旧 recordId；旧记录保留为 status=superseded，默认检索隐藏，"
+                       "历史意图查询会沿 supersedes／superseded_by 返回完整时间链。若旧记录从未"
+                       "真实过，请用 latent_correct，不要用本工具。支持 mode=preflight；"
+                       "新事实正文、索引和变迁账本同批提交。",
+        "annotations": {
+            "readOnlyHint": False,
+            "destructiveHint": False,
+            "idempotentHint": False,
+            "openWorldHint": False,
+        },
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "mode": {"type": "string", "enum": ["write", "preflight"],
+                         "description": "可选；默认 write。preflight 只校验，绝不写盘"},
+                "supersedes": {"type": "string",
+                               "description": "被新事实取代的旧记录 16 位 recordId"},
+                "text": {"type": "string", "description": "新发生且现在真实的事实"},
+                "current_state": {"type": "string",
+                                  "description": "**必填**：变化后的当前状态"},
+                "window": {"type": "integer",
+                           "description": "第几个窗口（可省略，按日期自动归窗）"},
+                "indexEvidence": {
+                    "type": "array", "minItems": 1,
+                    "description": "推荐；从新事实正文逐段摘取的索引证据",
+                    "items": {"type": "object", "properties": {
+                        "type": {"type": "string",
+                                 "enum": ["event", "feeling", "reason", "state", "context"]},
+                        "quote": {"type": "string"},
+                    }, "required": ["type", "quote"]},
+                },
+                "indexSummaries": {
+                    "type": "array", "minItems": 1,
+                    "description": "旧客户端兼容字段；新调用请改用 indexEvidence",
+                    "items": {"type": "object", "properties": {
+                        "summary": {"type": "string", "description": INDEX_SUMMARY_FORMAT_GUIDE},
+                        "evidenceTerms": {"type": "array", "minItems": 1,
+                                          "items": {"type": "string"}},
+                    }, "required": ["summary", "evidenceTerms"]},
+                },
+                "unresolvedOps": _UNRESOLVED_OPS_SCHEMA,
+            },
+            "required": ["supersedes", "text", "current_state"],
+        },
+    },
+    {
         "name": "latent_correct",
         "title": "更正记忆",
-        "description": "对方指出某段记忆**记错了或已经过时**（关系变了/搬家了/"
-                       "计划改了……）时当场调用：撤回那段旧记录（检索不再返回它；"
+        "description": "对方指出某段记忆**从未真实过**时当场调用：撤回那段旧记录"
+                       "（检索不再返回它；"
                        "原文件与撤回原因留档，可追溯），并可同时写入更正后的记录。"
                        "quote 必须从 latent_search 返回的原文里**逐字**摘一段、"
                        "足够长能唯一定位那条记录。只口头认错不调这个工具的话，"
                        "库没变，下次照样检索到错的。⚠ 撤的是你摘的**那一块**，"
                        "不是「这件事」——同一说法若散在别的记录里不受影响；"
                        "撤回后服务端会告诉你库里还有几块与它共享词面，可以再查一次看看，不必逐条撤。"
-                       "处理单值事实的当前值变化时，本次先只撤旧值（省略 correction），"
-                       "再单独调 latent_append 写新值；这样动作顺序可见，不会被误做成纯 append。",
+                       "事实当时真实、后来才变化时必须改用 latent_supersede，保留历史链。",
         "annotations": {
             "readOnlyHint": False,
             "destructiveHint": True,
@@ -300,7 +353,7 @@ TOOLS = [
                 "quote": {"type": "string",
                           "description": "要撤回的记录原文片段（逐字，不转述）"},
                 "reason": {"type": "string",
-                           "description": "为什么撤回——记错了/已过时/对方更正了什么"},
+                           "description": "为什么撤回——记错了/从未真实过/对方更正了什么"},
                 "correction": {"type": "string",
                                "description": "更正后的内容（可省略：只撤不补）"},
                 "current_state": {"type": "string",
@@ -388,6 +441,32 @@ TOOLS = [
         },
     },
 ]
+
+# 宿主专用入口：只在服务端显式启用时加入工具表，并由参考宿主从聊天模型工具列表
+# 过滤。默认部署仍逐项返回原来的七个工具，不能因升级静默开启自动检索。
+PASSIVE_RECALL_TOOL_SCHEMA = {
+    "name": PASSIVE_RECALL_TOOL,
+    "title": "自动浮现宿主入口",
+    "description": "宿主在用户消息后、首个模型请求前调用的只读候选入口；不得转交聊天模型。",
+    "annotations": {
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "userInput": {"type": "string"},
+            "turn": {"type": "object"},
+            "scope": {},
+            "previousAnchors": {"type": "array"},
+            "contextEvidence": {"type": "array"},
+            "capability": {"type": "object"},
+        },
+        "required": ["userInput", "turn"],
+    },
+}
 
 
 def _utf8_text_stream(binary, write=False):
@@ -757,9 +836,10 @@ class MemoryServer:
 
     def __init__(self, index=None, thread_store=None, search_topN=5, recall_topN=3,
                  corpus_dir=None, weights_path=None, retractions_path=None,
-                 entities_path=None, loader=None, time_context=None,
+                 supersessions_path=None, entities_path=None, loader=None, time_context=None,
                  source_dirs=None, index_dir=None, startup_notice=None,
-                 require_unresolved_review=False, write_dir=None):
+                 require_unresolved_review=False, write_dir=None,
+                 enable_passive_recall=False):
         # 两个 topN 分开（2026.07.31 真实语料冒烟后拆的）：显式检索是用户/模型
         # 主动问一件事，多给几条值；开场召回每次换窗都付一遍，条数要克制
         self.index = index if index is not None else MemoryIndex().build()
@@ -784,6 +864,8 @@ class MemoryServer:
         self.recall = SessionRecall(self.index, topN=recall_topN, thread_store=self.thread_store,
                                     time_context=self.time_context,
                                     unresolved_store=self.unresolved_store)
+        self.passive = PassiveRecallService(self.index) if enable_passive_recall else None
+        self.tools = list(TOOLS) + ([PASSIVE_RECALL_TOOL_SCHEMA] if self.passive else [])
         self.initialized = False
         # 写回与权重持久化（任务卡"记忆写回与权重持久化"）：
         # corpus_dir 是写回的落点，没配就明确拒写；weights_path 没配则权重只活在
@@ -804,6 +886,12 @@ class MemoryServer:
         self.retractions_path = retractions_path
         if retractions_path is not None:
             self.index.load_retractions(retractions_path)
+        # 老部署没有该文件时 load_supersessions 返回 0，全部记录显式视为 current。
+        self.supersessions_path = (Path(supersessions_path) if supersessions_path is not None
+                                  else (Path(corpus_dir) / ".supersessions.json"
+                                        if corpus_dir is not None else None))
+        if self.supersessions_path is not None:
+            self.index.load_supersessions(self.supersessions_path)
         if weights_path is not None:
             self.index.load_weights(weights_path)
         # 实体标注（图谱可插拔升级）：语料目录下有 .entities.json 就接上——
@@ -820,6 +908,12 @@ class MemoryServer:
         # 正好是自动重读这个特性要治的静默形态（2026.08.03 外部评审指出的竞态）
         self.written_paths = set()
 
+    def _sync_index_consumers(self):
+        """索引对象被整份替换后，同步所有长生命周期只读消费者。"""
+        self.recall.index = self.index
+        if self.passive is not None:
+            self.passive.set_index(self.index)
+
     def _reload_from_disk(self):
         """语料目录有文件级变化时从盘上重建索引（常驻 HTTP 形态专用）。
 
@@ -832,13 +926,31 @@ class MemoryServer:
         self.index = self.loader()
         if self.retractions_path is not None:
             self.index.load_retractions(self.retractions_path)
+        if self.supersessions_path is not None:
+            self.index.load_supersessions(self.supersessions_path)
         if self.weights_path is not None:
             self.index.load_weights(self.weights_path)
         if self.entities_path is not None and self.index.load_entities(self.entities_path):
             self.index.build()
-        self.recall.index = self.index
+        self._sync_index_consumers()
 
-    # ---------- 七个工具：协议接线；未解决的解析与状态变化仍在独立模块 ----------
+    def _refresh_after_write(self):
+        """正文写入后统一重建并接回全部 sidecar；常驻与测试路径同一语义。"""
+        if self.loader is not None:
+            self._reload_from_disk()
+            return
+        self.index = load_corpus(self.source_dirs).build()
+        if self.retractions_path is not None:
+            self.index.load_retractions(self.retractions_path)
+        if self.supersessions_path is not None:
+            self.index.load_supersessions(self.supersessions_path)
+        if self.weights_path is not None:
+            self.index.load_weights(self.weights_path)
+        if self.entities_path is not None and self.index.load_entities(self.entities_path):
+            self.index.build()
+        self._sync_index_consumers()
+
+    # ---------- 八个工具：协议接线；未解决的解析与状态变化仍在独立模块 ----------
 
     def _tool_memory_search(self, args, now=None):
         query = args.get("query")
@@ -849,8 +961,39 @@ class MemoryServer:
             raise ToolError("queryVariant 若提供，必须是非空字符串")
         queries = [query] + ([variant] if variant is not None else [])
         top_n = int(args.get("topN", self.search_topN))
-        results = self.index.retrieve_queries(queries, topN=top_n) \
-            if variant is not None else self.index.retrieve(query, topN=top_n)
+        historical = any(has_history_intent(q) for q in queries)
+        results = self.index.retrieve_queries(
+            queries, topN=top_n, include_superseded=historical) \
+            if variant is not None else self.index.retrieve(
+                query, topN=top_n, include_superseded=historical)
+        # 明确历史意图：命中链中任一节点即补齐整链。无历史词时仍默认只取 current；
+        # 只有可靠词面在同一显式链命中至少两个 recordId，才走用户指定的第二个例外。
+        roots = set()
+        if historical:
+            roots = {self.index.chain_record_ids(r["meta"].get("record_id"))[0]
+                     for r in results
+                     if r["meta"].get("record_id") in self.index.supersession_log}
+        else:
+            for q in queries:
+                roots.update(self.index.matching_supersession_roots(q))
+        if roots:
+            linked = [r for r in results
+                      if (r["meta"].get("record_id") in self.index.supersession_log
+                          and self.index.chain_record_ids(r["meta"].get("record_id"))[0] in roots)]
+            # “同链多节点命中”可能只命中已 superseded 的 A/B，默认候选中没有任何链节点。
+            # 此时仍要以已确认的链根补一个种子，否则 roots 虽判中，整链却没有入口。
+            linked_roots = {self.index.chain_record_ids(r["meta"].get("record_id"))[0]
+                            for r in linked}
+            for root in sorted(roots - linked_roots):
+                idx = next((i for i, meta in enumerate(self.index.meta)
+                            if meta.get("layer", "timeline") == "timeline"
+                            and meta.get("record_id") == root and i not in self.index.retracted), None)
+                if idx is not None:
+                    linked.append({"id": idx, "text": self.index.chunks[idx],
+                                   "meta": self.index.meta[idx], "score": 0.0,
+                                   "weight": self.index.weights[idx]})
+            unlinked = [r for r in results if r not in linked]
+            results = self.index.expand_supersession_chains(linked) + unlinked
         if self.weights_path is not None:
             # 用进落盘：retrieve 的副作用是命中块 +weight_boost，不落盘的话
             # server 一重启就归零——权重持久化的"存"这半就在这一行
@@ -873,8 +1016,22 @@ class MemoryServer:
         # 模型拿去圆"，而这个判断只有读到内容的模型能下——机制层负责把不确定性
         # 摆到台面上，不负责替它拒绝。
         # 拼接走 annotate_block（库函数），外壳仍然只是转发+组合调用，不自己拼字符串
-        return annotate_block(format_recall_block(results, time_context=self.time_context),
+        text = annotate_block(format_recall_block(results, time_context=self.time_context),
                               miss_rate)
+        if self.passive is None:
+            return text
+        return {"text": text, "structuredContent": self.passive.search_metadata(results)}
+
+    def _tool_passive_recall(self, args, now=None):
+        """宿主隐藏入口；策略与组装未完成前只返回结构化 candidate。"""
+        if self.passive is None:
+            raise ToolError("自动浮现宿主入口未启用")
+        try:
+            candidate = self.passive.candidate(args)
+        except PassiveRecallRequestError as exc:
+            raise ToolError(str(exc))
+        return {"text": "自动浮现候选已完成只读检查。",
+                "structuredContent": candidate}
 
     @staticmethod
     def _session_start_failure_reason(exc):
@@ -1112,11 +1269,7 @@ class MemoryServer:
                     f"原始正文仍在，但索引补写失败：{e}", "evidence")) from None
             except OSError as e:
                 raise ToolError(f"原始正文仍在，但索引补写失败：{e}") from None
-            if self.loader is not None:
-                self._reload_from_disk()
-            else:
-                self.index = load_corpus(self.source_dirs).build()
-                self.recall.index = self.index
+            self._refresh_after_write()
             self.written_paths.update(str(path) for path in paths)
             hint = (f" 未配置 --index-dir，索引已落到兼容路径 {index_write_dir}；"
                     "推荐配置独立 --index-dir。") if fallback_index else ""
@@ -1148,11 +1301,7 @@ class MemoryServer:
                 paths = commit_memory_files([body_plan])
             except OSError as write_error:
                 raise ToolError(str(write_error))
-            if self.loader is not None:
-                self._reload_from_disk()
-            else:
-                self.index = load_corpus(self.source_dirs).build()
-                self.recall.index = self.index
+            self._refresh_after_write()
             self.written_paths.update(str(path) for path in paths)
             unresolved = self._unresolved_after_core(
                 args, f"timeline/{paths[0].name}#record={body_plan['record_id']}")
@@ -1162,11 +1311,7 @@ class MemoryServer:
                     + unresolved)
         # 写完立刻进内存索引并重建，本会话的 latent_search 就能查到——
         # 不然"我记下了"之后当场问它还查不到，模型会顺势说"没有记录"
-        if self.loader is not None:
-            self._reload_from_disk()
-        else:
-            self.index = load_corpus(self.source_dirs).build()
-            self.recall.index = self.index
+        self._refresh_after_write()
         self.written_paths.update(str(path) for path in paths)
         hint = (f" 未配置 --index-dir，摘要已落到兼容路径 {index_write_dir}；"
                 "推荐配置独立 --index-dir。") if fallback_index else ""
@@ -1175,6 +1320,65 @@ class MemoryServer:
         return (f"已写进第 {body_plan['window']} 个窗口（{paths[0].name}），"
                 f"recordId={body_plan['record_id']}，并写入 {len(index_plans)} 条索引摘要。"
                 f"indexStatus=indexed。{hint} {unresolved}")
+
+    def _tool_memory_supersede(self, args, now=None):
+        """原子写入新事实与双向变迁链；correct 的撤回账本完全不参与。"""
+        mode = args.get("mode", "write")
+        if mode not in {"write", "preflight"}:
+            raise ToolError("mode 只能是 write 或 preflight；省略时默认 write")
+        if self.corpus_dir is None or self.supersessions_path is None:
+            raise ToolError("服务器没有配置可写的语料目录（--corpus），写不了事实变迁")
+        try:
+            self._require_unresolved_field(args)
+            body_plan = plan_append_record(
+                self.corpus_dir, args.get("text") or "", args.get("current_state") or "",
+                window=args.get("window"), now=now, time_context=self.time_context,
+                write_dir=self.write_dir)
+            ledger = self.index.supersession_plan(
+                args.get("supersedes"), body_plan["record_id"], now=now)
+        except (ValueError, OSError, ToolError) as exc:
+            raise ToolError(str(exc)) from None
+        index_write_dir = Path(self.index_dir) if self.index_dir is not None \
+            else Path(self.corpus_dir) / "index"
+        try:
+            index_plans, index_status = self._plan_append_indexes(
+                args, body_plan, index_write_dir)
+        except ValueError as exc:
+            index_plans, index_status, index_error = [], "pending", str(exc)
+        else:
+            index_error = ("未提供 indexEvidence（旧客户端可继续提供 indexSummaries）"
+                           if index_status == "pending" else None)
+        ledger_plan = {
+            "path": self.supersessions_path,
+            "content": json.dumps(ledger, ensure_ascii=False, indent=1) + "\n",
+        }
+        if mode == "preflight":
+            try:
+                unresolved_status = self._preflight_unresolved(args)
+            except ToolError as exc:
+                raise ToolError(str(exc)) from None
+            pending = f"；indexStatus=pending：{index_error}" if index_error \
+                else f"；indexStatus=indexed；预计索引文件={len(index_plans)}"
+            return (f"预检通过：preflightStatus=ready；旧 recordId={args.get('supersedes')}；"
+                    f"新 recordId={body_plan['record_id']}；旧状态将变为 superseded，"
+                    f"新状态将为 current{pending}；unresolvedStatus={unresolved_status}；本次零写入。")
+        plans = [body_plan] + index_plans + [ledger_plan]
+        if index_error:
+            plans = [body_plan, ledger_plan]
+        try:
+            paths = commit_memory_files(plans)
+        except OSError as exc:
+            raise ToolError(f"事实变迁写入失败，正文与关系账本已尝试一并回滚：{exc}") from None
+        self._refresh_after_write()
+        self.written_paths.update(str(path) for path in paths)
+        unresolved = self._unresolved_after_core(
+            args, f"timeline/{body_plan['path'].name}#record={body_plan['record_id']}")
+        index_message = (f"并写入 {len(index_plans)} 条索引摘要，indexStatus=indexed"
+                         if not index_error else
+                         f"索引尚未写入：{index_error}，indexStatus=pending；之后请按新 recordId 补索引")
+        return (f"事实变迁已登记：recordId={body_plan['record_id']} status=current "
+                f"supersedes={args.get('supersedes')}；旧记录 status=superseded "
+                f"superseded_by={body_plan['record_id']}；{index_message}。 {unresolved}")
 
     def _tool_memory_correct(self, args, now=None):
         correction = args.get("correction")
@@ -1256,6 +1460,9 @@ class MemoryServer:
             raise ToolError("服务器没有配置可写的语料目录（--corpus），不能清理记录")
         if not isinstance(record_id, str) or not re.fullmatch(r"[0-9a-f]{16}", record_id):
             raise ToolError("recordId 必须是 latent_append 返回的 16 位小写十六进制标识")
+        if record_id in self.index.supersession_log:
+            raise ToolError("该记录属于事实变迁链，不能直接 cleanup 造成断链；"
+                            "若它从未真实过，请先用 latent_correct 纠错并保留链账本")
 
         timeline_root = (Path(self.write_dir) if self.write_dir is not None
                          else Path(self.corpus_dir) / "timeline").resolve()
@@ -1408,7 +1615,7 @@ class MemoryServer:
                 self.index.load_weights(self.weights_path)
             if self.entities_path is not None and self.index.load_entities(self.entities_path):
                 self.index.build()
-            self.recall.index = self.index
+            self._sync_index_consumers()
         self.written_paths.update(str(path) for path in changed)
         return (f"已精准清理 recordId={plan['record_id']}：正文记录 1 条、关联索引 "
                 f"{len(plan['linked_index'])} 个；隔离备份与审计 manifest 位于 {backup_dir}。")
@@ -1451,10 +1658,12 @@ class MemoryServer:
             "latent_search": self._tool_memory_search,
             "latent_session_start": self._tool_session_start,
             "latent_append": self._tool_memory_append,
+            "latent_supersede": self._tool_memory_supersede,
             "latent_correct": self._tool_memory_correct,
             "latent_cleanup": self._tool_memory_cleanup,
             "latent_unresolved": self._tool_unresolved,
             "latent_thread_close": self._tool_thread_close,
+            **({PASSIVE_RECALL_TOOL: self._tool_passive_recall} if self.passive else {}),
         }
 
     # ---------- 协议层 ----------
@@ -1475,7 +1684,7 @@ class MemoryServer:
         if method == "notifications/initialized":
             return None                              # 通知不回响应（规格：JSON-RPC 通知无 id）
         if method == "tools/list":
-            return self._ok(mid, {"tools": TOOLS})
+            return self._ok(mid, {"tools": self.tools})
         if method == "tools/call":
             return self._call_tool(mid, params, now=now)
         if mid is None:
@@ -1494,19 +1703,34 @@ class MemoryServer:
         if not isinstance(args, dict):
             return self._err(mid, E_INVALID_PARAMS, "arguments 必须是对象")
         try:
-            text = handler(args, now=now)
+            payload = handler(args, now=now)
         except ToolError as e:
             # 工具执行错误：按规格回正常结果 + isError，让模型看得到失败原因
-            return self._ok(mid, {"content": [{"type": "text", "text": str(e)}], "isError": True})
+            result = {"content": [{"type": "text", "text": str(e)}], "isError": True}
+            # isError 只说明调用整体失败，不代表撤回／清理等前置状态没有生效。
+            if self.passive is not None and name != PASSIVE_RECALL_TOOL:
+                result["structuredContent"] = {"passiveRecall": self.passive.inspect()}
+            return self._ok(mid, result)
         except Exception as e:
             # 最终错误边界：不让工具内部异常冲破 HTTP/stdio，客户端只看见空白。
             # 不打印 e 的正文——底层异常可能夹带记忆内容或请求参数。
             print(f"工具执行异常（{name}）：{type(e).__name__}", file=sys.stderr)
             message = (f"{name} 执行失败（{type(e).__name__}）。服务端没有返回空结果，"
                        "而是工具执行异常；请查看服务端日志并检查相关文件与配置。")
-            return self._ok(mid, {"content": [{"type": "text", "text": message}],
-                                  "isError": True})
-        return self._ok(mid, {"content": [{"type": "text", "text": text}], "isError": False})
+            result = {"content": [{"type": "text", "text": message}], "isError": True}
+            if self.passive is not None and name != PASSIVE_RECALL_TOOL:
+                result["structuredContent"] = {"passiveRecall": self.passive.inspect()}
+            return self._ok(mid, result)
+        if isinstance(payload, dict) and isinstance(payload.get("text"), str):
+            result = {"content": [{"type": "text", "text": payload["text"]}],
+                      "isError": False}
+            if isinstance(payload.get("structuredContent"), dict):
+                result["structuredContent"] = payload["structuredContent"]
+            return self._ok(mid, result)
+        result = {"content": [{"type": "text", "text": payload}], "isError": False}
+        if self.passive is not None and name != PASSIVE_RECALL_TOOL:
+            result["structuredContent"] = {"passiveRecall": self.passive.inspect()}
+        return self._ok(mid, result)
 
     @staticmethod
     def _ok(mid, result):
@@ -2428,9 +2652,27 @@ def diagnose(corpus_dir, threads_path=None, embed=False, time_context=None,
                             f"块正文被编辑过、或旧版本手拼块文本留下的死账。")
         else:
             add(OK, name, f"{what}接上 {n} 块，无孤儿条目")
+    supersessions = root / ".supersessions.json"
+    if not supersessions.exists():
+        add(OK, supersessions.name, "没有（正常：老数据全部按 status=current 读取）")
+    else:
+        try:
+            n = index.load_supersessions(supersessions)
+            timeline_ids = {rid for m in index.meta
+                            if m.get("layer", "timeline") == "timeline"
+                            for rid in m.get("record_id_aliases", [m.get("record_id")])}
+            orphans = sorted(set(index.supersession_log) - timeline_ids)
+            if orphans:
+                add(WARN, supersessions.name,
+                    f"事实变迁链有 {len(orphans)} 个 recordId 对不上 timeline："
+                    f"{'、'.join(orphans[:3])}{' 等' if len(orphans) > 3 else ''}")
+            else:
+                add(OK, supersessions.name, f"{n} 个链节点双向一致且均可定位")
+        except (ValueError, OSError, json.JSONDecodeError) as e:
+            add(FAIL, supersessions.name, f"事实变迁账本读不出来：{e}")
     index.build()                       # 实体边在 build 时算，接上后要重建一次
 
-    # 写回落点：latent_append/latent_correct 要往这里写。只用 os.access 判，
+    # 写回落点：latent_append/latent_supersede/latent_correct 要往这里写。只用 os.access 判，
     # 不试写——试写就破了只读
     write_root = Path(write_dir).resolve() if write_dir is not None else root / "timeline"
     probe = write_root if write_root.is_dir() else write_root.parent
@@ -3075,10 +3317,10 @@ def _selftest():
     assert "我没有相关记录" in instr, "必须直接堵死“我没有记录”这句默认话术"
     assert "queryVariant" in instr and "最多再查一次" in instr and "第二次仍对不上就停" in instr, \
         "instructions 必须把单次改述的入口与停止边界一起交给宿主"
-    assert all(x in instr for x in ("同一时刻只能有一个答案", "先用 latent_correct",
-                                    "再用 latent_append", "不要只 append", "喜欢的电影",
+    assert all(x in instr for x in ("单值事实", "latent_supersede", "不要 correct 掉历史",
+                                    "从未真实过", "喜欢的电影",
                                     "不得为了写新项而 correct 旧项", "不要预先给每句话分类")), \
-        "instructions 必须同时给出单值冲突的 correct→append 顺序与并列事实禁止 correct 的边界"
+        "instructions 必须区分事实变迁、从未真实过的纠错与并列事实"
     assert all(x in instr for x in ("latent_unresolved", "open", "update", "close", "none",
                                     "不要按关键词", "历史快照")), \
         "instructions 必须交代未解决清单的四种判断、主观触发边界及 thread 历史定位"
@@ -3090,19 +3332,21 @@ def _selftest():
         "latent_search 描述要说清记忆类型并堵死默认话术"
     assert "queryVariant" in d["latent_search"] and "最多重试一次" in d["latent_search"], \
         "latent_search 描述必须告诉宿主怎么触发受控改述融合"
-    assert "必须先latent_correct 旧值" in d["latent_append"] and \
+    assert "latent_supersede" in d["latent_append"] and \
         "不得撤旧项" in d["latent_append"], \
         "latent_append 描述不能把单值冲突与并列新项都引向纯 append"
+    assert "当时真实" in d["latent_supersede"] and "latent_correct" in d["latent_supersede"], \
+        "latent_supersede 必须说清与纯纠错的边界"
     assert "主动" in d["latent_session_start"] and "主动" in d["latent_thread_close"], \
         "两个生命周期工具要写明主动调用，不用等对方要求"
     #    initialized 是通知，不能回响应（回了客户端会当成野生响应）
     assert srv.handle({"jsonrpc": "2.0", "method": "notifications/initialized"}) is None, \
         "initialized 是通知，回响应会让客户端收到一条没人等的野生响应"
 
-    # 2. tools/list：七个工具，schema 字段名照规格（name/inputSchema）
+    # 2. tools/list：八个工具，schema 字段名照规格（name/inputSchema）
     tools = srv.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})["result"]["tools"]
     assert [t["name"] for t in tools] == ["latent_search", "latent_session_start",
-                                          "latent_append", "latent_correct",
+                                          "latent_append", "latent_supersede", "latent_correct",
                                           "latent_cleanup",
                                           "latent_unresolved",
                                           "latent_thread_close"]
@@ -3111,6 +3355,34 @@ def _selftest():
             and t["inputSchema"]["type"] == "object" \
             and not {"anyOf", "oneOf"}.intersection(t["inputSchema"]), \
             f"{t['name']} 的 inputSchema 顶层必须是 object，且不得出现 anyOf/oneOf"
+
+    # 2a-W1.【宿主入口必须显式开启；纯候选不加权，主动结果补结构化来源】
+    passive_index = _build_server(now).index
+    passive_srv = MemoryServer(index=passive_index, thread_store=ThreadStore(),
+                               enable_passive_recall=True)
+    passive_tools = passive_srv.handle(
+        {"jsonrpc": "2.0", "id": 201, "method": "tools/list"})["result"]["tools"]
+    assert [tool["name"] for tool in passive_tools[:-1]] == [tool["name"] for tool in tools] \
+        and passive_tools[-1]["name"] == PASSIVE_RECALL_TOOL, \
+        "W1：显式启用只能在旧七工具后增加宿主入口；默认工具表必须逐项不变"
+    passive_before = list(passive_index.weights)
+    hidden = passive_srv.handle({"jsonrpc": "2.0", "id": 202, "method": "tools/call",
+                                 "params": {"name": PASSIVE_RECALL_TOOL, "arguments": {
+                                     "userInput": "咖啡机保险丝", "turn": {
+                                         "sessionId": "s1", "turnId": "t1",
+                                         "deliveryId": "d1"}}}})["result"]
+    assert hidden["structuredContent"]["status"] == "candidate" \
+        and hidden["structuredContent"]["deliveryId"] == "d1" \
+        and passive_index.weights == passive_before, \
+        "W1：宿主入口只返回 candidate，不能让自动命中污染权重"
+    active = passive_srv.handle({"jsonrpc": "2.0", "id": 203, "method": "tools/call",
+                                 "params": {"name": "latent_search", "arguments": {
+                                     "query": "咖啡机保险丝", "topN": 1}}})["result"]
+    active_state = active["structuredContent"]["passiveRecall"]
+    assert active["isError"] is False and active_state["evidence"] \
+        and "d1" in active_state["coveredDeliveryIds"] \
+        and passive_index.weights != passive_before, \
+        "W1：主动 search 文本照常返回并加权，同时给出可核验来源覆盖元数据"
     # 2c.【工具 annotations】变异靶心：任一工具漏字段、把检索冒充只读、
     #     把更正冒充纯追加，或把本地记忆库误标成 open world，这张逐字表都会红。
     expected_annotations = {
@@ -3119,7 +3391,9 @@ def _selftest():
         "latent_session_start": {"readOnlyHint": True, "destructiveHint": False,
                                  "idempotentHint": True, "openWorldHint": False},
         "latent_append": {"readOnlyHint": False, "destructiveHint": False,
-                          "idempotentHint": False, "openWorldHint": False},
+                           "idempotentHint": False, "openWorldHint": False},
+        "latent_supersede": {"readOnlyHint": False, "destructiveHint": False,
+                              "idempotentHint": False, "openWorldHint": False},
         "latent_correct": {"readOnlyHint": False, "destructiveHint": True,
                            "idempotentHint": False, "openWorldHint": False},
         "latent_cleanup": {"readOnlyHint": False, "destructiveHint": True,
@@ -3130,9 +3404,10 @@ def _selftest():
                                 "idempotentHint": False, "openWorldHint": False},
     }
     assert {t["name"]: t.get("annotations") for t in tools} == expected_annotations, \
-        "七个工具的 annotations 必须按真实副作用逐项声明"
-    assert tools[6]["inputSchema"]["required"] == ["window", "current_state"], "当下状态必填要写进 schema"
-    assert tools[3]["inputSchema"]["required"] == ["quote", "reason"], \
+        "八个工具的 annotations 必须按真实副作用逐项声明"
+    by_name = {tool["name"]: tool for tool in tools}
+    assert by_name["latent_thread_close"]["inputSchema"]["required"] == ["window", "current_state"], "当下状态必填要写进 schema"
+    assert by_name["latent_correct"]["inputSchema"]["required"] == ["quote", "reason"], \
         "更正工具必填 quote+reason——没有原因的撤回不可追溯"
     append_tool = tools[2]
     append_schema = append_tool["inputSchema"]
@@ -3149,11 +3424,13 @@ def _selftest():
         "预检必须留在现有写工具的平面 schema；工具整体不能冒充只读"
     assert "unresolvedOps" not in append_schema.get("required", []), \
         "兼容模式下 unresolvedOps 不得成为 latent_append 的 schema 必填字段"
-    assert tools[4]["inputSchema"]["required"] == ["action", "recordId"] \
-        and tools[4]["annotations"]["destructiveHint"] is True, \
+    assert by_name["latent_supersede"]["inputSchema"]["required"] == [
+        "supersedes", "text", "current_state"], "事实变迁必须同时给旧 ID、新事实与当前状态"
+    assert by_name["latent_cleanup"]["inputSchema"]["required"] == ["action", "recordId"] \
+        and by_name["latent_cleanup"]["annotations"]["destructiveHint"] is True, \
         "latent_cleanup 必须暴露两阶段精确清理 schema，并明确标为破坏性工具"
-    assert "unresolvedOps" in tools[6]["inputSchema"]["properties"] \
-        and "unresolvedOps" not in tools[6]["inputSchema"].get("required", []), \
+    assert "unresolvedOps" in by_name["latent_thread_close"]["inputSchema"]["properties"] \
+        and "unresolvedOps" not in by_name["latent_thread_close"]["inputSchema"].get("required", []), \
         "latent_thread_close 也要暴露可选 unresolvedOps，不能截断旧客户端"
 
     # 2b.【Kelivo PC schema 兼容】复刻 Kelivo
@@ -3821,7 +4098,96 @@ def _selftest():
                     for label in ("unresolvedOps", "写错：", "写对："))
         assert snapshot9a() == before_bad_calls9a, "所有参数错误都必须在零写入状态返回"
 
-    # 9b.【工具级精准清理】判据与采集条件：stdlib 服务端、临时双层语料，先用当前
+    # 9b.【事实变迁链】判据先写：A→B→C 后，默认精确查询只出 current C；带“以前／
+    #     变迁”的查询按登记时间返回 A、B、C，且旧 index 摘要不能从默认检索漏出；重启后
+    #     双向链接仍在。correct 反例另写一条从未真实过的外貌，仍进 retractions、任何历史
+    #     查询都不返回。采集条件：Windows 11、CPython 3.12、stdlib、零依赖检索、临时语料。
+    with tempfile.TemporaryDirectory() as td:
+        corpus9s = _P(td) / "corpus"
+        index9s = _P(td) / "index"
+        corpus9s.mkdir()
+        index9s.mkdir()
+        source_dirs9s, loader9s = make_corpus_loader(corpus9s, index9s)
+        supersessions9s = corpus9s / ".supersessions.json"
+        retractions9s = corpus9s / ".retractions.json"
+        mk9s = lambda: MemoryServer(
+            index=loader9s(), thread_store=ThreadStore(), corpus_dir=corpus9s,
+            index_dir=index9s, source_dirs=source_dirs9s, loader=loader9s,
+            supersessions_path=supersessions9s, retractions_path=retractions9s)
+        s9s = mk9s()
+        def fact_args(text, state):
+            return {"text": text, "current_state": state, "indexEvidence": [
+                {"type": "event", "quote": text}, {"type": "state", "quote": state}]}
+        old9s = call(s9s, "latent_append",
+                     fact_args("她的居住地是重庆沙坪坝。", "当前住在重庆沙坪坝。"), now)
+        old_id9s = re.search(r"recordId=([0-9a-f]{16})", old9s["content"][0]["text"]).group(1)
+        before_preflight9s = {p.relative_to(td): p.read_bytes()
+                              for p in _P(td).rglob("*") if p.is_file()}
+        preview9s = call(s9s, "latent_supersede", {
+            "mode": "preflight", "supersedes": old_id9s,
+            **fact_args("她的居住地现在是深圳南山。", "当前住在深圳南山。")}, now + 10)
+        assert preview9s["isError"] is False and "本次零写入" in preview9s["content"][0]["text"]
+        assert before_preflight9s == {p.relative_to(td): p.read_bytes()
+                                      for p in _P(td).rglob("*") if p.is_file()}, \
+            "supersede 预检不得写正文、索引或账本"
+        middle9s = call(s9s, "latent_supersede", {
+            "supersedes": old_id9s,
+            **fact_args("她的居住地现在是深圳南山。", "当前住在深圳南山。")}, now + 10)
+        middle_id9s = re.search(r"recordId=([0-9a-f]{16})", middle9s["content"][0]["text"]).group(1)
+        newest9s = call(s9s, "latent_supersede", {
+            "supersedes": middle_id9s,
+            **fact_args("她的居住地现在是广州天河。", "当前住在广州天河。")}, now + 20)
+        newest_id9s = re.search(r"recordId=([0-9a-f]{16})", newest9s["content"][0]["text"]).group(1)
+        ledger9s = json.loads(supersessions9s.read_text(encoding="utf-8"))["records"]
+        assert ledger9s[old_id9s]["superseded_by"] == middle_id9s \
+            and ledger9s[middle_id9s]["supersedes"] == old_id9s \
+            and ledger9s[middle_id9s]["superseded_by"] == newest_id9s \
+            and ledger9s[newest_id9s]["supersedes"] == middle_id9s, \
+            "A→B→C 必须逐段保存 supersedes／superseded_by 双向链接"
+        current9s = call(s9s, "latent_search", {"query": "广州天河", "topN": 5}, now + 21)
+        current_text9s = current9s["content"][0]["text"]
+        assert "广州天河" in current_text9s and "她的居住地是重庆沙坪坝" not in current_text9s \
+            and "她的居住地现在是深圳南山" not in current_text9s \
+            and "status=superseded" not in current_text9s \
+            and set(re.findall(r"recordId=([0-9a-f]{16})", current_text9s)) == {newest_id9s}, \
+            "默认检索只能返回 current，新旧 timeline 与旧 index 摘要都必须隐藏"
+        history9s = call(s9s, "latent_search", {"query": "她的居住地以前从重庆怎么变迁", "topN": 2}, now + 22)
+        history_text9s = history9s["content"][0]["text"]
+        assert all(place in history_text9s for place in ("重庆沙坪坝", "深圳南山", "广州天河")), \
+            f"历史意图没有补齐三段：{history_text9s}"
+        positions9s = [history_text9s.index(place) for place in ("重庆沙坪坝", "深圳南山", "广州天河")]
+        assert positions9s == sorted(positions9s) and history_text9s.count("recordId=") >= 3 \
+            and "status=superseded" in history_text9s \
+            and f"superseded_by={middle_id9s}" in history_text9s \
+            and f"supersedes={middle_id9s}" in history_text9s, \
+            "历史意图必须突破 topN 补齐整链，按登记时间正序并展示双向关系"
+        same_field9s = call(s9s, "latent_search", {"query": "重庆沙坪坝深圳南山", "topN": 2}, now + 23)
+        same_field_text9s = same_field9s["content"][0]["text"]
+        assert all(place in same_field_text9s
+                   for place in ("重庆沙坪坝", "深圳南山", "广州天河")) \
+            and same_field_text9s.count("recordId=") >= 3, \
+            f"无历史意图词时，同一显式链有多个节点命中也必须突破 topN 展开整链：{same_field_text9s}"
+        restarted9s = mk9s()
+        assert restarted9s.index.chain_record_ids(middle_id9s) == [old_id9s, middle_id9s, newest_id9s], \
+            "重启后必须从 .supersessions.json 恢复完整链"
+        recent_ids9s = {r["meta"].get("record_id") for r in restarted9s.index.recall_recent(topN=20)}
+        assert newest_id9s in recent_ids9s and old_id9s not in recent_ids9s \
+            and middle_id9s not in recent_ids9s, \
+            "自动会话召回也必须默认硬过滤 superseded，只注入 current"
+        false9s = call(restarted9s, "latent_append", {
+            "text": "她的眼睛是绿色。", "current_state": "该外貌记录等待核对。"}, now + 30)
+        assert false9s["isError"] is False
+        corrected9s = call(restarted9s, "latent_correct", {
+            "quote": "她的眼睛是绿色", "reason": "从未真实过，实际是棕色",
+            "correction": "她的眼睛是棕色。", "current_state": "外貌事实已纠正。"}, now + 31)
+        assert corrected9s["isError"] is False and retractions9s.exists(), \
+            "纯纠错仍必须走既有 retractions 路径"
+        wrong_history9s = call(restarted9s, "latent_search",
+                               {"query": "她以前的绿色眼睛", "topN": 5}, now + 32)
+        assert wrong_history9s["isError"] is True or "眼睛是绿色" not in wrong_history9s["content"][0]["text"], \
+            "correct 撤回的从未真实记录即使带历史意图也不得返回"
+
+    # 9c.【工具级精准清理】判据与采集条件：stdlib 服务端、临时双层语料，先用当前
     #     latent_append 在同一窗口写两条（目标有 recordId 关联索引、相邻记录保留），
     #     再覆盖 preview 零写入、旧令牌失效、未解决引用阻断、sidecar 去键、隔离备份
     #     不回灌，以及无索引 pending 记录也能按 ID 精确清理。通过＝每条断言均成立。
@@ -5597,10 +5963,13 @@ def _selftest():
              f"实际 {body24b.count('进程启动 pid=')} 条")
         assert body24b.startswith(body24a), "追加写：第二次不许把第一次的内容截掉"
 
-    print("selftest ok（25项断言：握手 / 工具表 / 调用往返 / 薄适配层 / 错误分层（含 "
+    print("selftest ok（26项断言：握手 / 工具表 / 调用往返 / 薄适配层 / 错误分层（含 "
           "session_start 读取异常只重试一次、未预料异常不空断、写工具不重放）/ "
           "完整链路 / stdio / UTF-8 / 写回当场可查 / 写回预检（零写入、补索引预检、"
-          "参数错误写错／写对对照）/ 精准清理（两阶段确认、引用阻断、"
+          "参数错误写错／写对对照）/ 事实变迁链（A→B→C 双向链接、默认只返回 current、"
+          "历史意图与同链多节点命中突破 topN 补齐、自动召回只见 current、按登记时间排序、"
+          "重启恢复、纯 correct 仍全局撤回）/ "
+          "精准清理（两阶段确认、引用阻断、"
           "隔离备份不回灌、sidecar 同步与故障回滚）/ 用进撑过重启 / "
           "无可靠命中明确说 / 撤回更正闭环 / 撤回粒度提醒（块级撤回、事实跨块：命中多块"
           "给总数＋最近定位、0 命中不冒提示且变异去 exclude 转红、只提示不自动撤；"
@@ -5665,6 +6034,9 @@ if __name__ == "__main__":
     ap.add_argument("--require-unresolved-review", action="store_true",
                     help="严格要求完整 append／thread_close 显式提供 unresolvedOps；"
                          "只卡字段缺失，清单操作失败仍不阻断正文／thread")
+    ap.add_argument("--passive-recall", action="store_true",
+                    help="显式开放自动浮现宿主入口；默认关闭。入口只供宿主调用，"
+                         "W1 阶段只返回只读候选，不会把候选直接注入模型")
     ap.add_argument("--embed", action="store_true", help="用真 embedding")
     ap.add_argument("--embed-provider", dest="embed_provider",
                     help="embedding 提供方：local（默认，需 fastembed）/ local:<模型> / "
@@ -5776,12 +6148,14 @@ if __name__ == "__main__":
                                corpus_dir=args.corpus,
                                weights_path=Path(args.corpus) / ".weights.json",
                                retractions_path=Path(args.corpus) / ".retractions.json",
+                               supersessions_path=Path(args.corpus) / ".supersessions.json",
                                entities_path=Path(args.corpus) / ".entities.json",
                                loader=loader, time_context=time_ctx,
                                source_dirs=source_dirs, index_dir=args.index_dir,
                                write_dir=args.write_dir,
                                startup_notice=timezone_notice,
-                               require_unresolved_review=args.require_unresolved_review)
+                               require_unresolved_review=args.require_unresolved_review,
+                               enable_passive_recall=args.passive_recall)
         except Exception as e:                       # noqa: BLE001（裸堆栈正是本卡要消灭的）
             _load_done()
             _startup_failed("load", e)

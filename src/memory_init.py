@@ -381,10 +381,10 @@ PROTOCOL_DEFAULTS = {
         "之前说“我不记得”。查完自然接上话，不用报告自己搜过。\n"
         "**会话约定**：新会话开场先调一次 latent_session_start；会话结束前调一次 "
         "latent_thread_close，记下聊到哪、当下状态、有什么没聊完。\n"
-        "**冲突即更正**：{ta}说出住址、当前职业、当前状态这类同一时刻只能有一个"
-        "答案的事实，而 latent_search 查到的旧值与新说法冲突时，凭常识判断这次冲突；"
-        "先用 latent_correct 让旧值退出检索，再用 latent_append 写入新值，不要只 append "
-        "让新旧并存。喜欢的电影、去过的地方、多个朋友这类可以并列的事实不适用："
+        "**事实变迁与纠错分开**：{ta}说出住址、当前职业、当前状态这类单值事实，而旧值"
+        "当时真实、后来发生变化时，用 latent_supersede 写新事实并以 supersedes 指向旧"
+        "recordId，保留历史链；旧值从未真实过才用 latent_correct。不要只 append 让新旧"
+        "并存，也不要 correct 掉真实历史。喜欢的电影、去过的地方、多个朋友这类并列事实不适用："
         "这些事实应当共存，不得为了写入新项而 correct 旧项。不要预先给每句话分类，只在"
         "检索结果与{ta}这次说法实际互斥时执行。\n"
         # ↓ 2026.08.02 追加的行为层两句。**只做加法**：上面那两段是三轮真机验证过的
@@ -455,7 +455,8 @@ def direct_protocol_markdown():
         "**写回约定**：对话中出现值得跨会话保留的新事实，用 latent_append "
         "交付正文、当下状态和 indexEvidence 原文证据片段。服务端返回 recordId；证据失败时"
         "正文仍保存且 indexStatus=pending，之后只传 recordId＋indexEvidence 补索引，"
-        "不要重复正文。\n"
+        "不要重复正文。旧事实当时真实、后来变化时改用 latent_supersede，并把检索结果里的"
+        "旧 recordId 放进 supersedes；从未真实过的错误才用 latent_correct。\n"
         f"{DIRECT_PROTOCOL_END}"
     )
 
@@ -2980,7 +2981,8 @@ def _selftest():
     conv = next(f.value for f in p_conv.fields if f.id == RETRIEVAL_CONVENTION_FIELD)
     for must in ("片段，不是全部", "grep", "不要说“没发生过”", "我的记录里没有"):
         assert must in conv, f"检索约定里缺行为层这条：{must}"
-    for must in ("冲突即更正", "latent_correct", "latent_append", "不要只 append",
+    for must in ("事实变迁与纠错分开", "latent_supersede", "supersedes", "latent_correct",
+                 "不要只 append", "不要 correct 掉真实历史",
                  "喜欢的电影", "不得为了写入新项而 correct 旧项", "不要预先给每句话分类"):
         assert must in conv, f"检索约定里缺单值冲突／并列事实边界：{must}"
     #     **只做加法**：三轮真机验证过的那两段一字不许动，逐字钉死（黄金串写在

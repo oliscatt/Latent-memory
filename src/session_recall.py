@@ -127,7 +127,18 @@ def format_recall_block(results, max_item_chars=DEFAULT_MAX_ITEM_CHARS, time_con
              "更早的读作历史；标「时间未知」的片段只当历史背景，不当作当下状态："]
     for r in results:
         head = r["meta"].get("heading") or r["meta"].get("source", "")
-        tag = "·".join(x for x in (_time_label(r["meta"], time_context), head) if x)
+        meta = r["meta"]
+        record_id = meta.get("record_id")
+        relation = []
+        if record_id:
+            relation.append(f"recordId={record_id}")
+        relation.append(f"status={meta.get('status', 'current')}")
+        if meta.get("supersedes"):
+            relation.append(f"supersedes={meta['supersedes']}")
+        if meta.get("superseded_by"):
+            relation.append(f"superseded_by={meta['superseded_by']}")
+        tag = "·".join(x for x in (_time_label(meta, time_context), head,
+                                  " ".join(relation)) if x)
         lines.append(f"- [{tag}] {_clip(r['text'], max_item_chars)}")
     return "\n".join(lines)
 
@@ -268,7 +279,8 @@ def _selftest():
 
     # 8.【防时间感塌陷·变异靶心】每条片段带发生日期，块头写明"不是正在发生"
     assert "不是正在发生" in block.splitlines()[0], "块头声明这是历史片段"
-    assert re.search(r"- \[\d{4}\.\d{2}\.\d{2}·昨天\]", block), "片段标注发生日期"
+    assert re.search(r"- \[\d{4}\.\d{2}\.\d{2}·昨天·recordId=[0-9a-f]{16} status=current\]",
+                     block), "片段标注发生日期、稳定 recordId 与默认 current 状态"
 
     # 8b.【新旧仲裁·变异靶心】（2026.08.03 补，验收变异测试打出来的洞：仲裁那两句
     #     整段删掉，全仓 22 个自检照样绿——**这句话是"防旧事实冒充现状"的唯一防线，
@@ -291,10 +303,10 @@ def _selftest():
     idx9.add("近似时间的事", {"heading": "近似", "timestamp": now - DAY, "timestamp_source": "mtime"})
     idx9.add("没有时间的事", {"heading": "没戳"})
     b9 = SessionRecall(idx9, topN=2).on_session_start(now=now)
-    assert "[时间未知·近似]" in b9, "mtime 兜底的块必须标时间未知——打日期就是假装知道"
+    assert "[时间未知·近似·recordId=" in b9, "mtime 兜底的块必须标时间未知——打日期就是假装知道"
     assert not re.search(r"\[≈?\d{4}\.\d{2}\.\d{2}·近似\]", b9), \
         "mtime 那档不许出现任何日期形态的标签（带不带 ≈ 都不行）"
-    assert "[时间未知·没戳]" in b9, "缺时间戳标时间未知，不崩"
+    assert "[时间未知·没戳·recordId=" in b9, "缺时间戳标时间未知，不崩"
 
     # 10. 自查指令跟着每次注入走：换窗和压缩触发的块尾都带
     assert block.endswith(SELF_CHECK_FOOTER) and compact_block.endswith(SELF_CHECK_FOOTER)
