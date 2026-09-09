@@ -864,7 +864,7 @@ class MemoryServer:
                  supersessions_path=None, entities_path=None, loader=None, time_context=None,
                  source_dirs=None, index_dir=None, startup_notice=None,
                  require_unresolved_review=False, write_dir=None,
-                 enable_passive_recall=False):
+                 enable_passive_recall=False, recall_per_day_cap=None):
         # 两个 topN 分开（2026.07.31 真实语料冒烟后拆的）：显式检索是用户/模型
         # 主动问一件事，多给几条值；开场召回每次换窗都付一遍，条数要克制
         self.index = index if index is not None else MemoryIndex().build()
@@ -890,9 +890,11 @@ class MemoryServer:
                              + (f"\n\n{startup_notice}" if startup_notice else ""))
         self.recall = SessionRecall(self.index, topN=recall_topN, thread_store=self.thread_store,
                                     time_context=self.time_context,
-                                    unresolved_store=self.unresolved_store)
+                                    unresolved_store=self.unresolved_store,
+                                    per_day_cap=recall_per_day_cap)
         self.passive = PassiveRecallService(
-            self.index, metadata_reader=self.passive_metadata.read
+            self.index, metadata_reader=self.passive_metadata.read,
+            assemble_candidates=True,
         ) if enable_passive_recall else None
         self.tools = list(TOOLS) + ([PASSIVE_RECALL_TOOL_SCHEMA] if self.passive else [])
         self.initialized = False
@@ -1052,14 +1054,14 @@ class MemoryServer:
         return {"text": text, "structuredContent": self.passive.search_metadata(results)}
 
     def _tool_passive_recall(self, args, now=None):
-        """宿主隐藏入口；W3 完成程序准入，W4 组装前仍只返回结构化 candidate。"""
+        """宿主隐藏入口；程序准入后返回经来源核验的 W4 现场资料。"""
         if self.passive is None:
             raise ToolError("自动浮现宿主入口未启用")
         try:
             candidate = self.passive.candidate(args)
         except PassiveRecallRequestError as exc:
             raise ToolError(str(exc))
-        return {"text": "自动浮现候选已完成只读检查。",
+        return {"text": "自动浮现已完成只读准入与现场资料组装。",
                 "structuredContent": candidate}
 
     @staticmethod
@@ -3572,10 +3574,10 @@ def _selftest():
                                      "userInput": "咖啡机保险丝", "turn": {
                                          "sessionId": "s1", "turnId": "t1",
                                          "deliveryId": "d1"}}}})["result"]
-    assert hidden["structuredContent"]["status"] == "candidate" \
+    assert hidden["structuredContent"]["status"] == "ready" \
         and hidden["structuredContent"]["deliveryId"] == "d1" \
         and passive_index.weights == passive_before, \
-        "W1：宿主入口只返回 candidate，不能让自动命中污染权重"
+        "W1～W4：宿主入口返回已组装 ready，不能让自动命中污染权重"
     active = passive_srv.handle({"jsonrpc": "2.0", "id": 203, "method": "tools/call",
                                  "params": {"name": "latent_search", "arguments": {
                                      "query": "咖啡机保险丝", "topN": 1}}})["result"]

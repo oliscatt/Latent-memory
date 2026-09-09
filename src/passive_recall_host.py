@@ -11,9 +11,11 @@ import json
 import time
 from pathlib import Path
 
+from passive_recall_observation import opaque_id
+
 
 HIDDEN_TOOL = "latent_passive_recall"
-CAPABILITY_VERSION = "reference-host-passive-w0-v1"
+CAPABILITY_VERSION = "reference-host-passive-w5-v1"
 MODES = {"temporary", "retained"}
 SINGLE_LIMIT = 300
 ORDINARY_LIMIT = 2400
@@ -82,14 +84,18 @@ class PassiveRecallAdapter:
     """参考宿主的单会话交付协调器；服务端检索实现以回调注入。"""
 
     def __init__(self, config=None, fetch=None, timeout_seconds=0.25, clock=None,
-                 can_remove_retained=True):
+                 can_remove_retained=True, token_counter=None,
+                 token_counter_name="utf8-json-byte-upper-bound"):
         self.config = config or PassiveRecallConfig()
         self.fetch = fetch
         self.timeout_seconds = float(timeout_seconds)
         self.clock = clock or time.monotonic
         self.can_remove_retained = bool(can_remove_retained)
+        self.token_counter = token_counter or request_token_upper_bound
+        self.token_counter_name = token_counter_name
         self.turn = None
         self.seen_deliveries = set()
+        self.delivery_ledger = {}
         self.ordinary_used = 0
         self.status_used = 0
         self.paused_reason = None
@@ -99,10 +105,11 @@ class PassiveRecallAdapter:
         return self.config.enabled and self.paused_reason is None
 
     def begin_turn(self, history, *, session_id, turn_id, delivery_id, user_input,
-                   scope=None, previous_anchors=(), context_evidence=()):
+                   scope=None, previous_anchors=None, context_evidence=None):
         """用户消息入 history 后、第一次模型请求前调用；同 delivery 幂等。"""
         self.turn = {"delivery_id": delivery_id, "message": None,
-                     "state": "skipped", "history": history}
+                     "state": "skipped", "history": history,
+                     "session_id": session_id, "scope": scope or "general"}
         if not self.enabled:
             return "disabled" if not self.config.enabled else "paused"
         if delivery_id in self.seen_deliveries:
@@ -114,6 +121,10 @@ class PassiveRecallAdapter:
         if self.fetch is None:
             self.paused_reason = "宿主没有 latent_passive_recall 入口"
             return "paused"
+        if previous_anchors is None:
+            previous_anchors = self.previous_anchors()
+        if context_evidence is None:
+            context_evidence = self.context_evidence()
         request = {
             "userInput": user_input,
             "turn": {"sessionId": session_id, "turnId": turn_id,
@@ -124,20 +135,23 @@ class PassiveRecallAdapter:
             "capability": {"host": "reference-host",
                            "version": CAPABILITY_VERSION,
                            "mode": self.config.mode,
-                           "tokenCounter": "utf8-json-byte-upper-bound"},
+                           "tokenCounter": self.token_counter_name},
         }
         started = self.clock()
         try:
             response = self.fetch(request, self.timeout_seconds)
         except TimeoutError:
+            self.turn["elapsed_ms"] = round((self.clock() - started) * 1000, 3)
             self.seen_deliveries.add(delivery_id)
             self.turn["state"] = "timeout"
             return "timeout"
         except Exception:
+            self.turn["elapsed_ms"] = round((self.clock() - started) * 1000, 3)
             self.seen_deliveries.add(delivery_id)
             self.turn["state"] = "source_unavailable"
             return "source_unavailable"
         elapsed = self.clock() - started
+        self.turn["elapsed_ms"] = round(elapsed * 1000, 3)
         self.seen_deliveries.add(delivery_id)
         if elapsed > self.timeout_seconds:
             self.turn["state"] = "timeout"
@@ -146,8 +160,18 @@ class PassiveRecallAdapter:
                 "candidate", "ready", "empty"}:
             self.turn["state"] = "invalid_response"
             return "invalid_response"
+        self.turn["response"] = {
+            key: json.loads(json.dumps(response[key])) for key in (
+                "status", "wireVersion", "policyVersion", "assemblyPolicyVersion",
+                "reasonCodes", "records", "dependencies") if key in response
+        }
         if response["status"] == "empty":
             self.turn["state"] = "empty"
+            if response.get("notApplicableDeliveryIds"):
+                self.observe_state({
+                    "notApplicableDeliveryIds": response["notApplicableDeliveryIds"],
+                    "statusNotice": response.get("statusNotice"),
+                })
             return "empty"
         if response.get("deliveryId") != delivery_id:
             self.turn["state"] = "stale"
@@ -165,7 +189,10 @@ class PassiveRecallAdapter:
                                 "assemblyVersion": response.get("assemblyVersion"),
                                 "dependencies": response.get("dependencies", []),
                                 "state": "active"}}
-        cost = request_token_upper_bound(_public_message(message))
+        cost = int(self.token_counter(_public_message(message)))
+        if cost < 0:
+            self.turn["state"] = "invalid_response"
+            return "invalid_response"
         if cost > SINGLE_LIMIT:
             self.turn["state"] = "budget_exceeded"
             return "budget_exceeded"
@@ -173,6 +200,13 @@ class PassiveRecallAdapter:
             self.turn["state"] = "budget_exhausted"
             return "budget_exhausted"
         self.turn.update(message=message, state="ready", cost=cost)
+        self.delivery_ledger[delivery_id] = {
+            "sessionId": session_id, "turnId": turn_id, "scope": scope or "general",
+            "assemblyVersion": response.get("assemblyVersion"),
+            "dependencies": json.loads(json.dumps(response.get("dependencies", []))),
+            "state": "prepared", "confirmed": False, "visibility": "unknown",
+            "cost": cost,
+        }
         if self.config.mode == "retained":
             history.append(message)
             self.ordinary_used += cost
@@ -182,47 +216,84 @@ class PassiveRecallAdapter:
         """每次模型请求前取消息；临时层只写请求副本，不改 history。"""
         if not self.turn or self.turn.get("state") != "ready":
             return [_public_message(item) for item in history]
+        ledger = self.delivery_ledger.get(self.turn["delivery_id"])
+        if ledger is not None:
+            ledger.update(state="active", confirmed=True, visibility="visible")
         if self.config.mode == "temporary":
             return _insert_after_latest_user(history, self.turn["message"])
         return [_public_message(item) for item in history]
 
+    def previous_anchors(self):
+        """只给服务端来源明确的少量账本锚点；不转发模型自由改写。"""
+        recent_ids = [delivery_id for delivery_id, value in self.delivery_ledger.items()
+                      if value.get("state") in {
+                          "prepared", "active", "delivery_unknown"}][-3:]
+        return [{"deliveryId": delivery_id,
+                 **{key: self.delivery_ledger[delivery_id].get(key) for key in
+                    ("assemblyVersion", "visibility", "turnId")}}
+                for delivery_id in recent_ids]
+
+    def context_evidence(self):
+        """仅把确认仍可见的原始证据报为覆盖；自然回答复述不算。"""
+        return [dependency for value in self.delivery_ledger.values()
+                if value.get("state") == "active" and value.get("confirmed")
+                and value.get("visibility") == "visible"
+                for dependency in value.get("dependencies", [])]
+
     def observe_state(self, state):
         """接收工具回执或只读复核给出的覆盖／失效状态，不重新检索。"""
-        if not self.turn or self.turn.get("state") != "ready" or not isinstance(state, dict):
+        if not isinstance(state, dict):
             return "unchanged"
-        delivery_id = self.turn["delivery_id"]
-        covered = delivery_id in state.get("coveredDeliveryIds", [])
-        invalid = delivery_id in state.get("invalidatedDeliveryIds", [])
-        if not (covered or invalid):
+        covered_ids = set(state.get("coveredDeliveryIds", []))
+        invalid_ids = set(state.get("invalidatedDeliveryIds", []))
+        not_applicable_ids = set(state.get("notApplicableDeliveryIds", []))
+        targets = [delivery_id for delivery_id, value in self.delivery_ledger.items()
+                   if value.get("state") in {"prepared", "active", "delivery_unknown"}
+                   and delivery_id in covered_ids | invalid_ids | not_applicable_ids]
+        if not targets:
             return "unchanged"
-        self.turn["state"] = "covered" if covered else "invalidated"
+        for delivery_id in targets:
+            self.delivery_ledger[delivery_id]["state"] = (
+                "covered" if delivery_id in covered_ids else
+                "invalidated" if delivery_id in invalid_ids else "not_applicable")
+            self.delivery_ledger[delivery_id]["visibility"] = "stale"
+        current_id = self.turn.get("delivery_id") if self.turn else None
+        if current_id in targets:
+            self.turn["state"] = self.delivery_ledger[current_id]["state"]
+        outcome = ("invalidated" if invalid_ids.intersection(targets) else
+                   "not_applicable" if not_applicable_ids.intersection(targets) else "covered")
         if self.config.mode == "temporary":
-            return self.turn["state"]
+            return outcome
         if self.can_remove_retained:
-            history = self.turn["history"]
+            history = self.turn["history"] if self.turn else []
             history[:] = [message for message in history
-                           if message.get("_passive", {}).get("deliveryId") != delivery_id]
-            return self.turn["state"]
+                           if message.get("_passive", {}).get("deliveryId") not in targets]
+            return outcome
         notice = state.get("statusNotice")
-        if invalid and isinstance(notice, str) and notice:
+        if (invalid_ids | not_applicable_ids).intersection(targets) \
+                and isinstance(notice, str) and notice:
             message = {"role": "system", "content": notice,
-                       "_passive": {"deliveryId": delivery_id, "state": "status"}}
-            cost = request_token_upper_bound(_public_message(message))
+                       "_passive": {"deliveryIds": targets, "state": "status"}}
+            cost = int(self.token_counter(_public_message(message)))
             remaining = STATUS_LIMIT - self.status_used
             if cost > FINAL_STATUS_RESERVE or cost > remaining - FINAL_STATUS_RESERVE:
                 retirement = state.get("retirementNotice")
                 if isinstance(retirement, str) and retirement:
                     retired_message = {"role": "system", "content": retirement,
                                        "_passive": {"state": "retired"}}
-                    retired_cost = request_token_upper_bound(_public_message(retired_message))
+                    retired_cost = int(self.token_counter(_public_message(retired_message)))
                     if retired_cost <= FINAL_STATUS_RESERVE and retired_cost <= remaining:
                         self.turn["history"].append(retired_message)
                         self.status_used += retired_cost
                 self.paused_reason = "状态预算不足，自动资料已退役或有效性未确认"
+                for value in self.delivery_ledger.values():
+                    if value.get("state") in {"prepared", "active", "delivery_unknown",
+                                              "invalidated", "covered"}:
+                        value["state"] = "retired"
                 return "retired"
             self.turn["history"].append(message)
             self.status_used += cost
-        return self.turn["state"]
+        return outcome
 
     def observe_tool_result(self, result):
         structured = result.get("structuredContent", {}) if isinstance(result, dict) else {}
@@ -231,6 +302,9 @@ class PassiveRecallAdapter:
     def finish_turn(self):
         """回答完成、失败或取消都丢掉临时层；历史保留块留在 history。"""
         if self.turn and self.config.mode == "temporary":
+            ledger = self.delivery_ledger.get(self.turn["delivery_id"])
+            if ledger is not None and ledger.get("state") == "active":
+                ledger["visibility"] = "clipped"
             self.turn["message"] = None
         self.turn = None
 
@@ -241,6 +315,53 @@ class PassiveRecallAdapter:
                 "total": self.ordinary_used + self.status_used,
                 "limits": {"ordinary": ORDINARY_LIMIT, "status": STATUS_LIMIT,
                            "total": TOTAL_LIMIT, "finalStatusReserve": FINAL_STATUS_RESERVE}}
+
+    def observation(self, *, host="reference-host", host_version=CAPABILITY_VERSION):
+        """返回不含输入／证据原文的 W5 观测事件；是否落盘由宿主显式决定。"""
+        turn = self.turn or {}
+        delivery_id = turn.get("delivery_id")
+        ledger = self.delivery_ledger.get(delivery_id, {})
+        state = turn.get("state", "idle")
+        candidate = turn.get("candidate") or {}
+        dependencies = ledger.get("dependencies") or candidate.get("dependencies") or []
+        source_ids = list(dict.fromkeys(
+            item.get("recordId") for item in dependencies
+            if isinstance(item, dict) and item.get("recordId")))
+        response = turn.get("response") or candidate
+        reason_codes = response.get("reasonCodes", []) if isinstance(response, dict) else []
+        queried = state not in {"idle", "skipped", "disabled", "paused", "duplicate"}
+        retrieval_skips = {"low_information", "control_command", "quoted_or_code_only",
+                           "scope_unknown", "source_unresolved"}
+        retrieval_performed = queried and not retrieval_skips.intersection(reason_codes)
+        return {
+            "event": "turn",
+            "host": host,
+            "hostVersion": host_version,
+            "mode": self.config.mode if self.config.enabled else "off",
+            "scope": ledger.get("scope", turn.get("scope", "general")),
+            "sessionHash": opaque_id(ledger.get("sessionId", turn.get("session_id"))),
+            "deliveryHash": opaque_id(delivery_id),
+            "state": state,
+            "prefilter": queried,
+            "retrieved": retrieval_performed,
+            "injected": bool(ledger.get("confirmed")),
+            "reasonCodes": reason_codes,
+            "sourceIds": source_ids,
+            "dependencyCoverage": "complete" if source_ids else "none",
+            "visibility": ledger.get("visibility", "unknown"),
+            "elapsedMs": turn.get("elapsed_ms"),
+            "tokenCounter": self.token_counter_name,
+            "incrementalTokens": ledger.get("cost"),
+            "ordinaryUsed": self.ordinary_used,
+            "statusUsed": self.status_used,
+            "policyVersion": response.get("policyVersion") if isinstance(response, dict) else None,
+            "assemblyPolicyVersion": response.get("assemblyPolicyVersion")
+            if isinstance(response, dict) else None,
+            "wireVersion": response.get("wireVersion") if isinstance(response, dict) else None,
+            "failurePoint": state if state in {
+                "timeout", "source_unavailable", "invalid_response", "stale",
+                "budget_exceeded", "budget_exhausted"} else None,
+        }
 
 
 def _selftest():

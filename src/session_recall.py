@@ -5,6 +5,8 @@
 memory_retrieval.MemoryIndex.recall_recent 解决"没有 query 时召回什么"（时间新鲜度×
 用进废退权重），本文件解决"什么时刻调它"，只做触发与格式化，不碰排序逻辑：
 
+可选 ``per_day_cap`` 只在宿主显式给值时启用按日分散；缺省 ``None`` 保持旧路径。
+
   触发点一·换新窗口：信号干净——新 session/新进程启动本身就是边界。宿主在 session
   启动逻辑里调一次 on_session_start()，把返回的文本块注入开场 context。
 
@@ -153,7 +155,8 @@ class SessionRecall:
 
     def __init__(self, index, topN=DEFAULT_TOPN, half_life=None,
                  compact_threshold_chars=DEFAULT_COMPACT_THRESHOLD_CHARS,
-                 thread_store=None, time_context=None, unresolved_store=None):
+                 thread_store=None, time_context=None, unresolved_store=None,
+                 per_day_cap=None):
         self.index = index
         self.topN = topN
         self.half_life = half_life  # None → recall_recent 用自己的默认半衰期
@@ -162,12 +165,19 @@ class SessionRecall:
         # “上次聊到哪”，没给就跳过 thread；其余层照常给——不断线（规格 §5 三层）
         self.thread_store = thread_store
         self.unresolved_store = unresolved_store
+        self.per_day_cap = per_day_cap
         # 记忆所有者的时区（任务卡"写回时区与跨日归窗"）：只在 meta 没有 local_date
         # 的旧块上用得到——新块的日期在写入时就定死了，读的时候不再换算一次
         self.time_context = time_context
         self._chars_since_recall = 0
 
     def _recall(self, now=None, exclude_record_ids=()):
+        if self.per_day_cap is not None:
+            results = self.index.recall_recent(
+                topN=self.topN, half_life=self.half_life, now=now,
+                per_day_cap=self.per_day_cap, exclude_record_ids=exclude_record_ids,
+                time_context=self.time_context)
+            return format_recall_block(results, time_context=self.time_context)
         results = self.index.recall_recent(
             topN=self.topN, half_life=self.half_life, now=now)
         if exclude_record_ids:

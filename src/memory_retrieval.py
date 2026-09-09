@@ -26,7 +26,7 @@ RRF 只看名次不看绝对分，避开脆弱的跨层分数归一化（Elastic
 这样旧块的历史命中数不会越过当下相关性；权重仍用于无 query 的换窗召回与可选精排。
 
 换窗/压缩召回（任务卡"换窗压缩记忆召回"）：retrieve 之外平级的第二种检索模式
-recall_recent(topN)——换新窗口/context 压缩这两个场景没有 query 可用，语义相关性
+recall_recent(topN, per_day_cap=None)——换新窗口/context 压缩这两个场景没有 query 可用，语义相关性
 无从算起，改用 时间新鲜度×用进废退权重 排序（设计结论已定，不引语义相似度）。
 两个触发点的接线在同目录 session_recall.py。
 
@@ -407,7 +407,8 @@ class MemoryIndex:
         "3.20兑现"这类：共享显著词即相连，见 _build_graph）。没有关联返回空。"""
         return self._neighbors.get(chunk_idx, [])
 
-    def recall_recent(self, topN=5, half_life=None, now=None):
+    def recall_recent(self, topN=5, half_life=None, now=None, per_day_cap=None,
+                      exclude_record_ids=(), time_context=None):
         """无 query 的主动召回：score = 时间新鲜度 × 用进废退权重。
 
         跟 retrieve() 平级的第二种检索模式——换新窗口/context 压缩这两个场景里
@@ -442,12 +443,23 @@ class MemoryIndex:
         都机械抬高最近块的权重，形成"最近的越来越重"的自激循环，污染 retrieve()
         的用进废退信号。
 
+        per_day_cap 缺省 None，逐字保留旧路径。显式给正整数时才启用 B1：先排除
+        指定 recordId、按同源去重，再在完整排序池上限制每个所有者自然日的数量；
+        时间依据不足的记录归“时间未知”组，同样受限。不放宽上限凑满 topN。
+
         返回 [{id, text, meta, score}]（任务卡定的形状）。"""
+        if per_day_cap is not None and (not isinstance(per_day_cap, int)
+                                        or isinstance(per_day_cap, bool)
+                                        or per_day_cap <= 0):
+            raise ValueError("per_day_cap 必须是正整数或 None")
         half_life = RECALL_HALF_LIFE_DAYS if half_life is None else half_life
         now = time.time() if now is None else now
+        excluded = set(exclude_record_ids) if per_day_cap is not None else set()
         scored = []
         for i, meta in enumerate(self.meta):
             if i in self.retracted or i in self.superseded:  # 默认召回只看 current
+                continue
+            if excluded and _chunk_key(self.chunks[i]) in excluded:
                 continue
             ts = meta.get("timestamp")
             if ts is None:
@@ -459,8 +471,40 @@ class MemoryIndex:
             # 不是对抗新鲜度的杠杆"只有在权重有上限时才真成立
             scored.append((i, recency * min(self.weights[i], WEIGHT_INFLUENCE_CAP)))
         scored.sort(key=lambda x: (-x[1], -self.weights[x[0]], x[0]))
-        return [{"id": i, "text": self.chunks[i], "meta": self.meta[i], "score": s}
-                for i, s in scored[:topN]]
+        if per_day_cap is None:
+            return [{"id": i, "text": self.chunks[i], "meta": self.meta[i], "score": s}
+                    for i, s in scored[:topN]]
+        if topN <= 0:
+            return []
+
+        tc = time_context or TimeContext.default()
+        selected, source_seen, day_counts = [], set(), Counter()
+        for i, score in scored:
+            meta = self.meta[i]
+            # 同窗口的 timeline／index 属于同一次来源；没有窗口号时退回文件名。
+            if meta.get("window") is not None:
+                source_key = ("window", meta.get("window"), meta.get("source"))
+            elif meta.get("source"):
+                source_key = ("source", meta.get("source"))
+            else:
+                source_key = ("record", _chunk_key(self.chunks[i]))
+            if source_key in source_seen:
+                continue
+            source_seen.add(source_key)
+            if meta.get("timestamp_source") == "mtime" or meta.get("timestamp") is None:
+                day = "unknown"
+            elif meta.get("local_date"):
+                day = str(meta["local_date"])
+            else:
+                day = tc.local_date(meta["timestamp"])
+            if day_counts[day] >= per_day_cap:
+                continue
+            day_counts[day] += 1
+            selected.append({"id": i, "text": self.chunks[i], "meta": meta,
+                             "score": score})
+            if len(selected) >= topN:
+                break
+        return selected
 
 
     def _distinctive_df(self):
