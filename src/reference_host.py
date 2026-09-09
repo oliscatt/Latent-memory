@@ -17,6 +17,7 @@ latent_session_start / latent_thread_close 都不由宿主代调——模型主�
   temporary／retained。W1 入口尚未随 server 提供时会暂停，不会静默改走主动搜索。
 环境变量：HOST_API_KEY（必填；key 只从环境读，不写进任何文件——凭证不入库）、
   HOST_API_BASE（默认 https://api.deepseek.com/v1）、HOST_MODEL（默认 deepseek-chat）。
+  PASSIVE_RECALL_OBSERVATIONS（可选，本地 JSONL 路径；只记结构化状态，不记原文）。
 """
 
 import json
@@ -30,6 +31,7 @@ from pathlib import Path
 
 from passive_recall_host import (HIDDEN_TOOL, PassiveRecallAdapter,
                                  PassiveRecallConfigError, load_config)
+from passive_recall_observation import JsonlObservationRecorder
 
 API_BASE = os.environ.get("HOST_API_BASE", "https://api.deepseek.com/v1")
 MODEL = os.environ.get("HOST_MODEL", "deepseek-chat")
@@ -140,7 +142,11 @@ def chat(payload):
         headers={"Content-Type": "application/json",
                  "Authorization": "Bearer " + os.environ["HOST_API_KEY"]})
     with urllib.request.urlopen(req, timeout=300) as r:
-        return json.loads(r.read().decode("utf-8"))["choices"][0]["message"]
+        response = json.loads(r.read().decode("utf-8"))
+    message = response["choices"][0]["message"]
+    # 内部字段会被 _public_message 剥掉，不回传模型；只供 W5 本地成本采集。
+    message["_usage"] = response.get("usage", {})
+    return message
 
 
 def run_turn(mcp, persona, history, transport=chat):
@@ -149,6 +155,8 @@ def run_turn(mcp, persona, history, transport=chat):
         volatile = mcp.instructions + "\n当前时间：" + time.strftime("%Y-%m-%d %H:%M")
         request_history = (mcp.passive.messages_for_request(history)
                            if getattr(mcp, "passive", None) else history)
+        request_history = [{key: value for key, value in item.items()
+                            if not key.startswith("_")} for item in request_history]
         msg = transport(build_request(persona, volatile, request_history, mcp.tools))
         history.append(msg)
         if not msg.get("tool_calls"):
@@ -183,6 +191,8 @@ def main(out_dir):
         HIDDEN_TOOL, request, timeout=timeout).get("structuredContent", {})) \
         if hidden_available else None
     mcp.passive = PassiveRecallAdapter(config=config, fetch=fetch)
+    observation_path = os.environ.get("PASSIVE_RECALL_OBSERVATIONS")
+    recorder = JsonlObservationRecorder(observation_path) if observation_path else None
     print(f"参考宿主就绪：{MODEL} @ {API_BASE}，工具 {len(mcp.tools)} 个。exit / Ctrl-D 结束。")
     history = []
     while True:
@@ -201,8 +211,32 @@ def main(out_dir):
             detail = f"：{mcp.passive.paused_reason}" if mcp.passive.paused_reason else ""
             print(f"  [自动浮现] 本轮未交付（{passive_status}）{detail}", file=sys.stderr)
         try:
+            history_before = len(history)
             print("模型> " + run_turn(mcp, persona, history))
         finally:
+            if recorder is not None:
+                try:
+                    added = history[history_before:]
+                    usage_rows = [item.get("_usage", {}) for item in added
+                                  if isinstance(item, dict) and item.get("_usage")]
+                    event = mcp.passive.observation()
+                    event.update({
+                        "model": MODEL,
+                        "base": API_BASE,
+                        "requestInputTokens": sum(int(row.get("prompt_tokens",
+                                                              row.get("input_tokens", 0)) or 0)
+                                                  for row in usage_rows),
+                        "cachedInputTokens": sum(int(
+                            (row.get("prompt_tokens_details") or {}).get("cached_tokens", 0) or 0)
+                                                  for row in usage_rows),
+                        "historyAddedMessages": len(added),
+                        "historyAddedChars": sum(len(str(item.get("content") or ""))
+                                                 for item in added if isinstance(item, dict)),
+                    })
+                    recorder(event)
+                except (OSError, TypeError, ValueError, OverflowError) as exc:
+                    print(f"  [自动浮现观测] 本轮日志未写入（{type(exc).__name__}）",
+                          file=sys.stderr)
             mcp.passive.finish_turn()
     mcp.proc.terminate()
 
@@ -265,7 +299,8 @@ def _selftest():
             replies = [{"role": "assistant", "content": None, "tool_calls": [
                             {"id": "c1", "type": "function",
                              "function": {"name": "latent_search",
-                                          "arguments": '{"query": "咖啡机"}'}}]},
+                                          "arguments": '{"query": "咖啡机"}'}}],
+                        "_usage": {"prompt_tokens": 123}},
                        {"role": "assistant", "content": "查到了。"}]
             fake = lambda payload: (seen.append(payload), replies.pop(0))[1]
             hist = [{"role": "user", "content": "咖啡机怎么修的？"}]
@@ -274,6 +309,8 @@ def _selftest():
                 "工具结果必须以 tool 消息回进 history，模型才看得到"
             assert all(s["messages"][0]["content"] == persona for s in seen), \
                 "回路里每一轮请求的第一条消息都必须是逐字 persona（契约二）"
+            assert all("_usage" not in json.dumps(s, ensure_ascii=False) for s in seen), \
+                "provider usage 只供本地观测，后续请求不得把内部字段发给模型"
         finally:
             mcp.proc.terminate()
 
