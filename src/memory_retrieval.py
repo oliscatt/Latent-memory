@@ -2064,12 +2064,12 @@ def _selftest(embed=False):
         i1.retrieve("咖啡机", topN=3)
         assert pv1.texts_embedded == len(SYNTH) + 1, \
             "一次查询只该多算一个查询向量，不是把全库重算一遍"
-        #   换窗开场召回（recall_recent）**一个 embedding 都不该花**：它按时间
+        #   换窗召回（recall_recent）**一个 embedding 都不该花**：它按时间
         #   新鲜度×权重排序，压根没有 query 向量可算。这是云端档最该单独算账的
         #   地方（每开一次新会话都要付、用户正等着第一句话），实测代价是零。
         before = pv1.texts_embedded
         i1.recall_recent(topN=3)
-        assert pv1.texts_embedded == before, "开场召回不该触发任何 embedding 调用"
+        assert pv1.texts_embedded == before, "换窗召回不该触发任何 embedding 调用"
         #   重启（重新建库）：块向量全部命中缓存，一次都不重算
         pv2 = HTTPCloudProvider("https://api.example.com/v1/embeddings", "BAAI/bge-m3",
                                 transport=_fake_transport(), env=_env)
@@ -2346,7 +2346,7 @@ def _selftest(embed=False):
     #      所有自产自销的回归都走 ISO；memory_import 那边认的是 json 结构。
     #      而"直接拿导出器吐出来的 md 建库"是最省事、因此最多人走的一条路——
     #      2026.08.02 内测用户就是这么撞上的：头行 `> 7/22/2026 12:54:09` 一个都
-    #      认不出来，整份语料的块全落 mtime，开场召回按新鲜度排序当场失效。
+    #      认不出来，整份语料的块全落 mtime，换窗召回按新鲜度排序当场失效。
     #      语料样本是自己造的（用户明确说内容私人不给，我们也不要）。
     def _mk(td, name, text):
         Path(td, name).write_text(text, encoding="utf-8")

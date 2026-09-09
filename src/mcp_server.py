@@ -135,7 +135,7 @@ INSTRUCTIONS = (
     "latent_cleanup：必须先 preview，向对方展示将移除的记录，再把确认令牌逐字交回 delete；"
     "不得按相似文字猜记录，不得跳过确认。\n"
     "⚠ 但 latent_correct 撤的是你**逐字摘的那一块**，不是「这件事」：同一说法若还写在"
-    "别的记录里，那些不受影响，开场自动浮现（没有 query、按时间和权重排）可能把旧说法"
+    "别的记录里，那些不受影响，换窗召回（没有 query、按时间和权重排）可能把旧说法"
     "直接端回来。改过重要的事实后，服务端会提醒库里还有几块与它共享词面——可以用旧"
     "说法再查一次看看还有没有；不必、也不该逐条撤。\n"
     "查过但确实没有的，就如实说没找到——查过之后的“没有”是诚实，查之前的“没有”才是错。\n"
@@ -866,7 +866,7 @@ class MemoryServer:
                  require_unresolved_review=False, write_dir=None,
                  enable_passive_recall=False, recall_per_day_cap=None):
         # 两个 topN 分开（2026.07.31 真实语料冒烟后拆的）：显式检索是用户/模型
-        # 主动问一件事，多给几条值；开场召回每次换窗都付一遍，条数要克制
+        # 主动问一件事，多给几条值；换窗召回每次换窗都付一遍，条数要克制
         self.index = index if index is not None else MemoryIndex().build()
         self.thread_store = thread_store if thread_store is not None else ThreadStore()
         self.corpus_dir = corpus_dir
@@ -1641,7 +1641,7 @@ class MemoryServer:
                 head = (f" ⚠ 但撤回是块级的：库里还有 {len(survivors)} 块与它共享词面"
                         f"（最近：{'、'.join(labels)}{more}）")
             msg += (head + "，它们**没被这次撤回影响**。"
-                    "主动检索通常问不到它们，但开场自动浮现没有 query、按时间和权重排，"
+                    "主动检索通常问不到它们，但换窗召回没有 query、按时间和权重排，"
                     "旧说法可能被直接端出来。可以用旧说法再 latent_search 一次看看还有"
                     "没有；不必、也不该逐条撤——服务端只提示、不会替你自动撤"
                     "（词面命中不等于讲的是同一件事，撤错比给旧值更糟）。")
@@ -2904,7 +2904,7 @@ def diagnose(corpus_dir, threads_path=None, embed=False, time_context=None,
         add(FAIL, "写回落点", f"{probe} 不可写——模型会说“记下了”，但每一次写回都失败。")
 
     # thread 落点：没配 --threads 时 latent_thread_close 只活在内存里，进程一退就没了，
-    # 下个会话的开场召回接不上上一次聊到哪
+    # 下个会话的换窗召回接不上上一次聊到哪
     if not threads_path:
         add(WARN, "会话线索", "没配 --threads，会话收尾只在内存里、进程一退就没——"
                               "下个会话接不上“上次聊到哪”。MCP 配置里补一个 jsonl 路径。")
@@ -5772,7 +5772,7 @@ def _selftest():
         b20 = srv20b.handle({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
                              "params": {"name": "latent_session_start", "arguments": {}}})
         assert "[2026.08.04" in b20["result"]["content"][0]["text"], \
-            f"重启后的开场召回该还是 08-04：{b20['result']['content'][0]['text']}"
+            f"重启后的换窗召回该还是 08-04：{b20['result']['content'][0]['text']}"
         #    c) 走真进程：--timezone 非法值必须非零退出，不许静默退 UTC
         code20, out20 = run_doctor(td20, "--corpus", "corpus", "--timezone", "Asia/Shenzhen")
         assert code20 != 0 and "Asia/Shenzhen" in out20, \
@@ -6170,7 +6170,7 @@ def _selftest():
           "session_start 读取异常只重试一次、未预料异常不空断、写工具不重放）/ "
           "完整链路 / stdio / UTF-8 / 写回当场可查 / 写回预检（零写入、补索引预检、"
           "参数错误写错／写对对照）/ 事实变迁链（A→B→C 双向链接、默认只返回 current、"
-          "历史意图与同链多节点命中突破 topN 补齐、自动召回只见 current、按登记时间排序、"
+          "历史意图与同链多节点命中突破 topN 补齐、换窗召回只见 current、按登记时间排序、"
           "重启恢复、纯 correct 仍全局撤回）/ "
           "精准清理（两阶段确认、引用阻断、"
           "隔离备份不回灌、sidecar 同步与故障回滚）/ 用进撑过重启 / "
@@ -6190,7 +6190,7 @@ def _selftest():
           "）/ "
           "CLI 入口把 stdout 锁成 UTF-8（⚠ 变异要在 PYTHONIOENCODING=gbk 下跑，"
           "默认 UTF-8 的机器上这条恒真）/ "
-          "时区穿到进程级（--timezone 一路到文件名／H2／当场检索标签／重启后开场召回，"
+          "时区穿到进程级（--timezone 一路到文件名／H2／当场检索标签／重启后换窗召回，"
           "非法名非零退出、没配报 ⚠ 且打出实际时区、配了报 ✓ 并写出名字）/ "
           "启动失败给人话给出口·真进程（端口被占／拿不到模型／慢加载三条各造一次且互不串，"
           "都不再是裸堆栈，报告连堆栈落盘；stdio 档起降级壳把那段话从协议里回出去——"

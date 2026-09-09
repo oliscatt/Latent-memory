@@ -1,0 +1,81 @@
+name: 自动浮现问题
+description: 报告自动浮现未运行、注入错误、重复或无法关闭等问题
+title: "[自动浮现问题] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        出问题时请先关闭自动浮现；主动检索、换窗召回和正常写回不会受影响。
+
+        **禁止上传真实人格、记忆正文、问句、回答、token、私人路径或原始导出包。** 最小虚构复现和脱敏日志有帮助，但不是提交门槛。跨用户读取、未授权写入、凭证泄露或任意文件访问请不要公开提交，改用仓库 Security 页的私密漏洞报告。
+  - type: input
+    id: commit
+    attributes:
+      label: Latent 完整 commit
+      description: 请填写 `git rev-parse HEAD` 的完整输出。
+      placeholder: 40 位 commit
+    validations:
+      required: true
+  - type: input
+    id: host
+    attributes:
+      label: 宿主名称与版本
+      placeholder: 例如：自建 Node 宿主 1.2.0
+    validations:
+      required: true
+  - type: input
+    id: hook_timing
+    attributes:
+      label: hook 执行时机
+      description: 写 hook 名称，以及它相对用户消息提交和首个模型请求的位置；不知道可写“未确认”。
+      placeholder: 例如：beforeModel，在用户消息入 history 后、首个模型请求前
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: 当前模式
+      options:
+        - 关闭
+        - 临时
+        - 历史保留
+        - 未确认
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: 实际结果与预期结果
+      description: 请分别写实际发生了什么、你原本期望什么；不要贴真实对话或记忆内容。
+      placeholder: |
+        实际：
+        预期：
+    validations:
+      required: true
+  - type: textarea
+    id: stages
+    attributes:
+      label: 可选：AI 部署报告或阶段信息
+      description: 可贴脱敏后的 hook、隐藏入口、候选、注入和一句话关闭状态。
+    validations:
+      required: false
+  - type: textarea
+    id: environment
+    attributes:
+      label: 可选：环境
+      description: 操作系统、Python、stdio／HTTP、模型与 base、是否在恢复／压缩／分叉／重启后出现。
+    validations:
+      required: false
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: 可选：最小虚构复现或脱敏日志
+      description: 只能使用完全虚构的数据；无法安全提供时留空。
+    validations:
+      required: false
+  - type: markdown
+    attributes:
+      value: |
+        初期不承诺响应时间。数据损坏、跨用户读取、凭证问题优先处理；“没有浮现”排在后面。
+
+        > 所有 Issue 我们都会认真回复；迭代之后会回到原 Issue 告知结果。 跑通了也请告诉我们——成功记录和失败记录一样有用。谢谢每一位愿意反馈的人。
