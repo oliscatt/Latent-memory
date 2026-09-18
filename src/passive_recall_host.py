@@ -4,6 +4,7 @@
 本文件不做检索、不判断相关性、不组装历史证据；这些属于 W1～W4。它只冻结宿主
 和后续 ``latent_passive_recall`` 入口之间的请求／响应形状，并管理一次交付在请求、
 历史、工具回路、取消和预算里的去向。默认关闭，没有明确模式时绝不调用服务端。
+窗口预算只供拥有真实 transcript 裁剪能力的宿主显式选择；这里不负责压缩历史。
 """
 
 from dataclasses import dataclass
@@ -81,11 +82,20 @@ def _insert_after_latest_user(history, message):
 
 
 class PassiveRecallAdapter:
-    """参考宿主的单会话交付协调器；服务端检索实现以回调注入。"""
+    """参考宿主的单会话交付协调器；服务端检索实现以回调注入。
+
+    默认 session 策略保留累计上限；host_window 仅执行单条硬顶，宿主必须在
+    保存／恢复／裁剪后按真实 history 同步可见性，再发起下一次模型请求。
+    """
 
     def __init__(self, config=None, fetch=None, timeout_seconds=0.25, clock=None,
                  can_remove_retained=True, token_counter=None,
-                 token_counter_name="utf8-json-byte-upper-bound"):
+                 token_counter_name="utf8-json-byte-upper-bound", budget_policy="session",
+                 single_limit=SINGLE_LIMIT):
+        if budget_policy not in {"session", "host_window"}:
+            raise PassiveRecallConfigError("预算策略必须是 session 或 host_window")
+        if isinstance(single_limit, bool) or not isinstance(single_limit, int) or single_limit < 1:
+            raise PassiveRecallConfigError("单条预算必须是正整数")
         self.config = config or PassiveRecallConfig()
         self.fetch = fetch
         self.timeout_seconds = float(timeout_seconds)
@@ -93,12 +103,15 @@ class PassiveRecallAdapter:
         self.can_remove_retained = bool(can_remove_retained)
         self.token_counter = token_counter or request_token_upper_bound
         self.token_counter_name = token_counter_name
+        self.budget_policy = budget_policy
+        self.single_limit = single_limit
         self.turn = None
         self.seen_deliveries = set()
         self.delivery_ledger = {}
         self.ordinary_used = 0
         self.status_used = 0
         self.paused_reason = None
+        self._window_sync_needed = False
 
     @property
     def enabled(self):
@@ -107,6 +120,8 @@ class PassiveRecallAdapter:
     def begin_turn(self, history, *, session_id, turn_id, delivery_id, user_input,
                    scope=None, previous_anchors=None, context_evidence=None):
         """用户消息入 history 后、第一次模型请求前调用；同 delivery 幂等。"""
+        if self.budget_policy == "host_window" and self._window_sync_needed:
+            raise PassiveRecallConfigError("发起下一轮前必须同步真实保留的历史")
         self.turn = {"delivery_id": delivery_id, "message": None,
                      "state": "skipped", "history": history,
                      "session_id": session_id, "scope": scope or "general"}
@@ -193,10 +208,11 @@ class PassiveRecallAdapter:
         if cost < 0:
             self.turn["state"] = "invalid_response"
             return "invalid_response"
-        if cost > SINGLE_LIMIT:
+        if cost > self.single_limit:
             self.turn["state"] = "budget_exceeded"
             return "budget_exceeded"
-        if self.config.mode == "retained" and self.ordinary_used + cost > ORDINARY_LIMIT:
+        if self.config.mode == "retained" and self.budget_policy == "session" \
+                and self.ordinary_used + cost > ORDINARY_LIMIT:
             self.turn["state"] = "budget_exhausted"
             return "budget_exhausted"
         self.turn.update(message=message, state="ready", cost=cost)
@@ -210,6 +226,8 @@ class PassiveRecallAdapter:
         if self.config.mode == "retained":
             history.append(message)
             self.ordinary_used += cost
+            if self.budget_policy == "host_window":
+                self._window_sync_needed = True
         return "ready"
 
     def messages_for_request(self, history):
@@ -227,7 +245,8 @@ class PassiveRecallAdapter:
         """只给服务端来源明确的少量账本锚点；不转发模型自由改写。"""
         recent_ids = [delivery_id for delivery_id, value in self.delivery_ledger.items()
                       if value.get("state") in {
-                          "prepared", "active", "delivery_unknown"}][-3:]
+                          "prepared", "active", "delivery_unknown"}
+                      and value.get("visibility") != "evicted"][-3:]
         return [{"deliveryId": delivery_id,
                  **{key: self.delivery_ledger[delivery_id].get(key) for key in
                     ("assemblyVersion", "visibility", "turnId")}}
@@ -240,6 +259,38 @@ class PassiveRecallAdapter:
                 and value.get("visibility") == "visible"
                 for dependency in value.get("dependencies", [])]
 
+    def reconcile_retained_history(self, history):
+        """由宿主裁剪／恢复后的实际 history 更新可见性；不推断事实失效。
+
+        只识别参考适配器写入的 `_passive.deliveryId`。宿主若另存 transcript，
+        应先把它准确映射到此结构，再调用本方法；不能按时间猜测哪些资料还在。
+        """
+        if self.config.mode != "retained" or self.budget_policy != "host_window":
+            raise PassiveRecallConfigError("只有历史保留的宿主窗口策略可同步可见性")
+        visible = {}
+        notices = {}
+        for position, item in enumerate(history):
+            if not isinstance(item, dict) or not isinstance(item.get("_passive"), dict):
+                continue
+            metadata = item["_passive"]
+            if metadata.get("deliveryId"):
+                visible[metadata["deliveryId"]] = position
+            if metadata.get("state") == "status":
+                for delivery_id in metadata.get("deliveryIds", []):
+                    notices[delivery_id] = position
+        for delivery_id, position in visible.items():
+            if self.delivery_ledger.get(delivery_id, {}).get("notice_required") \
+                    and notices.get(delivery_id, -1) <= position:
+                raise PassiveRecallConfigError("保留证据缺少其后较新的失效通知，不能发送裁剪后的历史")
+        for delivery_id, value in self.delivery_ledger.items():
+            if value.get("confirmed"):
+                value["visibility"] = "visible" if delivery_id in visible else "evicted"
+        self._window_sync_needed = False
+        return {"visible": sum(value.get("confirmed") and value.get("visibility") == "visible"
+                               for value in self.delivery_ledger.values()),
+                "evicted": sum(value.get("confirmed") and value.get("visibility") == "evicted"
+                               for value in self.delivery_ledger.values())}
+
     def observe_state(self, state):
         """接收工具回执或只读复核给出的覆盖／失效状态，不重新检索。"""
         if not isinstance(state, dict):
@@ -249,6 +300,7 @@ class PassiveRecallAdapter:
         not_applicable_ids = set(state.get("notApplicableDeliveryIds", []))
         targets = [delivery_id for delivery_id, value in self.delivery_ledger.items()
                    if value.get("state") in {"prepared", "active", "delivery_unknown"}
+                   and value.get("visibility") != "evicted"
                    and delivery_id in covered_ids | invalid_ids | not_applicable_ids]
         if not targets:
             return "unchanged"
@@ -256,7 +308,8 @@ class PassiveRecallAdapter:
             self.delivery_ledger[delivery_id]["state"] = (
                 "covered" if delivery_id in covered_ids else
                 "invalidated" if delivery_id in invalid_ids else "not_applicable")
-            self.delivery_ledger[delivery_id]["visibility"] = "stale"
+            if self.budget_policy != "host_window":
+                self.delivery_ledger[delivery_id]["visibility"] = "stale"
         current_id = self.turn.get("delivery_id") if self.turn else None
         if current_id in targets:
             self.turn["state"] = self.delivery_ledger[current_id]["state"]
@@ -276,13 +329,15 @@ class PassiveRecallAdapter:
                        "_passive": {"deliveryIds": targets, "state": "status"}}
             cost = int(self.token_counter(_public_message(message)))
             remaining = STATUS_LIMIT - self.status_used
-            if cost > FINAL_STATUS_RESERVE or cost > remaining - FINAL_STATUS_RESERVE:
+            if (cost > self.single_limit if self.budget_policy == "host_window" else
+                    cost > FINAL_STATUS_RESERVE or cost > remaining - FINAL_STATUS_RESERVE):
                 retirement = state.get("retirementNotice")
                 if isinstance(retirement, str) and retirement:
                     retired_message = {"role": "system", "content": retirement,
                                        "_passive": {"state": "retired"}}
                     retired_cost = int(self.token_counter(_public_message(retired_message)))
-                    if retired_cost <= FINAL_STATUS_RESERVE and retired_cost <= remaining:
+                    if retired_cost <= min(FINAL_STATUS_RESERVE, self.single_limit) \
+                            and (self.budget_policy == "host_window" or retired_cost <= remaining):
                         self.turn["history"].append(retired_message)
                         self.status_used += retired_cost
                 self.paused_reason = "状态预算不足，自动资料已退役或有效性未确认"
@@ -293,6 +348,10 @@ class PassiveRecallAdapter:
                 return "retired"
             self.turn["history"].append(message)
             self.status_used += cost
+            if self.budget_policy == "host_window":
+                self._window_sync_needed = True
+                for delivery_id in targets:
+                    self.delivery_ledger[delivery_id]["notice_required"] = True
         return outcome
 
     def observe_tool_result(self, result):
@@ -314,7 +373,9 @@ class PassiveRecallAdapter:
         return {"ordinary": self.ordinary_used, "status": self.status_used,
                 "total": self.ordinary_used + self.status_used,
                 "limits": {"ordinary": ORDINARY_LIMIT, "status": STATUS_LIMIT,
-                           "total": TOTAL_LIMIT, "finalStatusReserve": FINAL_STATUS_RESERVE}}
+                           "total": TOTAL_LIMIT, "finalStatusReserve": FINAL_STATUS_RESERVE,
+                           "single": self.single_limit,
+                           "cumulativeEnforced": self.budget_policy == "session"}}
 
     def observation(self, *, host="reference-host", host_version=CAPABILITY_VERSION):
         """返回不含输入／证据原文的 W5 观测事件；是否落盘由宿主显式决定。"""
@@ -486,6 +547,23 @@ def _selftest():
                              user_input="预算") == "budget_exceeded"
     assert len(hb) == 1, "超预算资料不能先追加再回滚"
     assert retained.usage()["total"] <= TOTAL_LIMIT
+    # 宿主实际裁剪窗口时，单条仍有硬顶，累计值仅为遥测；可见性来自历史实物。
+    window_history = []
+    window = PassiveRecallAdapter(PassiveRecallConfig(True, "retained"), ready,
+                                  token_counter=lambda _message: 100,
+                                  budget_policy="host_window", single_limit=120)
+    for i in range(25):
+        window_history.append({"role": "user", "content": f"虚构话题{i}"})
+        assert window.begin_turn(window_history, session_id="s", turn_id=str(i),
+                                 delivery_id=f"w{i}", user_input=f"虚构话题{i}") == "ready"
+        window.messages_for_request(window_history)
+        window.finish_turn()
+        window.reconcile_retained_history(window_history)
+    assert window.usage()["ordinary"] == 2500
+    assert window.reconcile_retained_history(window_history[2:]) == {
+        "visible": 24, "evicted": 1}
+    assert window.delivery_ledger["w0"]["state"] == "active"
+    assert window.delivery_ledger["w0"]["visibility"] == "evicted"
     print("selftest 通过：W0 L1-L3／T1-T2／H1-H4 宿主契约离线夹具")
 
 
