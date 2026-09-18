@@ -232,6 +232,12 @@ class PassiveRecallAdapter:
 
     def messages_for_request(self, history):
         """每次模型请求前取消息；临时层只写请求副本，不改 history。"""
+        if self.budget_policy == "host_window" and self.paused_reason:
+            raise PassiveRecallConfigError("自动资料失效通知无法安全交付，不能继续发送旧历史")
+        if self.budget_policy == "host_window" and self.config.mode == "retained":
+            self.reconcile_retained_history(history)
+            # 请求副本检查不代替下一轮前对最终保存结果的同步。
+            self._window_sync_needed = True
         if not self.turn or self.turn.get("state") != "ready":
             return [_public_message(item) for item in history]
         ledger = self.delivery_ledger.get(self.turn["delivery_id"])
@@ -279,7 +285,8 @@ class PassiveRecallAdapter:
                 for delivery_id in metadata.get("deliveryIds", []):
                     notices[delivery_id] = position
         for delivery_id, position in visible.items():
-            if self.delivery_ledger.get(delivery_id, {}).get("notice_required") \
+            if self.delivery_ledger.get(delivery_id, {}).get("state") in {
+                    "invalidated", "not_applicable"} \
                     and notices.get(delivery_id, -1) <= position:
                 raise PassiveRecallConfigError("保留证据缺少其后较新的失效通知，不能发送裁剪后的历史")
         for delivery_id, value in self.delivery_ledger.items():
@@ -323,6 +330,10 @@ class PassiveRecallAdapter:
                            if message.get("_passive", {}).get("deliveryId") not in targets]
             return outcome
         notice = state.get("statusNotice")
+        if self.budget_policy == "host_window" and (invalid_ids | not_applicable_ids).intersection(targets) \
+                and (not isinstance(notice, str) or not notice):
+            self.paused_reason = "旧证据仍在历史中，但缺少失效通知"
+            return "retired"
         if (invalid_ids | not_applicable_ids).intersection(targets) \
                 and isinstance(notice, str) and notice:
             message = {"role": "system", "content": notice,
@@ -350,8 +361,6 @@ class PassiveRecallAdapter:
             self.status_used += cost
             if self.budget_policy == "host_window":
                 self._window_sync_needed = True
-                for delivery_id in targets:
-                    self.delivery_ledger[delivery_id]["notice_required"] = True
         return outcome
 
     def observe_tool_result(self, result):
