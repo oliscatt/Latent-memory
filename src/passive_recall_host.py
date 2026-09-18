@@ -17,6 +17,7 @@ from passive_recall_observation import opaque_id
 
 HIDDEN_TOOL = "latent_passive_recall"
 CAPABILITY_VERSION = "reference-host-passive-w5-v1"
+WINDOW_CAPABILITY_VERSION = "reference-host-passive-window-v2"
 MODES = {"temporary", "retained"}
 SINGLE_LIMIT = 300
 ORDINARY_LIMIT = 2400
@@ -104,6 +105,8 @@ class PassiveRecallAdapter:
         self.token_counter = token_counter or request_token_upper_bound
         self.token_counter_name = token_counter_name
         self.budget_policy = budget_policy
+        self.capability_version = (WINDOW_CAPABILITY_VERSION if budget_policy == "host_window"
+                                   else CAPABILITY_VERSION)
         self.single_limit = single_limit
         self.turn = None
         self.seen_deliveries = set()
@@ -148,7 +151,7 @@ class PassiveRecallAdapter:
             "previousAnchors": list(previous_anchors),
             "contextEvidence": list(context_evidence),
             "capability": {"host": "reference-host",
-                           "version": CAPABILITY_VERSION,
+                           "version": self.capability_version,
                            "mode": self.config.mode,
                            "tokenCounter": self.token_counter_name},
         }
@@ -386,7 +389,7 @@ class PassiveRecallAdapter:
                            "single": self.single_limit,
                            "cumulativeEnforced": self.budget_policy == "session"}}
 
-    def observation(self, *, host="reference-host", host_version=CAPABILITY_VERSION):
+    def observation(self, *, host="reference-host", host_version=None):
         """返回不含输入／证据原文的 W5 观测事件；是否落盘由宿主显式决定。"""
         turn = self.turn or {}
         delivery_id = turn.get("delivery_id")
@@ -406,7 +409,7 @@ class PassiveRecallAdapter:
         return {
             "event": "turn",
             "host": host,
-            "hostVersion": host_version,
+            "hostVersion": host_version or self.capability_version,
             "mode": self.config.mode if self.config.enabled else "off",
             "scope": ledger.get("scope", turn.get("scope", "general")),
             "sessionHash": opaque_id(ledger.get("sessionId", turn.get("session_id"))),
