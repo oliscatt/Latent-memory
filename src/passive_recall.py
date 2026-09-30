@@ -1326,7 +1326,16 @@ class PassiveRecallService:
         eligible = []
         normalized_input = _canonical(user_input)
         today = self._today() if _ADMISSION_POLICY.get("skip_same_day_records") else None
+        # 撤回、被取代、被部署插件隐藏的块一律不递。热词路径和 index 桥接是直接扫全库取行的，
+        # 不经过 retrieve_candidates 那道过滤，所以在三条路径共用的这一处统一挡：漏了被取代的，
+        # 旧状态会被当证据递出去；漏了撤回的，组装时认不出来、整轮以 source_unresolved 留空。
+        dead = set(getattr(self.index, "retracted", ()) or ()) \
+            | set(getattr(self.index, "superseded", ()) or ())
+        if hasattr(self.index, "hidden_indices"):
+            dead |= set(self.index.hidden_indices())
         for row in rows:
+            if row["id"] in dead:
+                continue
             # 每条都过主题和语义门槛；唯一例外是上面登记精确相等的许可短句。
             if row["id"] not in qualified:
                 rejected.append("no_reliable_candidate")
@@ -1998,6 +2007,50 @@ def __selftest_rare_excerpt_anchor_body():
     print("selftest 稀有词片段：通过（以锚点为中心截取、片段含锚点词、W4 重组与签名）")
 
 
+def _selftest_not_current():
+    """撤回、被取代的块不递：热词路径与稀有词路径的 index 桥接都直接扫全库取行，
+    这条钉住它们在共用准入处被挡掉，而且挡掉后照常去看下一个候选、不整轮留空。"""
+    import tempfile
+    from memory_retrieval import MemoryIndex
+    rows = [("风车岛一日：坐船到风车岛，尝了gelato，海边走了一下午。", "a-day", "timeline", "2026-01-01"),
+            ("2026-01-01 · 风车岛一日，风车岛冰淇淋，海边散步。", "a-day", "index", "2026-01-01"),
+            ("风车岛冰淇淋又吃了一次，这回是开心果味。", "d-day", "timeline", "2026-01-07"),
+            ("陶瓷样品的检验记录。", "c-day", "timeline", "2026-01-03")]
+
+    def build(dead=None):
+        index = MemoryIndex()
+        for text, source, layer, day in rows:
+            index.add(text, {"source": source, "chunk_index": 0, "layer": layer, "local_date": day,
+                             "timestamp_source": "filename"})
+        index.build()
+        if dead:
+            getattr(index, dead).add(0)
+        return index
+
+    old, fresh = _chunk_key(rows[0][0]), _chunk_key(rows[2][0])
+    saved = dict(_ADMISSION_POLICY)
+    try:
+        _ADMISSION_POLICY["rare_word_tags"] = ["nr", "ns", "nt", "nz", "nrt", "eng"]
+        _ADMISSION_POLICY["rare_word_max_df"] = 18
+        table = build_hotwords_from_index(build(), k_sources=12)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "passive_hotwords.json"
+            path.write_text(json.dumps(table, ensure_ascii=False), encoding="utf-8")
+            for label, pin in (("热词路径", path), ("稀有词路径", Path(tmp) / "none.json")):
+                with _hotwords_pinned(pin):
+                    for dead in ("superseded", "retracted"):
+                        result = PassiveRecallService(build(dead), assemble_candidates=True).candidate({
+                            "userInput": "风车冰淇淋，捞",
+                            "turn": {"sessionId": label, "turnId": dead, "deliveryId": f"{label}-{dead}"}})
+                        got = [r["recordId"] for r in result.get("records", [])]
+                        assert old not in got, f"{label}：{dead} 的块不许递出去：{result}"
+                        assert got == [fresh], f"{label}：{dead} 挡掉后要接着看下一个候选，不整轮留空：{result}"
+    finally:
+        _ADMISSION_POLICY.clear()
+        _ADMISSION_POLICY.update(saved)
+    print("selftest 不递非现行块：通过（热词路径、稀有词桥接 × 被取代、撤回）")
+
+
 def _selftest():
     _selftest_substring_path()
     if not JIEBA_AVAILABLE:
@@ -2005,6 +2058,7 @@ def _selftest():
               "没装时块路径只剩子串路径（要有热词表），事实模式与主动检索不受影响")
         return
     _selftest_hotwords_path()
+    _selftest_not_current()
     _selftest_topic_admission()
     _selftest_filler_ranking()
     _selftest_rare_path()
