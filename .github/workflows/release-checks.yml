@@ -32,6 +32,8 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+      - name: 安装自动浮现块路径依赖（jieba）
+        run: pip install -r requirements-passive.txt
       - name: 运行全部公开自检
         run: >-
           python tests/run_release_checks.py

@@ -180,6 +180,8 @@ def format_block(items, bad_lines=()):
     if not items and not bad_lines:
         return None
     lines = ["【当前未解决】以下事项仍被明确标记为未结束；这是当前集合，优先于后面的历史快照："]
+    if items:
+        lines.append("【由你自己选择合适的时机提起】")
     for item in items:
         source = item.updated if item.updated != "—" else item.initial
         lines.append(f"- [{item.id}｜{source}] {item.summary}")
@@ -213,11 +215,21 @@ def _selftest():
         item = store.read()[0]
         assert item.summary == "只差民宿确认" and "window_01" in item.initial
         assert "window_02" in item.updated
-        assert item_id in format_block(store.read())
+        block = format_block(store.read())
+        assert item_id in block
+        assert block.splitlines()[1] == "【由你自己选择合适的时机提起】" \
+            and block.count("【由你自己选择合适的时机提起】") == 1, \
+            "有效未解决事项须把是否、何时提起交给当前模型，且只提示一次"
         store.apply([{"action": "close", "id": item_id}], "manual")
         assert store.read() == [] and item_id not in store.path.read_text(encoding="utf-8")
+        assert format_block([]) is None, "空清单不得额外制造开场内容"
         store.path.write_text("# 未解决\n坏行\n", encoding="utf-8")
-        assert store.read(allow_partial=True)[1] == [2]
+        valid, bad_lines = store.read(allow_partial=True)
+        assert bad_lines == [2]
+        damaged_block = format_block(valid, bad_lines)
+        assert "⚠ 未解决清单另有格式错误行：2" in damaged_block
+        assert "【由你自己选择合适的时机提起】" not in damaged_block, \
+            "只有坏行时须保留警告，但不能冒充存在可择机提起的有效事项"
         try:
             store.apply([{"action": "none"}], "manual")
             assert False, "坏文件不能冒充 reviewed"

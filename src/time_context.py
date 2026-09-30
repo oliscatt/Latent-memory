@@ -74,7 +74,6 @@ _OFFSET_RE = re.compile(r"^(?:UTC|GMT)?([+-])(\d{1,2})(?::?(\d{2}))?$", re.IGNOR
 # 形态是 HTML 注释：渲染出来的 Markdown 里看不见，正文仍然是人可读的。
 _RECORD_MARK_RE = re.compile(r"<!--\s*写于\s*([0-9T:.+\-]+)\s*-->")
 
-
 def record_time_marker(epoch, time_context):
     """(epoch, TimeContext) → 记录级精确时刻标记行（带 UTC offset 的 ISO 8601）。"""
     return f"<!-- 写于 {time_context.isoformat(epoch)} -->"
@@ -129,7 +128,9 @@ class TimeContext:
             raise ValueError(
                 f"认不出这个时区名：{name}（{e}）。要么是拼错了（IANA 名形如 "
                 "Asia/Shanghai、Europe/Berlin），要么是这台机器上没有 IANA 时区"
-                "数据库——Windows 常见，出口有两条：装 tzdata（pip install tzdata），"
+                "数据库——Windows 常见，出口有两条：装 tzdata（普通 Python 用 "
+                "python -m pip install tzdata；无 pip 的便携版把 tzdata wheel 里的 "
+                "tzdata 文件夹放到实际 python.exe 同目录，见 docs/故障排查.md），"
                 "或改用固定偏移写法（--timezone UTC+08:00，⚠ 它不懂夏令时，"
                 "只对常年不换偏移的地区等价）。") from e
         self.name = name
@@ -303,7 +304,8 @@ def _selftest():
     assert det is None or det in available_timezones(), f"探到的名字必须是真 IANA 名：{det}"
 
     print("selftest ok（7项断言：跨时区自然日 / 自然日边界 / 记录级 ISO 标记 / "
-          "非法名不静默退UTC / 固定偏移出口 / 默认档＝东八区且自报是默认值 / 时区探测不猜）")
+          "非法名不静默退UTC / 固定偏移出口 / "
+          "默认档＝东八区且自报是默认值 / 时区探测不猜）")
 
 
 if __name__ == "__main__":

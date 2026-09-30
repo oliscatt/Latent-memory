@@ -47,6 +47,19 @@ def safe_base(value):
     return urlunsplit((parts.scheme, host, parts.path, "", ""))
 
 
+# 这几类原因码的冒号后面是用户这句话里的词（主题词、锚点词），只留前缀；
+# 分数类（fact_score:0.512）是数字，照留。
+_WORD_BEARING_REASONS = ("topic:", "anchor:")
+
+
+def _safe_reason(code):
+    code = str(code)
+    for prefix in _WORD_BEARING_REASONS:
+        if code.startswith(prefix):
+            return prefix.rstrip(":")
+    return code
+
+
 def sanitize_observation(event):
     """按白名单生成可落盘事件；未知字段与原文类字段一律拒绝。"""
     if not isinstance(event, dict):
@@ -60,6 +73,8 @@ def sanitize_observation(event):
     clean = {key: value for key, value in event.items() if value is not None}
     if "base" in clean:
         clean["base"] = safe_base(clean["base"])
+    if isinstance(clean.get("reasonCodes"), list):
+        clean["reasonCodes"] = [_safe_reason(code) for code in clean["reasonCodes"]]
     clean["schemaVersion"] = SCHEMA_VERSION
     clean["observedAt"] = datetime.now(timezone.utc).isoformat()
     return clean
@@ -93,6 +108,10 @@ def _selftest():
         assert "真实会话名" not in recorder.path.read_text(encoding="utf-8")
         assert "secret" not in recorder.path.read_text(encoding="utf-8")
         assert saved["reasonCodes"] == ["low_information"]
+        worded = recorder({"event": "turn", "reasonCodes": ["specific_user_signal", "topic:冰淇淋",
+                                                             "anchor:风车岛", "fact_score:0.512"]})
+        assert worded["reasonCodes"] == ["specific_user_signal", "topic", "anchor", "fact_score:0.512"]
+        assert "冰淇淋" not in recorder.path.read_text(encoding="utf-8"), "原因码不许带出用户原话里的词"
         try:
             recorder({"event": "turn", "content": "不应落盘的原文"})
             raise AssertionError("原文字段必须被拒绝")

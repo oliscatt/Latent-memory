@@ -31,3 +31,13 @@ mcp-config.json
 # 里面「人格候选输入清单.json」记着你语料文件的路径和哈希、「候选结果.json」直接装着
 # 从语料里抽出来的人格原文——都是你的私人内容，跟 memory/ 同等对待
 persona-extraction/
+# 自动浮现事实模式：事实库是从记忆拆出的事实，与记忆同等敏感
+事实库/
+# 部署私有配置与部署时由语料生成的词表：含私人用词
+src/passive_admission.json
+src/passive_hotwords.json
+src/passive_hotwords_override.json
+src/passive_userdict.txt
+src/passive_common_english.txt
+# 部署私有插件
+src/latent_plugin_*.py

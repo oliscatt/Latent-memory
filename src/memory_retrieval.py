@@ -51,6 +51,7 @@ import hashlib
 import json
 import math
 import re
+import sys
 import tempfile
 import time
 from collections import Counter, defaultdict
@@ -188,6 +189,11 @@ def has_history_intent(query):
     return isinstance(query, str) and any(term in query for term in HISTORY_INTENT_TERMS)
 
 
+# 查询向量对全库逐块点积：纯 Python 生成器在约 1600 块×1024 维上约 260ms，是被动召回
+# 延迟的最大一段；3.12+ 的 math.sumprod 在 C 里算，旧解释器退回原写法。
+_dot = getattr(math, "sumprod", None) or (lambda a, b: sum(x * y for x, y in zip(a, b)))
+
+
 def tokenize(text: str):
     """BM25 用的中文零依赖分词：清标点/空白后取字符 bigram 当词。"""
     s = re.sub(r"[^\w一-鿿]", "", text.lower())
@@ -199,13 +205,21 @@ class BM25:
 
     def __init__(self, docs_tokens, k1=1.5, b=0.75):
         self.k1, self.b = k1, b
-        self.docs = docs_tokens
-        self.N = len(docs_tokens)
-        self.avgdl = sum(len(d) for d in docs_tokens) / self.N if self.N else 0.0
-        self.tf = [Counter(d) for d in docs_tokens]
+        self.tf = []
+        self.doc_lengths = []
         self.df = Counter()
-        for d in docs_tokens:
-            self.df.update(set(d))
+        total_tokens = 0
+        # docs_tokens 故意按可迭代对象消费：大语料建库时每块的
+        # bigram 数组只存活到该块 Counter 建好，不再与词频表双份常驻。
+        for tokens in docs_tokens:
+            counts = Counter(tokens)
+            length = sum(counts.values())
+            self.tf.append(counts)
+            self.doc_lengths.append(length)
+            self.df.update(counts.keys())
+            total_tokens += length
+        self.N = len(self.tf)
+        self.avgdl = total_tokens / self.N if self.N else 0.0
 
     def idf(self, term):
         n = self.df.get(term, 0)
@@ -214,7 +228,7 @@ class BM25:
     def scores(self, query_tokens):
         out = []
         for i in range(self.N):
-            dl = len(self.docs[i]) or 1
+            dl = self.doc_lengths[i] or 1
             s = 0.0
             for t in set(query_tokens):
                 f = self.tf[i].get(t, 0)
@@ -255,6 +269,34 @@ def rrf_fuse(rank_lists, k=60, ks=None):
         for rank, idx in enumerate(ranks):
             fused[idx] += 1.0 / (kk + rank + 1)
     return sorted(fused.items(), key=lambda x: (-x[1], x[0]))
+
+
+# ==== 部署插件 ================================================================
+# 同目录下的 latent_plugin_*.py 在导入本模块时自动加载（本仓库不带任何插件）。每个插件
+# 提供 register(api)，通过 api 登记两类钩子：
+#   register_add_hook(fn(index, i, text, meta))   块入库前调用，可往 meta 里补字段；
+#   register_hidden_hook(fn(index, now) -> 下标)  当下要对所有检索路径隐藏的块。
+# 插件只做判定；排除由 MemoryIndex.hidden_indices() 统一施加在每条检索路径上。
+_ADD_HOOKS = []
+_HIDDEN_HOOKS = []
+
+
+def register_add_hook(fn):
+    _ADD_HOOKS.append(fn)
+
+
+def register_hidden_hook(fn):
+    _HIDDEN_HOOKS.append(fn)
+
+
+def _load_plugins():
+    import importlib.util
+    module = sys.modules[__name__]
+    for path in sorted(Path(__file__).resolve().parent.glob("latent_plugin_*.py")):
+        spec = importlib.util.spec_from_file_location(f"_latent_plugin_{path.stem}", path)
+        plugin = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(plugin)
+        plugin.register(module)
 
 
 class MemoryIndex:
@@ -313,18 +355,44 @@ class MemoryIndex:
         # chunk 下标 → 实体集合。默认空——图谱走零依赖词面代理；用户花 LLM 调用
         # 抽取过实体（load_entities 接入 .entities.json）后，实体边并进图谱
         self._entities = {}
+        # 判"今天是几号"用的时区；宿主（MemoryServer）会把自己那一份灌进来。
+        # None＝退 TimeContext.default()（东八区），理由同那边的 docstring。
+        self.time_context = None
+        # 测试注入的固定当下（epoch）。None＝真实当下。**生产路径永远是 None**——
+        # 可注入的时钟只给自检用，不做配置项。
+        self.fixed_now = None
 
     def add(self, text, meta=None):
         meta = dict(meta or {})
         meta.setdefault("record_id", _chunk_key(text))
         meta.setdefault("record_id_aliases", _record_id_aliases(text))
         meta.setdefault("status", "current")
+        # 部署插件的入库钩子放在**所有入库路径的唯一收口**上：load_corpus、memory_import、
+        # append_record、测试直接 add——一条都绕不过去。
+        for hook in _ADD_HOOKS:
+            hook(self, len(self.chunks), text, meta)
         self.chunks.append(text)
         self.meta.append(meta)
         self.weights.append(1.0)
 
+    def hidden_indices(self, now=None):
+        """当下对所有检索路径隐藏的块下标集合（撤回与变迁另有账本，不在这里）。
+
+        没装部署插件时恒为空。插件登记的隐藏判定在这里汇总，所有检索、召回、种子、
+        图谱邻居与撤回提醒都按它排除，一条路都不许绕过——插件只管判定，不管过滤。
+        `now`（epoch）跟 `recall_recent` 同款：调用方已有确定时刻就传进来；都没有
+        才取 `fixed_now`（自检注入）或真实当下。"""
+        if not _HIDDEN_HOOKS:
+            return frozenset()
+        if now is None:
+            now = time.time() if self.fixed_now is None else self.fixed_now
+        hidden = set()
+        for hook in _HIDDEN_HOOKS:
+            hidden.update(hook(self, now))
+        return frozenset(hidden)
+
     def build(self):
-        self._bm25 = BM25([tokenize(c) for c in self.chunks])
+        self._bm25 = BM25(tokenize(c) for c in self.chunks)
         if self.embed:
             # 块向量：缓存里有的不重算（见 embedding_provider.VectorCache）。
             # **云端档的成本模型全靠这一条**——不缓存的话每次起服务都是全库一遍。
@@ -335,10 +403,7 @@ class MemoryIndex:
             self._ccounts = [bigram_counts(c) for c in self.chunks]
         self._neighbors = self._build_graph()
         # 文档频次缓存，供 query_miss_rate 用（零依赖，建库时顺手算一次）
-        self._df_cache = {}
-        for d in self._bm25.docs:
-            for t in set(d):
-                self._df_cache[t] = self._df_cache.get(t, 0) + 1
+        self._df_cache = dict(self._bm25.df)
         return self
 
     def _build_graph(self):
@@ -356,10 +421,10 @@ class MemoryIndex:
         每块只存强度前 graph_topK 的邻居。诚实标注局限：这是词面代理，"约定"和
         "兑现"若不共享任何字面（连专名都换了说法），这版连不上——那是实体识别/
         语义图谱的活，跟检索层 bigram 当分词一样，等真实评估再升级，现在不假装。"""
-        docs = self._bm25.docs
+        docs = self._bm25.tf
         inv = defaultdict(list)
         for i, d in enumerate(docs):
-            for t in set(d):
+            for t in d:
                 inv[t].append(i)
         max_df = self._graph_df_cap()
         link = defaultdict(float)
@@ -393,12 +458,29 @@ class MemoryIndex:
         return {i: [j for _, j in sorted(v, key=lambda x: (-x[0], x[1]))][:self.graph_topK]
                 for i, v in by_node.items()}
 
+    def prime_query_vectors(self, queries):
+        """一次请求取回同一轮要用的几条查询向量，随后 _vector_scores 直接复用。
+
+        被动召回一轮里检索查询和原句各要一个向量；分两次请求就是两个网络往返。
+        调用方用完必须 clear_primed_query_vectors()，缓存不跨轮。"""
+        if not self.embed or getattr(self, "provider", None) is None:
+            return
+        texts = [q for q in dict.fromkeys(queries) if q]
+        if texts:
+            self._primed_query_vectors = dict(
+                zip(texts, self.provider.embed(texts, is_query=True)))
+
+    def clear_primed_query_vectors(self):
+        self._primed_query_vectors = {}
+
     def _vector_scores(self, query):
         if self.embed:
             # **每次查询只算一个查询向量**：块那边已经缓存住了（build），查询这边
             # 按次算——云端档一次检索就是一个往返，不是全库一遍
-            qv = self.provider.embed([query], is_query=True)[0]
-            return [sum(a * b for a, b in zip(cv, qv)) for cv in self._cvecs]
+            qv = (getattr(self, "_primed_query_vectors", None) or {}).get(query)
+            if qv is None:
+                qv = self.provider.embed([query], is_query=True)[0]
+            return [_dot(cv, qv) for cv in self._cvecs]
         q = bigram_counts(query)
         return [cosine(q, cc) for cc in self._ccounts]
 
@@ -455,9 +537,14 @@ class MemoryIndex:
         half_life = RECALL_HALF_LIFE_DAYS if half_life is None else half_life
         now = time.time() if now is None else now
         excluded = set(exclude_record_ids) if per_day_cap is not None else set()
+        # 插件隐藏的块一条都不端出来（换窗召回没有 query、按时间排，隐藏的恰好是最新
+        # 那条时，不挡在这里就等于直接端出来）
+        hidden = self.hidden_indices(now)
         scored = []
         for i, meta in enumerate(self.meta):
             if i in self.retracted or i in self.superseded:  # 默认召回只看 current
+                continue
+            if i in hidden:
                 continue
             if excluded and _chunk_key(self.chunks[i]) in excluded:
                 continue
@@ -634,7 +721,7 @@ class MemoryIndex:
                        if 0 < self._bm25.df.get(t, 0) <= max_df}
         if not distinctive:
             return []
-        skip = set(exclude) | {chunk_idx}
+        skip = set(exclude) | {chunk_idx} | self.hidden_indices()
         out = [i for i, tf in enumerate(self._bm25.tf)
                if i not in skip and i not in self.retracted and i not in self.superseded
                and any(t in tf for t in distinctive)]
@@ -689,7 +776,7 @@ class MemoryIndex:
                                      include_superseded=include_superseded)
 
     def retrieve_candidates(self, query, topN=5, reranker=None, coarse_topM=20,
-                            routes=None):
+                            routes=None, with_relevance=False):
         """返回与 ``retrieve`` 同序同形的纯候选，不修改任何活跃度状态。
 
         这是自动浮现和影子评估的唯一查询入口。结果里的 ``weight`` 只是读取本轮
@@ -698,11 +785,12 @@ class MemoryIndex:
         return self._retrieve_ranked(query, topN=topN, reranker=reranker,
                                      coarse_topM=coarse_topM, routes=routes,
                                      update_weights=False,
-                                     include_superseded=False)
+                                     include_superseded=False,
+                                     with_relevance=with_relevance)
 
     def _retrieve_ranked(self, query, topN=5, reranker=None, coarse_topM=20,
                          routes=None, update_weights=False,
-                         include_superseded=False):
+                         include_superseded=False, with_relevance=False):
         """共用检索排序核心；``update_weights`` 只允许主动入口传 True。"""
         routes = {"bm25", "vector", "graph"} if routes is None else set(routes)
         bm_scores = self._bm25.scores(tokenize(query))
@@ -744,8 +832,12 @@ class MemoryIndex:
         if lexical_vector:
             _vec_admit_raw = vec_admit
             vec_admit = lambda i: _vec_admit_raw(i) and i in lex_ok  # noqa: E731
+        # 插件隐藏的块在这里跟撤回同档出局：不进候选、不进种子、不被图谱带回、不加权。
+        # ⚠ `include_superseded`（历史意图）**不开这道门**——那个例外开的是"旧事实
+        # 也想看"，跟"这段内容当下不许检索"是两件事，混在一起就等于给隐藏留了后门。
+        hidden = self.hidden_indices()
         scored_ok = [i for i in range(len(self.chunks))
-                     if i not in self.retracted
+                     if i not in self.retracted and i not in hidden
                      and (include_superseded or i not in self.superseded)
                      and (bm_admit(i) or vec_admit(i))]
         ok = set(scored_ok)
@@ -774,6 +866,7 @@ class MemoryIndex:
         for seed in seeds:
             for nb in self.graph_neighbors(seed):
                 if (nb not in graph_route and nb not in self.retracted
+                        and nb not in hidden
                         and (include_superseded or nb not in self.superseded)):
                     graph_route.append(nb)
         # 带出了新关联块才追加，没有就退回两路融合
@@ -808,6 +901,11 @@ class MemoryIndex:
             "score": score,
             "weight": self.weights[idx],  # 本次排序所用的权重（+0.05 前）
         } for idx, score in fused]
+        if with_relevance:
+            # 内部只读诊断信号：复用本次向量结果，不再发第二次 embedding 请求。
+            # 主动检索和默认候选字段保持原样，不把诊断字段暴露给模型。
+            for row in results:
+                row["_vector_score"] = vec_scores[row["id"]]
         if update_weights:
             for idx, _ in fused:
                 self.weights[idx] += self.weight_boost  # 用进废退：命中即加权
@@ -1096,6 +1194,7 @@ class MemoryIndex:
     def expand_supersession_chains(self, results):
         """命中链中任一节点后，用 timeline 正文替换摘要并补齐整链。"""
         expanded, emitted = [], set()
+        hidden = self.hidden_indices()      # 补链也不许把隐藏的那一节补回来
         for row in results:
             rid = row["meta"].get("record_id")
             if rid in self.supersession_log:
@@ -1106,7 +1205,7 @@ class MemoryIndex:
                 emitted.add(marker)
                 by_id = {meta.get("record_id"): i for i, meta in enumerate(self.meta)
                          if meta.get("layer", "timeline") == "timeline"
-                         and i not in self.retracted}
+                         and i not in self.retracted and i not in hidden}
                 for chain_id in chain:
                     idx = by_id.get(chain_id)
                     if idx is None:
@@ -1131,11 +1230,12 @@ class MemoryIndex:
             return set()
         bm_scores = self._bm25.scores(tokenize(query))
         lex_ok = self.lexical_admit(tokenize(query))
+        hidden = self.hidden_indices()
         matched = set()
         for i, meta in enumerate(self.meta):
             rid = meta.get("record_id")
             if (rid in self.supersession_log and i not in self.retracted
-                    and bm_scores[i] > 0 and i in lex_ok):
+                    and i not in hidden and bm_scores[i] > 0 and i in lex_ok):
                 matched.add(rid)
         by_root = defaultdict(set)
         for rid in matched:
@@ -1311,6 +1411,22 @@ def _first_valid_short_date(line, fallback_year):
     return None
 
 
+# 开头几行里的完整日期只在日期靠近行首时才算块日期：标题行本身，或日期前只有很短
+# 的前缀（“第十个窗口 · 2026.06.21”“**window_40_某某（2026.08.22）**”“- **2026.09.02｜
+# 事件”“*记录：2026.07.16 · 某某写*”）。段落中间顺带提到的日期（“……说起 2026.09.11
+# 那次旅行”“付到 2027-09-13”）不是这块发生的日子，续写小节开头就提到旧日期时会被误标。
+# 真实语料里合法前缀最长 15 个可见字符，段落误判大多在 18 个以上。
+# ponytail: 前缀长度是经验阈值，短句开头就提别的日期仍会误判；要根治得让写入方把
+# 日期写进标题行，再改成只认标题行。
+_TITLE_DATE_PREFIX_MAX = 16
+
+
+def _dated_title_line(line, date_start):
+    if line.lstrip().startswith("#"):
+        return True
+    return len(re.sub(r"[\s*_>#`\-]", "", line[:date_start])) <= _TITLE_DATE_PREFIX_MAX
+
+
 def _head_lines(text, n=3):
     """开头 n 个非空行——标题/日期都写在最前面，只扫这里，压正文里数字的误判概率。"""
     return [ln for ln in text.splitlines() if ln.strip()][:n]
@@ -1444,7 +1560,7 @@ def parse_chunk_timestamp(filename, chunk_text, fallback_year, date_order=None):
     head = _head_lines(chunk_text)
     for line in head:
         m = _DATE_FULL_TEXT_RE.search(line)
-        if m:
+        if m and _dated_title_line(line, m.start()):
             ts = _ymd_ts(int(m.group(1)), int(m.group(2)), int(m.group(3)))
             if ts is not None:
                 return ts, "chunk_head"
@@ -1798,6 +1914,22 @@ def _selftest(embed=False):
     bm = idx._bm25.scores(tokenize("薄荷 盆底积水"))
     assert bm[2] == max(bm), "薄荷块 BM25 分最高"
 
+    # 2a.【大语料常驻内存】BM25 只需保留每块词频与长度，不得把每个
+    #     字符位置生成的 bigram 字符串数组一起常驻。反向变异：恢复
+    #     ``self.docs = docs_tokens`` 后，这份 12 万字夹具的追踪内存会突破
+    #     4 MiB；该门槛只数 ``tracemalloc.start()`` 之后的常驻 Python 分配，
+    #     夹具正文在追踪前已建好，不把输入本身算进去。
+    import tracemalloc
+    long_text = "花园咖啡旅行电影音乐天气工作" * 7500
+    tracemalloc.start()
+    memory_idx = MemoryIndex(embed=False)
+    memory_idx.add(long_text)
+    memory_idx.build()
+    retained_bytes, _ = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert retained_bytes < 4 * 1024 * 1024, \
+        f"BM25 常驻分配过高：{retained_bytes / 1024 / 1024:.1f} MiB"
+
     # 3. RRF 融合是纯函数：两路名次都把 0 排前 → 0 胜
     fused = rrf_fuse([[0, 1], [0, 1]])
     assert fused[0][0] == 0
@@ -1936,6 +2068,22 @@ def _selftest(embed=False):
         "后期标题格式：# window_30_标题（2026.07.15）"
     #    正文里的紧凑 8 位数字不当日期认（正文匹配分隔符必带），单号/编号误判挡住
     assert parse_chunk_timestamp("window_11.md", "## 快递\n单号 20260721 已签收", 2026) == (None, None)
+    #    索引层条目的日期在行首（- **日期｜事件：**），仍算块日期
+    ts_i, src_i = parse_chunk_timestamp(
+        "window_42.md", "## window_42_某某\n\n- **2026.09.02｜事件：** 讨论了一件事。", 2000)
+    assert src_i == "chunk_head" and datetime.fromtimestamp(ts_i).strftime("%Y%m%d") == "20260902"
+
+    # 11b.【回归】续写小节开头几行是正文，里面提到别的日期（某次旅行在 9.11）
+    #    不能当这块的日期；应继承文件标题行的日期。夹具内容虚构。
+    letter = ("# window_55_某某（2026.09.22）\n\n## 白天\n白天的事。\n\n"
+              "## 凌晨（同窗续）\n\n收尾之后这一晚没散场。\n\n"
+              "翻出之前那一沓旅行照片，一张一张往下看，说起最后那一张是在 "
+              "2026.09.11 的那趟海边，看了很久没说话。\n")
+    night = [meta for chunk, meta in timeline_chunks(letter, "window_55_某某.md", 0)
+             if "那趟" in chunk]
+    assert night and night[0]["local_date"] == "2026-09-22" \
+        and night[0]["timestamp_source"] == "file_head", \
+        f"正文里提到的日期不能冒充块日期：{night}"
 
     # 12. 文件级日期继承：日期只写在文件标题行（只属于第一个 chunk）时，
     #     同文件其余 chunk 继承 file_head，不落 mtime
@@ -2732,6 +2880,9 @@ def run(corpus_dir, query, topN=5, embed=False, provider_spec=None):
         head = r["meta"].get("heading") or r["meta"].get("source", "")
         preview = r["text"].replace("\n", " ")[:60]
         print(f"{i}. [{head}] score={r['score']:.4f} w={r['weight']:.2f}  {preview}…")
+
+
+_load_plugins()
 
 
 if __name__ == "__main__":

@@ -4,8 +4,17 @@
 `--selftest`，退出码全部为 0。文件数不写死；新增 `.py` 会自动进入下一次检查。
 
 ```bash
+pip install -r requirements-passive.txt   # jieba，自动浮现相关自检要用
 python tests/run_release_checks.py
 ```
+
+检查脚本本身零第三方依赖。没装 jieba 时各文件照样跑完，但自动浮现相关的自检段落会打印
+“跳过”，这部分就没有被覆盖。GitHub Actions（`.github/workflows/release-checks.yml`）在 Python 3.10／3.11／3.12 上先装 jieba 再跑。
+
+**macOS 上 `e2e_smoke.py` 与 `memory_init.py` 两项会红，结果是 26/28，这不是出货问题。** macOS 的临时
+目录 `/var/…` 是 `/private/var/…` 的软链接，这两份自检用临时目录夹具比对产出路径时，一边是别名、
+一边是真实路径，字面对不上；报错文字（“引导句没指向这次出货的人格文件”“config 指向……”）看着像
+出货 bug，实际出货路径是对的。Linux（CI）与 Windows 上这两项通过。
 
 需要保留采集条件与逐文件输出时：
 

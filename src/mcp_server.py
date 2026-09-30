@@ -96,8 +96,9 @@ from unresolved_state import (FILENAME as UNRESOLVED_FILENAME, UnresolvedRequest
 # 两种起动形态共用同一个，不各自造一份换算逻辑
 from time_context import (TimeContext, detect_local_timezone, parse_record_time_marker,
                           tzdb_available)
-from passive_recall import (PassiveRecallRequestError, PassiveRecallService,
-                            TOOL_NAME as PASSIVE_RECALL_TOOL)
+from passive_recall import (ASSEMBLY_POLICY_VERSION, POLICY_VERSION,
+                            PassiveRecallRequestError, PassiveRecallService,
+                            TOOL_NAME as PASSIVE_RECALL_TOOL, WIRE_VERSION, JIEBA_AVAILABLE)
 from passive_metadata import (FILENAME as PASSIVE_METADATA_FILENAME,
                               PassiveMetadataStore, source_signature, validate_passive)
 
@@ -119,6 +120,9 @@ INSTRUCTIONS = (
     "查一下往往就有。查完自然接上话即可，不用报告自己搜过。\n"
     "记忆库不是只读的：对话里出现值得长期记住的事——新约定、重要事件、状态变化、"
     "对方明确说要记住的——**当场用 latent_append 写进去**，不用请示，不用等会话结束。\n"
+    "facts 参数可选：你的工具里有 latent_fact_backfill（部署开了自动浮现）时，写回顺手把这次里"
+    "值得单独记住的小事拆成一句一条放进 facts（对方买了什么、定了什么约定、身体和情绪、一句原话、"
+    "一个具体数字），以后对方说到相关的话它们会浮到你手边；没有这个工具就不用传。\n"
     "每次完整 latent_append 与会话收尾都顺手复核未解决清单：新出现且尚未结束的用 "
     "open；仍没结束但缺口变了用 update；明确完成、取消或不再继续才 close；没有变化传 "
     "none。不要按关键词或内容相似自动关闭。thread 只是上个窗口的历史快照，当前仍未解决"
@@ -250,6 +254,21 @@ TOOLS = [
                          "description": "可选；默认 write。preflight 只校验并返回预计落点，绝不写盘"},
                 "text": {"type": "string",
                          "description": "发生了什么——具体动作和原话，不是概括"},
+                "facts": {
+                    "type": "array",
+                    "description": "可选。你的工具里有 latent_fact_backfill（部署开了自动浮现）就带上；没有就不用传。"
+                                   "带了会写进事实库，供自动浮现的事实模式使用。"
+                                   "把这次写的内容里值得单独记住的小事拆成一句一条："
+                                   "对方买了什么、你们搭了什么、定了什么约定、对方的身体和情绪、一句原话、"
+                                   "一个具体数字。一句只讲一件事，写清主语，不写空泛总结。",
+                    "items": {"type": "object", "properties": {
+                        "fact": {"type": "string", "description": "一句话，8–120 字"},
+                        "tag": {"type": "string", "enum": ["life", "work", "meta"]},
+                        "kind": {"type": "string", "enum": ["event", "state"],
+                                 "description": "event＝那天发生了什么；state＝现在是什么状态、以后可能变"},
+                        "event_date": {"type": "string", "description": "YYYY-MM-DD，拿不准就省略"},
+                    }, "required": ["fact"]},
+                },
                 "current_state": {"type": "string",
                                   "description": "**必填**：这件事现在的状态（约定成立／还在处理／"
                                                  "已解决……）。不写会被拒绝；写了才分得清"
@@ -490,6 +509,47 @@ PASSIVE_RECALL_TOOL_SCHEMA = {
             "capability": {"type": "object"},
         },
         "required": ["userInput", "turn"],
+    },
+}
+
+
+FACT_BACKFILL_TOOL = "latent_fact_backfill"
+FACT_BACKFILL_TOOL_SCHEMA = {
+    "name": FACT_BACKFILL_TOOL,
+    "title": "事实库全量回填",
+    "description": (
+        "只在自动浮现开着时出现。把已有记忆逐块拆成一句一条的事实，生成事实模式要用的全量事实库；"
+        "用户要求“建事实库／回填事实”时才用，一次性的活，可以分多次会话做完。"
+        "流程：status 看进度 → next 领一批块（附提炼规则）→ 按规则拆好用 submit 交回 → "
+        "重复直到拆完 → finish 去重落库，事实模式随即生效。交错的块会整块退回并说明原因，改好再交。"),
+    "annotations": {
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "enum": ["status", "next", "submit", "finish"],
+                       "description": "status 看进度；next 领一批待拆的块；submit 交回拆好的事实；finish 全部拆完后去重落库"},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 20,
+                      "description": "next 一次领几块，默认 8；块很长时会自动少给"},
+            "items": {
+                "type": "array",
+                "description": "submit 用：每项 {block, facts}。block 照 next 返回的原样抄；facts 是这块拆出的事实，没有就交空数组",
+                "items": {"type": "object", "properties": {
+                    "block": {"type": "string"},
+                    "facts": {"type": "array", "items": {"type": "object", "properties": {
+                        "fact": {"type": "string", "description": "一句话，8–120 字"},
+                        "tag": {"type": "string", "enum": ["life", "work", "meta"]},
+                        "kind": {"type": "string", "enum": ["event", "state"]},
+                        "event_date": {"type": "string", "description": "YYYY-MM-DD，拿不准就省略"},
+                    }, "required": ["fact"]}},
+                }, "required": ["block", "facts"]},
+            },
+        },
+        "required": ["action"],
     },
 }
 
@@ -892,11 +952,20 @@ class MemoryServer:
                                     time_context=self.time_context,
                                     unresolved_store=self.unresolved_store,
                                     per_day_cap=recall_per_day_cap)
+        fact_index = fact_cooldown = None
+        if enable_passive_recall:
+            # 事实模式：显式配了 LATENT_PASSIVE_FACTS，或语料旁的「事实库/」里已有全量回填就启用；
+            # 复用主索引的 embedding 提供方。回滚要切回旧版本，只删环境变量关不掉。
+            from passive_facts import fact_index_from_env
+            fact_index, fact_cooldown = fact_index_from_env(
+                getattr(self.index, "provider", None) if getattr(self.index, "embed", False) else None,
+                default_root=self._default_fact_root())
         self.passive = PassiveRecallService(
             self.index, metadata_reader=self.passive_metadata.read,
-            assemble_candidates=True,
+            assemble_candidates=True, fact_index=fact_index, fact_cooldown=fact_cooldown,
         ) if enable_passive_recall else None
-        self.tools = list(TOOLS) + ([PASSIVE_RECALL_TOOL_SCHEMA] if self.passive else [])
+        self.tools = list(TOOLS) + ([FACT_BACKFILL_TOOL_SCHEMA, PASSIVE_RECALL_TOOL_SCHEMA]
+                                    if self.passive else [])
         self.initialized = False
         # 写回与权重持久化（任务卡"记忆写回与权重持久化"）：
         # corpus_dir 是写回的落点，没配就明确拒写；weights_path 没配则权重只活在
@@ -933,6 +1002,8 @@ class MemoryServer:
         # loader：怎么从盘上重建索引（常驻 HTTP 形态的重读用）。stdio 懒加载
         # 每次调用重读语料所以用不上；不传则常驻形态检测到语料变化时明确不重读
         self.loader = loader
+        # 启动时也接一次：索引不是被替换才需要这一份时区，它从第一次检索起就要用
+        self.index.time_context = self.time_context
         # 本进程自己写过哪些语料文件（常驻 HTTP 形态的指纹记账用）。
         # 为什么要精确到路径而不是"handle 之后重算一遍指纹"：那样会把**同一个请求
         # 窗口里用户手动上传的 md 一起吞进基线**，那次上传再也不触发重读——
@@ -942,6 +1013,11 @@ class MemoryServer:
     def _sync_index_consumers(self):
         """索引对象被整份替换后，同步所有长生命周期只读消费者。"""
         self.recall.index = self.index
+        # 检索层判"今天几号"（插件隐藏、换窗召回）要用服务端这一份时区，不能自己退默认值。
+        # ⚠ 这里必须判空：重建索引前会先 `self.index = None` 再调本方法把消费者断开
+        # （为的是不让旧库和新库的内存峰值叠在一起），那一趟进来没有索引可接。
+        if self.index is not None:
+            self.index.time_context = self.time_context
         if self.passive is not None:
             self.passive.set_index(self.index)
 
@@ -954,32 +1030,33 @@ class MemoryServer:
         （每次 correct 后 save_retractions）、权重落盘（每次 search 后 save_weights），
         重建后按各自的 sidecar 路径重新接上即可，无损。
         SessionRecall 只换 index 引用，会话内状态（距上次召回的字数）保留。"""
-        self.index = self.loader()
-        if self.retractions_path is not None:
-            self.index.load_retractions(self.retractions_path)
-        if self.supersessions_path is not None:
-            self.index.load_supersessions(self.supersessions_path)
-        if self.weights_path is not None:
-            self.index.load_weights(self.weights_path)
-        if self.entities_path is not None and self.index.load_entities(self.entities_path):
-            self.index.build()
+        # HTTP 调用方持有串行锁：先断开全部消费者，再分配新库。
+        # 不保留旧库作回滚，否则仍然是旧库＋新库的重建峰值。
+        self.index = None
+        self._sync_index_consumers()
+        try:
+            self.index = (self.loader() if self.loader is not None
+                          else load_corpus(self.source_dirs))
+            if self.retractions_path is not None:
+                self.index.load_retractions(self.retractions_path)
+            if self.supersessions_path is not None:
+                self.index.load_supersessions(self.supersessions_path)
+            if self.weights_path is not None:
+                self.index.load_weights(self.weights_path)
+            if self.entities_path is not None and self.index.load_entities(self.entities_path):
+                self.index.build()
+        except Exception as exc:
+            # sidecar 失败也不能发布半成品；只报异常类型，避免带出语料或凭证。
+            self.index = None
+            raise ToolError(
+                f"索引重建失败（{type(exc).__name__}），检索暂不可用。"
+                "已完成的文件写入或清理不会回滚，请先核对磁盘结果，不要直接重复写入；"
+                "修复文件或资源问题后，下次请求会重试加载。") from None
         self._sync_index_consumers()
 
     def _refresh_after_write(self):
         """正文写入后统一重建并接回全部 sidecar；常驻与测试路径同一语义。"""
-        if self.loader is not None:
-            self._reload_from_disk()
-            return
-        self.index = load_corpus(self.source_dirs).build()
-        if self.retractions_path is not None:
-            self.index.load_retractions(self.retractions_path)
-        if self.supersessions_path is not None:
-            self.index.load_supersessions(self.supersessions_path)
-        if self.weights_path is not None:
-            self.index.load_weights(self.weights_path)
-        if self.entities_path is not None and self.index.load_entities(self.entities_path):
-            self.index.build()
-        self._sync_index_consumers()
+        self._reload_from_disk()
 
     # ---------- 八个工具：协议接线；未解决的解析与状态变化仍在独立模块 ----------
 
@@ -1016,9 +1093,11 @@ class MemoryServer:
             linked_roots = {self.index.chain_record_ids(r["meta"].get("record_id"))[0]
                             for r in linked}
             for root in sorted(roots - linked_roots):
+                hidden = self.index.hidden_indices()
                 idx = next((i for i, meta in enumerate(self.index.meta)
                             if meta.get("layer", "timeline") == "timeline"
-                            and meta.get("record_id") == root and i not in self.index.retracted), None)
+                            and meta.get("record_id") == root
+                            and i not in self.index.retracted and i not in hidden), None)
                 if idx is not None:
                     linked.append({"id": idx, "text": self.index.chunks[idx],
                                    "meta": self.index.meta[idx], "score": 0.0,
@@ -1051,7 +1130,11 @@ class MemoryServer:
                               miss_rate)
         if self.passive is None:
             return text
-        return {"text": text, "structuredContent": self.passive.search_metadata(results)}
+        # 有些宿主只向模型投递 structuredContent；两种消费路径都必须包含正文。
+        # 保留 passiveRecall 原始来源字段，让宿主照常识别主动检索已覆盖的记录。
+        structured = self.passive.search_metadata(results)
+        structured["text"] = text
+        return {"text": text, "structuredContent": structured}
 
     def _tool_passive_recall(self, args, now=None):
         """宿主隐藏入口；程序准入后返回经来源核验的 W4 现场资料。"""
@@ -1096,7 +1179,9 @@ class MemoryServer:
                     "服务端没有返回空结果，而是执行失败。请检查 --corpus、--threads "
                     "指向的路径、文件可读性与服务端日志。") from None
         if block is None:
-            raise ToolError("记忆库是空的，没有可召回的内容")
+            # 新库的正常状态，不是故障：不回 isError，免得新用户第一场会话先看见一个报错。
+            return ("记忆库还是空的，这是新库的正常状态，没有可召回的内容。之后对话里出现值得长期"
+                    "记住的事，用 latent_append 写进去，下次开场就能召回。")
         return block
 
     def _unresolved_after_core(self, args, source):
@@ -1335,6 +1420,44 @@ class MemoryServer:
                 f"unresolvedStatus={unresolved_status}{hint}；本次零写入。")
 
     def _tool_memory_append(self, args, now=None):
+        """写回正文后，把随附的 facts 追加进事实库增量（落档时顺手提炼）。
+
+        facts 先整批校验，格式不对连正文都不写，免得正文进了、事实半截；事实库没配置成目录时
+        正文照写，回执里明说事实没进库。"""
+        facts = args.get("facts")
+        core_args = {k: v for k, v in args.items() if k != "facts"}
+        root = (getattr(getattr(self.passive, "fact_index", None), "root", None)
+                if self.passive else None) or self._default_fact_root()
+        if facts is not None:
+            try:
+                from passive_facts import append_facts
+                import tempfile
+                with tempfile.TemporaryDirectory() as probe:   # 只校验，不落盘
+                    append_facts(probe, "probe", "2000-01-01", "0" * 16, facts)
+            except ValueError as e:
+                raise ToolError(_append_input_error(f"facts 格式不对：{e}", "full")) from None
+        result = self._tool_memory_append_core(core_args, now=now)
+        if facts is None or core_args.get("mode", "write") != "write" or core_args.get("recordId"):
+            return result
+        found = re.search(r"recordId=([0-9a-f]{16})", result)
+        if root is None or found is None:
+            return result + " factsStatus=not_saved（没有语料目录，事实无处可落）。"
+        from passive_facts import append_facts
+        local_date = self.time_context.local_date(now if now is not None else time.time())
+        side = os.environ.get("LATENT_FACTS_SIDE") or "local"
+        try:
+            n = append_facts(root, side, local_date, found.group(1), facts)
+        except (ValueError, OSError) as e:
+            return result + f" factsStatus=failed：{e}（正文已保存，事实可用同一批内容重试）。"
+        return result + f" factsStatus=saved（{n} 条进事实库）。"
+
+    def _default_fact_root(self):
+        """事实库默认放在语料目录旁边的「事实库」：配了语料就有地方落事实，新用户不用另配。"""
+        if getattr(self, "corpus_dir", None) is None:
+            return None
+        return Path(self.corpus_dir).resolve().parent / "事实库"
+
+    def _tool_memory_append_core(self, args, now=None):
         mode = args.get("mode", "write")
         if mode not in {"write", "preflight"}:
             raise ToolError(_append_input_error(
@@ -1808,17 +1931,7 @@ class MemoryServer:
             changed = commit_cleanup_changes(plan["changes"])
         except OSError as exc:
             raise ToolError(f"清理失败，活动文件已尝试回滚；隔离备份保留在 {backup_dir}。{exc}") from None
-        if self.loader is not None:
-            self._reload_from_disk()
-        else:
-            self.index = load_corpus(self.source_dirs).build()
-            if self.retractions_path is not None:
-                self.index.load_retractions(self.retractions_path)
-            if self.weights_path is not None:
-                self.index.load_weights(self.weights_path)
-            if self.entities_path is not None and self.index.load_entities(self.entities_path):
-                self.index.build()
-            self._sync_index_consumers()
+        self._refresh_after_write()
         self.written_paths.update(str(path) for path in changed)
         return (f"已精准清理 recordId={plan['record_id']}：正文记录 1 条、关联索引 "
                 f"{len(plan['linked_index'])} 个；隔离备份与审计 manifest 位于 {backup_dir}。")
@@ -1856,6 +1969,64 @@ class MemoryServer:
         detail = f"：{'、'.join(changed)}" if changed else ""
         return f"unresolvedStatus={status}{detail}。"
 
+    def _tool_fact_backfill(self, args, now=None):
+        """全量回填：块从主索引取，规则随 next 下发，校验与落库在 passive_facts.FactBackfill。"""
+        from passive_facts import BACKFILL_RULES, FactBackfill, fact_index_from_env
+        root = (getattr(getattr(self.passive, "fact_index", None), "root", None)
+                or self._default_fact_root())
+        if root is None:
+            raise ToolError("没有语料目录，事实库无处可落；启动时要配 --corpus。")
+        backfill = FactBackfill(root)
+        action = args.get("action")
+        # 事实模式靠向量找相似事实：没配 --embed 时建出全量，自动浮现每轮都是 fact_no_embedding，
+        # 块路径也不会接替——等于把自动浮现关哑了。所以没向量就不让开工、也不让落库。
+        no_embed = ("服务端没配向量检索（--embed）。事实模式靠向量找相似事实，这时建好事实库，"
+                    "自动浮现反而每一轮都会留空，原来的块路径也不再接替。请先让部署方给服务端加上 "
+                    "--embed 并配好向量服务、重启后再建。")
+        has_embed = bool(getattr(self.index, "embed", False) and getattr(self.index, "provider", None))
+        if action == "status":
+            return backfill.status_line(self.index, now) + ("" if has_embed else "⚠ " + no_embed)
+        if action in {"next", "finish"} and not has_embed:
+            raise ToolError(no_embed)
+        if action == "next":
+            limit = args.get("limit", 8)
+            if not isinstance(limit, int) or not 1 <= limit <= 20:
+                raise ToolError("limit 要是 1～20 的整数，省略时默认 8")
+            batch = backfill.next_batch(self.index, now, limit=limit)
+            if not batch:
+                return backfill.status_line(self.index, now) + "没有待拆的块了，用 finish 去重落库。"
+            return (backfill.status_line(self.index, now) + "\n\n" + BACKFILL_RULES
+                    + "\n\n按上面的规则拆下面这些块，用 submit 交回（items 每项 {block, facts}）：\n"
+                    + json.dumps(batch, ensure_ascii=False, indent=1))
+        if action == "submit":
+            try:
+                blocks, facts, errors = backfill.submit(self.index, args.get("items"), now)
+            except ValueError as e:
+                raise ToolError(f"{e}。写对：{{\"action\":\"submit\",\"items\":[{{\"block\":\"<next 给的块号>\","
+                                "\"facts\":[{\"fact\":\"她周六在楼下面馆吃了一碗牛肉面\",\"tag\":\"life\","
+                                "\"kind\":\"event\"}]}]}") from None
+            text = f"收下 {blocks} 块、{facts} 条事实。"
+            if errors:
+                text += "以下块退回，改好再交：" + "；".join(f"{b}：{why}" for b, why in errors) + "。"
+            return text + backfill.status_line(self.index, now)
+        if action == "finish":
+            today = self.time_context.local_date(now if now is not None else time.time())
+            try:
+                kept, merged, name = backfill.finish(self.index, today, now)
+            except ValueError as e:
+                raise ToolError(str(e)) from None
+            if name is None:
+                return (f"这一轮拆过的块都没有新事实（交空的，或与库里已有的事实重复 {merged} 条），"
+                        "没有生成新的全量；这些块已记下，下次回填不会再发。")
+            if self.passive is not None and self.passive.fact_index is None:
+                self.passive.fact_index, self.passive.fact_cooldown = fact_index_from_env(
+                    getattr(self.index, "provider", None) if getattr(self.index, "embed", False) else None,
+                    default_root=self._default_fact_root())
+            return (f"全量事实库已生成：{name}，保留 {kept} 条，同日近似重复合并 {merged} 条。"
+                    "事实模式已生效：事实向量正在后台计算，算完之前自动浮现暂时留空"
+                    "（原因码 fact_index_warming），算完自动开始浮现。")
+        raise ToolError("action 只能是 status／next／submit／finish")
+
     def _handlers(self):
         return {
             "latent_search": self._tool_memory_search,
@@ -1866,13 +2037,23 @@ class MemoryServer:
             "latent_cleanup": self._tool_memory_cleanup,
             "latent_unresolved": self._tool_unresolved,
             "latent_thread_close": self._tool_thread_close,
-            **({PASSIVE_RECALL_TOOL: self._tool_passive_recall} if self.passive else {}),
+            **({FACT_BACKFILL_TOOL: self._tool_fact_backfill,
+                PASSIVE_RECALL_TOOL: self._tool_passive_recall} if self.passive else {}),
         }
 
     # ---------- 协议层 ----------
 
-    def handle(self, msg, now=None):
-        """一条 JSON-RPC 消息 → 一条响应（通知类返回 None，规格要求不回响应）。"""
+    def handle(self, msg, now=None, hidden_ok=False):
+        """一条 JSON-RPC 消息 → 一条响应（通知类返回 None，规格要求不回响应）。
+
+        `hidden_ok`：这条请求的凭证准不准看见隐藏入口（自动浮现宿主入口）。
+        **默认 False＝fail-closed**：谁要开隐藏入口谁显式传
+        True，漏传一律关。旧默认是 True，等于「新加一条传输、忘了接这个参数」
+        就全世界可见、而且不报错没人发现；改成 False 之后漏配的后果变成宿主
+        hook 当场 -32601、立刻被发现。HTTP 传输只认 --hook-token 那条凭证（见
+        `_gate`）。⚠ 这条跟「部署必须配 --hook-token」是一套，不能只改一半。
+        ⚠ 拒绝必须发生在参数校验之前，回的是与「未知工具」逐字相同的错误——
+        回「无权限」等于告诉调用方这里有个东西，存在性本身就是要藏的那一半。"""
         method, mid = msg.get("method"), msg.get("id")
         params = msg.get("params") or {}
 
@@ -1887,16 +2068,21 @@ class MemoryServer:
         if method == "notifications/initialized":
             return None                              # 通知不回响应（规格：JSON-RPC 通知无 id）
         if method == "tools/list":
-            return self._ok(mid, {"tools": self.tools})
+            tools = self.tools if hidden_ok else [
+                tool for tool in self.tools if tool["name"] != PASSIVE_RECALL_TOOL]
+            return self._ok(mid, {"tools": tools})
         if method == "tools/call":
-            return self._call_tool(mid, params, now=now)
+            return self._call_tool(mid, params, now=now, hidden_ok=hidden_ok)
         if mid is None:
             return None                              # 其它通知一律忽略，不回错
         return self._err(mid, E_METHOD_NOT_FOUND, f"未知 method：{method}")
 
-    def _call_tool(self, mid, params, now=None):
+    def _call_tool(self, mid, params, now=None, hidden_ok=False):
         name = params.get("name")
-        handler = self._handlers().get(name)
+        handlers = self._handlers()
+        if not hidden_ok:
+            handlers.pop(PASSIVE_RECALL_TOOL, None)
+        handler = handlers.get(name)
         if handler is None:
             # 规格"Error Handling"：未知工具属协议错误，不是 isError 结果
             return self._err(mid, E_METHOD_NOT_FOUND, f"未知工具：{name}")
@@ -1906,12 +2092,14 @@ class MemoryServer:
         if not isinstance(args, dict):
             return self._err(mid, E_INVALID_PARAMS, "arguments 必须是对象")
         try:
+            if self.index is None:
+                self._reload_from_disk()
             payload = handler(args, now=now)
         except ToolError as e:
             # 工具执行错误：按规格回正常结果 + isError，让模型看得到失败原因
             result = {"content": [{"type": "text", "text": str(e)}], "isError": True}
             # isError 只说明调用整体失败，不代表撤回／清理等前置状态没有生效。
-            if self.passive is not None and name != PASSIVE_RECALL_TOOL:
+            if self.passive is not None and self.index is not None and name != PASSIVE_RECALL_TOOL:
                 result["structuredContent"] = {"passiveRecall": self.passive.inspect()}
             return self._ok(mid, result)
         except Exception as e:
@@ -1921,7 +2109,7 @@ class MemoryServer:
             message = (f"{name} 执行失败（{type(e).__name__}）。服务端没有返回空结果，"
                        "而是工具执行异常；请查看服务端日志并检查相关文件与配置。")
             result = {"content": [{"type": "text", "text": message}], "isError": True}
-            if self.passive is not None and name != PASSIVE_RECALL_TOOL:
+            if self.passive is not None and self.index is not None and name != PASSIVE_RECALL_TOOL:
                 result["structuredContent"] = {"passiveRecall": self.passive.inspect()}
             return self._ok(mid, result)
         if isinstance(payload, dict) and isinstance(payload.get("text"), str):
@@ -1931,7 +2119,7 @@ class MemoryServer:
                 result["structuredContent"] = payload["structuredContent"]
             return self._ok(mid, result)
         result = {"content": [{"type": "text", "text": payload}], "isError": False}
-        if self.passive is not None and name != PASSIVE_RECALL_TOOL:
+        if self.passive is not None and self.index is not None and name != PASSIVE_RECALL_TOOL:
             result["structuredContent"] = {"passiveRecall": self.passive.inspect()}
         return self._ok(mid, result)
 
@@ -1962,7 +2150,9 @@ class MemoryServer:
                 msg = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            resp = self.handle(msg)
+            # stdio 是一条私有管道：进程即宿主，没有第二个调用方可分辨，也没有
+            # 凭证可核。fail-closed 的默认值挡的是 HTTP 那一侧，这里显式开。
+            resp = self.handle(msg, hidden_ok=True)
             if resp is not None:
                 stdout.write(json.dumps(resp, ensure_ascii=False) + "\n")
                 stdout.flush()
@@ -2232,13 +2422,22 @@ def _corpus_signature(source_dirs):
 
 
 def make_http_server(server, host="127.0.0.1", port=8765, token=None,
-                     sse_stream=True):
+                     sse_stream=True, hook_token=None):
     """MemoryServer → 绑好端口的 ThreadingHTTPServer（不启动；.serve_forever() 是
     调用方的事——selftest 要拿着实例开线程、取真端口、shutdown）。
 
     `sse_stream`：GET 要不要给一条空长流（默认给，理由见上面那段注释）。
-    关掉就退回「GET 恒 405」的旧行为，留给「长流反而碍事」的部署。"""
-    http_bind_guard(host, token)
+    关掉就退回「GET 恒 405」的旧行为，留给「长流反而碍事」的部署。
+
+    `hook_token`：只发给宿主 hook 的第二条凭证。配了它之后两条凭证都能过闸，
+    但**只有它**看得见、调得动自动浮现宿主入口；`token` 与任何别的调用方拿到的
+    是少一项的工具表，盲调也只得到「未知工具」。
+    ⚠ **fail-closed**：不配 `hook_token` 不再是「所有凭证都
+    看得见」的回滚态，而是隐藏入口对所有凭证关闭——回环裸跑、宿主 hook 自己都
+    一样。漏配的后果从「全世界都能看见、永远没人发现」变成「宿主 hook 当场
+    -32601、立刻发现」。因此它跟「部署必须配 --hook-token」是一套：要恢复得把
+    凭证补上，不是把凭证拿掉。"""
+    http_bind_guard(host, token or hook_token)
     lock = threading.Lock()                  # index 的增删改建都不是线程安全的：串行化
     deny_log = _make_deny_logger()           # 被拒请求留痕（带刷屏上限，见那个函数）
     state = {"sig": _corpus_signature(server.source_dirs)
@@ -2385,12 +2584,20 @@ def make_http_server(server, host="127.0.0.1", port=8765, token=None,
             if urllib.parse.urlsplit(self.path).path.rstrip("/") not in ("", "/mcp"):
                 self._deny(404, f"没有这个端点：{self.path}——本 server 只在 /mcp 上收")
                 return False
-            if token:
+            # 凭证两条：token＝普通调用方，hook_token＝宿主 hook。
+            # fail-closed：隐藏入口只对**核对通过的 hook_token** 开；没配
+            # hook_token 时对所有凭证关闭——回环裸跑与宿主 hook 自己都一样。
+            self.hidden_ok = False
+            if token or hook_token:
                 got = self.headers.get("Authorization") or ""
-                if not hmac.compare_digest(got, f"Bearer {token}"):
+                is_hook = bool(hook_token) and hmac.compare_digest(
+                    got, f"Bearer {hook_token}")
+                is_plain = bool(token) and hmac.compare_digest(got, f"Bearer {token}")
+                if not (is_hook or is_plain):
                     self._deny(401, "缺少或错误的 Bearer token",
                                extra=[("WWW-Authenticate", "Bearer")])
                     return False
+                self.hidden_ok = is_hook
             # Origin 校验（规格的 DNS rebinding 防线）：App 客户端不发 Origin，
             # 发了且不是本机的只会是浏览器页面在拿本地端口当跳板
             origin = self.headers.get("Origin")
@@ -2523,10 +2730,15 @@ def make_http_server(server, host="127.0.0.1", port=8765, token=None,
                 # 不可漏掉一次）。
                 if state["sig"] is not None:
                     sig = _corpus_signature(server.source_dirs)
-                    if sig != state["sig"]:
-                        server._reload_from_disk()
+                    if sig != state["sig"] or server.index is None:
+                        try:
+                            server._reload_from_disk()
+                        except ToolError as exc:
+                            body = json.dumps(server._err(msg.get("id"), -32603, str(exc)),
+                                              ensure_ascii=False).encode("utf-8")
+                            return self._send(503, body)
                         state["sig"] = sig
-                resp = server.handle(msg)
+                resp = server.handle(msg, hidden_ok=getattr(self, "hidden_ok", False))
                 if state["sig"] is not None and server.written_paths:
                     # **只折进 server 自己写的那几个文件**，其余差异留着让下一个
                     # 请求去发现——手动上传就落在"其余"里，不会被自己的刷新吞掉。
@@ -2682,6 +2894,11 @@ def diagnose(corpus_dir, threads_path=None, embed=False, time_context=None,
         # 都一样读得到），拿名字猜就是在教人一个错的判据
         near = [d for d in sorted(root.parent.iterdir())
                 if d.is_dir() and d != root and corpus_files(d)] if root.parent.exists() else []
+        if root.is_dir() and not near:
+            # 零素材初始化出的新库就是空目录：服务能正常起，写回后就有内容。不是故障，不报 ✗。
+            add(WARN, "语料文件", f"{root} 下还没有任何 .md 语料。没有历史材料的新库就是这样，"
+                "服务可以正常起，之后写回的记忆会落在这里；如果你本来有语料，确认一下路径。")
+            return out
         hint = (f"同级的这些目录里有 md，你要指的多半是其中之一："
                 f"{'、'.join(d.name for d in near[:5])}。" if near
                 else "它的同级目录里也没有——确认一下记忆库到底建在哪儿。")
@@ -2998,7 +3215,8 @@ def diagnose(corpus_dir, threads_path=None, embed=False, time_context=None,
 
 def _doctor_probe(index):
     """优先取含内容词的标题；只有日期／窗口标题时返回弱探针标记。"""
-    ranked = sorted(range(len(index.meta)),
+    hidden = index.hidden_indices()     # 体检探针也不拿隐藏的记录当查询词
+    ranked = sorted((j for j in range(len(index.meta)) if j not in hidden),
                     key=lambda j: index.meta[j].get("timestamp") or 0, reverse=True)
     candidates = []
     for i in ranked:
@@ -3092,6 +3310,15 @@ def startup_log_path():
     return Path(base) / "last-startup-error.log"
 
 
+def _missing_embed_lib(exc):
+    """embed 档要的库（fastembed／onnxruntime）没装在服务端所用的 Python 里。
+    跟“没网”分开报：常见原因是装进了 venv、配置里却是 venv 外的解释器，联网解决不了。"""
+    for e in (exc, exc.__cause__, exc.__context__):
+        if isinstance(e, ImportError):
+            return getattr(e, "name", None) or "fastembed"
+    return None
+
+
 def _looks_offline(exc):
     """这个异常是不是「拉不到模型」那一类（没网／下不动／库没装）。
 
@@ -3106,9 +3333,6 @@ def _looks_offline(exc):
         if isinstance(e, OSError) and e.errno in (
                 errno.ENETUNREACH, errno.EHOSTUNREACH, errno.ECONNREFUSED,
                 errno.ETIMEDOUT, errno.ENETDOWN):
-            return True
-        if isinstance(e, ImportError):
-            # fastembed/onnxruntime 没装：跟没网是同一条出口（先联网备好这一档）
             return True
         name = type(e).__name__
         if name in ("ConnectError", "ConnectTimeout", "ReadTimeout", "ProxyError",
@@ -3149,6 +3373,14 @@ def startup_failure_report(stage, exc, *, embed=False, http_bind=None, log_path=
         how = ("出口：换一个端口重起（例如 --http 127.0.0.1:8766），"
                "或者先把占着这个端口的进程停掉再重起"
                "（Linux/macOS：lsof -i :<端口>；Windows：netstat -ano | findstr :<端口>）。")
+    elif stage == "load" and embed and _missing_embed_lib(exc):
+        missing = _missing_embed_lib(exc)
+        why = (f"embed 档要用的库 {missing} 在服务端所用的 Python 里没装"
+               f"（当前解释器：{sys.executable}）。")
+        how = ("出口：二选一——①用这个解释器装上：<解释器> -m pip install fastembed"
+               "（用 venv 的话，MCP 配置里的 command 要指向 venv 里的 python）；"
+               "②不想装就重跑 python memory_init.py --step route --route zero-dep，"
+               "让它重新生成客户端配置。")
     elif stage == "load" and embed and _looks_offline(exc):
         why = "这台机器上没有现成的 embedding 模型，而现在也下不下来（没网或下载被挡）。"
         how = ("出口：二选一——①连上网再起一次，让它把模型下完（只需一次，之后离线可用）；"
@@ -3331,7 +3563,9 @@ class StartupFailureServer:
     _ok = staticmethod(MemoryServer._ok)
     _err = staticmethod(MemoryServer._err)
 
-    def handle(self, msg, now=None):
+    def handle(self, msg, now=None, hidden_ok=False):
+        # hidden_ok 只为跟 MemoryServer.serve_stdio 的调用签名对齐；降级壳一个真
+        # 工具都不提供，隐藏入口在这儿本来就无从谈起，传什么都忽略。
         method, mid = msg.get("method"), msg.get("id")
         if method == "initialize":
             self.initialized = True
@@ -3379,7 +3613,33 @@ def _build_server(now):
     return MemoryServer(index=idx, thread_store=ThreadStore())
 
 
+def _selftest_search_visible_body():
+    """结构化优先的宿主必须同时读到正文与完整来源编号。"""
+    index = MemoryIndex()
+    texts = ["青铜齿轮样品甲，检验标记为占位甲。", "青铜齿轮样品乙，检验标记为占位乙。"]
+    for number, text in enumerate(texts):
+        index.add(text, {"source": f"neutral-{number}.md", "chunk_index": number})
+    index.build()
+    srv = MemoryServer(index=index, enable_passive_recall=True)
+    result = srv.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                         "params": {"name": "latent_search", "arguments": {
+                             "query": "青铜齿轮", "topN": 2}}})["result"]
+    structured = result["structuredContent"]
+    assert structured.get("text") == result["content"][0]["text"], \
+        "云端结构化返回必须包含与 content 相同的正文"
+    assert "占位甲" in structured["text"] and "占位乙" in structured["text"], \
+        "正文必须包含检索到的中性样品原文，不能只有编号"
+    visible_ids = set(re.findall(r"\b[0-9a-f]{16}\b", json.dumps(structured)))
+    evidence = structured["passiveRecall"]["evidence"]
+    assert len(evidence) == 2 and all(
+        re.fullmatch(r"[0-9a-f]{16}", row["recordId"])
+        and row["recordId"] in visible_ids for row in evidence), \
+        "每条原始 recordId 必须被宿主 JSON dump 正则完整提取"
+    print("selftest 搜索正文可见：通过（中性双记录、正文与来源编号）")
+
+
 def _selftest():
+    _selftest_search_visible_body()
     now = 1_800_000_000.0
     srv = _build_server(now)
 
@@ -3393,7 +3653,7 @@ def _selftest():
 
     # 摘要闸的核心靶心：缺失、越界、每段无锚点、多条合法。
     try:
-        validate_index_summaries([], "柳州那晚很难过", "约定仍成立", "2026-08-20")
+        validate_index_summaries([], "灯塔那晚很着急", "约定仍成立", "2026-08-20")
         assert False, "缺摘要不能进入索引层"
     except ValueError as exc:
         assert "不写索引摘要" in str(exc)
@@ -3419,9 +3679,9 @@ def _selftest():
         except ValueError as exc:
             assert expected_segment in str(exc) and "期望" in str(exc), \
                 f"格式错误必须定位到 {expected_segment} 并说明期望形状：{exc}"
-    valid_summary = "**2026.08.20**：柳州那晚约定直说。\n一直猜而难过。**当下：约定仍成立。**"
-    valid_terms = ["柳州那晚", "约定", "直说", "一直猜", "难过", "仍成立"]
-    base_text = "柳州那晚约定直说，一直猜让她难过。"
+    valid_summary = "**2026.08.20**：灯塔那晚约定轮流做饭。\n一直拖而着急。**当下：约定仍成立。**"
+    valid_terms = ["灯塔那晚", "约定", "轮流做饭", "一直拖", "着急", "仍成立"]
+    base_text = "灯塔那晚约定轮流做饭，一直拖让人着急。"
     assert len(validate_index_summaries(
         [{"summary": valid_summary, "evidenceTerms": valid_terms}] * 2,
         base_text, "约定仍成立", "2026-08-20")) == 2
@@ -3434,7 +3694,7 @@ def _selftest():
     except ValueError as exc:
         assert "日期应为 2026.08.20" in str(exc)
     for terms, expected in ((valid_terms + ["安全感"], "越界词"),
-                            (["柳州那晚", "约定", "直说", "仍成立"], "未锚定段")):
+                            (["灯塔那晚", "约定", "轮流做饭", "仍成立"], "未锚定段")):
         try:
             validate_index_summaries([{"summary": valid_summary, "evidenceTerms": terms}],
                                      base_text, "约定仍成立", "2026-08-20")
@@ -3451,7 +3711,7 @@ def _selftest():
             f"越界文案必须点明词缺在 summary：{exc}"
     try:
         validate_index_summaries(
-            [{"summary": valid_summary.replace("一直猜", "旅行社一直猜"),
+            [{"summary": valid_summary.replace("一直拖", "旅行社一直拖"),
               "evidenceTerms": valid_terms + ["旅行社"]}],
             base_text, "约定仍成立", "2026-08-20")
         assert False, "只在 summary 中、没进 text/current_state 的证据词必须拒绝"
@@ -3564,28 +3824,39 @@ def _selftest():
     passive_srv = MemoryServer(index=passive_index, thread_store=ThreadStore(),
                                enable_passive_recall=True)
     passive_tools = passive_srv.handle(
-        {"jsonrpc": "2.0", "id": 201, "method": "tools/list"})["result"]["tools"]
-    assert [tool["name"] for tool in passive_tools[:-1]] == [tool["name"] for tool in tools] \
-        and passive_tools[-1]["name"] == PASSIVE_RECALL_TOOL, \
-        "W1：显式启用只能在旧七工具后增加宿主入口；默认工具表必须逐项不变"
+        {"jsonrpc": "2.0", "id": 201, "method": "tools/list"},
+        hidden_ok=True)["result"]["tools"]
+    assert [tool["name"] for tool in passive_tools[:-2]] == [tool["name"] for tool in tools] \
+        and [tool["name"] for tool in passive_tools[-2:]] == [FACT_BACKFILL_TOOL, PASSIVE_RECALL_TOOL], \
+        "W1：显式启用只能在默认工具后增加回填工具与宿主入口；默认工具表必须逐项不变"
     passive_before = list(passive_index.weights)
     hidden = passive_srv.handle({"jsonrpc": "2.0", "id": 202, "method": "tools/call",
                                  "params": {"name": PASSIVE_RECALL_TOOL, "arguments": {
                                      "userInput": "咖啡机保险丝", "turn": {
                                          "sessionId": "s1", "turnId": "t1",
-                                         "deliveryId": "d1"}}}})["result"]
-    assert hidden["structuredContent"]["status"] == "ready" \
-        and hidden["structuredContent"]["deliveryId"] == "d1" \
-        and passive_index.weights == passive_before, \
-        "W1～W4：宿主入口返回已组装 ready，不能让自动命中污染权重"
-    active = passive_srv.handle({"jsonrpc": "2.0", "id": 203, "method": "tools/call",
-                                 "params": {"name": "latent_search", "arguments": {
-                                     "query": "咖啡机保险丝", "topN": 1}}})["result"]
-    active_state = active["structuredContent"]["passiveRecall"]
-    assert active["isError"] is False and active_state["evidence"] \
-        and "d1" in active_state["coveredDeliveryIds"] \
-        and passive_index.weights != passive_before, \
-        "W1：主动 search 文本照常返回并加权，同时给出可核验来源覆盖元数据"
+                                         "deliveryId": "d1"}}}},
+                                hidden_ok=True)["result"]
+    #    fail-closed 的反面判据：同一条请求不传 hidden_ok 必须回「未知工具」，
+    #    而不是靠调用方自觉。变异：把 handle 的默认改回 True → 这条红。
+    closed = passive_srv.handle({"jsonrpc": "2.0", "id": 204, "method": "tools/call",
+                                 "params": {"name": PASSIVE_RECALL_TOOL}})
+    assert closed["error"]["code"] == E_METHOD_NOT_FOUND         and "未知工具" in closed["error"]["message"],         f"fail-closed：漏传 hidden_ok 必须当未知工具挡掉，实际 {closed}"
+    assert PASSIVE_RECALL_TOOL not in {
+        t["name"] for t in passive_srv.handle(
+            {"jsonrpc": "2.0", "id": 205, "method": "tools/list"})["result"]["tools"]},         "fail-closed：漏传 hidden_ok 的 tools/list 不许列出隐藏入口"
+    if JIEBA_AVAILABLE:     # 没装 jieba 时被动一律留空，下面两条判据无从成立（主动检索另有自检）
+        assert hidden["structuredContent"]["status"] == "ready" \
+            and hidden["structuredContent"]["deliveryId"] == "d1" \
+            and passive_index.weights == passive_before, \
+            "W1～W4：宿主入口返回已组装 ready，不能让自动命中污染权重"
+        active = passive_srv.handle({"jsonrpc": "2.0", "id": 203, "method": "tools/call",
+                                     "params": {"name": "latent_search", "arguments": {
+                                         "query": "咖啡机保险丝", "topN": 1}}})["result"]
+        active_state = active["structuredContent"]["passiveRecall"]
+        assert active["isError"] is False and active_state["evidence"] \
+            and "d1" in active_state["coveredDeliveryIds"] \
+            and passive_index.weights != passive_before, \
+            "W1：主动 search 文本照常返回并加权，同时给出可核验来源覆盖元数据"
     # 2c.【工具 annotations】变异靶心：任一工具漏字段、把检索冒充只读、
     #     把更正冒充纯追加，或把本地记忆库误标成 open world，这张逐字表都会红。
     expected_annotations = {
@@ -3773,8 +4044,10 @@ def _selftest():
         f"未知工具是协议错误、不是 isError 结果：{unknown}"
     assert unknown["error"]["code"] == E_METHOD_NOT_FOUND
     empty_srv = MemoryServer(index=MemoryIndex().build())
+    # 没配 --corpus 的写回必然失败（拒写而不是写进内存假装成功），拿它当“工具内部失败”
     r5 = empty_srv.handle({"jsonrpc": "2.0", "id": 12, "method": "tools/call",
-                           "params": {"name": "latent_session_start"}}, now=now)
+                           "params": {"name": "latent_append", "arguments": {
+                               "text": "测试写回", "current_state": "测试"}}}, now=now)
     assert "result" in r5 and r5["result"]["isError"] is True, \
         f"工具执行失败该回 isError 结果而不是协议错误——模型要看得到失败原因：{r5}"
     # 5b.【Kelivo 偶发空结果·读取异常只重试一次】生产变异：删掉
@@ -3870,13 +4143,15 @@ def _selftest():
         "编码读取失败" in encoding_result["content"][0]["text"], \
         "文件编码错误要与普通读取失败分开说"
 
-    # 5f. 真空库是确定的业务结果，不是偶发读取失败：一次就报空库，不重试。
+    # 5f. 真空库是确定的业务结果，不是偶发读取失败：一次就说库是空的，不重试，也不回 isError
+    #     （新用户第一场会话就会走到这里，不该先看见一个报错）。
     none_srv = MemoryServer(index=MemoryIndex().build())
     none_srv.recall = SequenceRecall([None, "不该调用第二次"])
     none_result = none_srv.handle(
         {"jsonrpc": "2.0", "id": 125, "method": "tools/call",
          "params": {"name": "latent_session_start"}}, now=now)["result"]
-    assert none_result["isError"] is True and "记忆库是空的" in none_result["content"][0]["text"]
+    assert none_result["isError"] is False and "记忆库还是空的" in none_result["content"][0]["text"], \
+        f"空库是新库的正常状态，不许回 isError：{none_result}"
     assert none_srv.recall.calls == 1, "真空库不该自动重试"
 
     # 5g.【最终错误边界】不在预期列表里的异常也不能冲破 HTTP/stdio，让客户端
@@ -3965,7 +4240,9 @@ def _selftest():
             "住宿还没有确认。", [{"action": "open", "summary": "住宿还没有确认"}]))
         assert opened["isError"] is False and "unresolvedStatus=updated" in opened["content"][0]["text"]
         opening = unresolved_call(strict, "latent_session_start", {})["content"][0]["text"]
-        assert opening.startswith("【当前未解决】") and "住宿还没有确认" in opening
+        assert opening.startswith("【当前未解决】") \
+            and "【由你自己选择合适的时机提起】" in opening \
+            and "住宿还没有确认" in opening
         (Path(td_u) / UNRESOLVED_FILENAME).write_text("# 未解决\n坏行\n", encoding="utf-8")
         damaged = unresolved_call(strict, "latent_append", append_args(
             "清单坏了正文也必须写。", [{"action": "none"}]))
@@ -4322,24 +4599,24 @@ def _selftest():
             return {"text": text, "current_state": state, "indexEvidence": [
                 {"type": "event", "quote": text}, {"type": "state", "quote": state}]}
         old9s = call(s9s, "latent_append",
-                     fact_args("她的居住地是重庆沙坪坝。", "当前住在重庆沙坪坝。"), now)
+                     fact_args("她的居住地是云港东湾。", "当前住在云港东湾。"), now)
         old_id9s = re.search(r"recordId=([0-9a-f]{16})", old9s["content"][0]["text"]).group(1)
         before_preflight9s = {p.relative_to(td): p.read_bytes()
                               for p in _P(td).rglob("*") if p.is_file()}
         preview9s = call(s9s, "latent_supersede", {
             "mode": "preflight", "supersedes": old_id9s,
-            **fact_args("她的居住地现在是深圳南山。", "当前住在深圳南山。")}, now + 10)
+            **fact_args("她的居住地现在是临川南坡。", "当前住在临川南坡。")}, now + 10)
         assert preview9s["isError"] is False and "本次零写入" in preview9s["content"][0]["text"]
         assert before_preflight9s == {p.relative_to(td): p.read_bytes()
                                       for p in _P(td).rglob("*") if p.is_file()}, \
             "supersede 预检不得写正文、索引或账本"
         middle9s = call(s9s, "latent_supersede", {
             "supersedes": old_id9s,
-            **fact_args("她的居住地现在是深圳南山。", "当前住在深圳南山。")}, now + 10)
+            **fact_args("她的居住地现在是临川南坡。", "当前住在临川南坡。")}, now + 10)
         middle_id9s = re.search(r"recordId=([0-9a-f]{16})", middle9s["content"][0]["text"]).group(1)
         newest9s = call(s9s, "latent_supersede", {
             "supersedes": middle_id9s,
-            **fact_args("她的居住地现在是广州天河。", "当前住在广州天河。")}, now + 20)
+            **fact_args("她的居住地现在是白石北岸。", "当前住在白石北岸。")}, now + 20)
         newest_id9s = re.search(r"recordId=([0-9a-f]{16})", newest9s["content"][0]["text"]).group(1)
         ledger9s = json.loads(supersessions9s.read_text(encoding="utf-8"))["records"]
         assert ledger9s[old_id9s]["superseded_by"] == middle_id9s \
@@ -4347,27 +4624,27 @@ def _selftest():
             and ledger9s[middle_id9s]["superseded_by"] == newest_id9s \
             and ledger9s[newest_id9s]["supersedes"] == middle_id9s, \
             "A→B→C 必须逐段保存 supersedes／superseded_by 双向链接"
-        current9s = call(s9s, "latent_search", {"query": "广州天河", "topN": 5}, now + 21)
+        current9s = call(s9s, "latent_search", {"query": "白石北岸", "topN": 5}, now + 21)
         current_text9s = current9s["content"][0]["text"]
-        assert "广州天河" in current_text9s and "她的居住地是重庆沙坪坝" not in current_text9s \
-            and "她的居住地现在是深圳南山" not in current_text9s \
+        assert "白石北岸" in current_text9s and "她的居住地是云港东湾" not in current_text9s \
+            and "她的居住地现在是临川南坡" not in current_text9s \
             and "status=superseded" not in current_text9s \
             and set(re.findall(r"recordId=([0-9a-f]{16})", current_text9s)) == {newest_id9s}, \
             "默认检索只能返回 current，新旧 timeline 与旧 index 摘要都必须隐藏"
-        history9s = call(s9s, "latent_search", {"query": "她的居住地以前从重庆怎么变迁", "topN": 2}, now + 22)
+        history9s = call(s9s, "latent_search", {"query": "她的居住地以前从云港怎么变迁", "topN": 2}, now + 22)
         history_text9s = history9s["content"][0]["text"]
-        assert all(place in history_text9s for place in ("重庆沙坪坝", "深圳南山", "广州天河")), \
+        assert all(place in history_text9s for place in ("云港东湾", "临川南坡", "白石北岸")), \
             f"历史意图没有补齐三段：{history_text9s}"
-        positions9s = [history_text9s.index(place) for place in ("重庆沙坪坝", "深圳南山", "广州天河")]
+        positions9s = [history_text9s.index(place) for place in ("云港东湾", "临川南坡", "白石北岸")]
         assert positions9s == sorted(positions9s) and history_text9s.count("recordId=") >= 3 \
             and "status=superseded" in history_text9s \
             and f"superseded_by={middle_id9s}" in history_text9s \
             and f"supersedes={middle_id9s}" in history_text9s, \
             "历史意图必须突破 topN 补齐整链，按登记时间正序并展示双向关系"
-        same_field9s = call(s9s, "latent_search", {"query": "重庆沙坪坝深圳南山", "topN": 2}, now + 23)
+        same_field9s = call(s9s, "latent_search", {"query": "云港东湾临川南坡", "topN": 2}, now + 23)
         same_field_text9s = same_field9s["content"][0]["text"]
         assert all(place in same_field_text9s
-                   for place in ("重庆沙坪坝", "深圳南山", "广州天河")) \
+                   for place in ("云港东湾", "临川南坡", "白石北岸")) \
             and same_field_text9s.count("recordId=") >= 3, \
             f"无历史意图词时，同一显式链有多个节点命中也必须突破 topN 展开整链：{same_field_text9s}"
         restarted9s = mk9s()
@@ -5021,6 +5298,12 @@ def _selftest():
         assert code != 0, f"空目录必须非零退出，实际 {code}：{out}"
         assert "✗" in out and "没找到任何 .md 语料" in out, f"提示要显著：{out}"
         assert str(empty.resolve()) in out, "失败路径同样要回答“读的是哪儿”"
+        #    零素材新库：空目录、旁边也没有语料 → ⚠ 不是 ✗，退出码 0（服务本来就能起）
+        with tempfile.TemporaryDirectory() as fresh_td:
+            (_P(fresh_td) / "新库").mkdir()
+            code_new, out_new = run_doctor(fresh_td, "--corpus", "新库")
+            assert code_new == 0 and "✗" not in out_new and "还没有任何 .md 语料" in out_new, \
+                f"零素材新库不该被体检判成故障：{code_new} / {out_new}"
 
         #    有 md、但切不出块（全空行）：不许崩成 traceback——正在排查故障的人
         #    要的是一句看得懂的话。旧版在这里 ZeroDivisionError
@@ -5415,8 +5698,8 @@ def _selftest():
         #   就这么造错了，变异不红——夹具错了跟钉子失效长得一模一样）。
         real_handle, done18e = srv18e.handle, []
 
-        def handle_then_upload(msg, now=None):
-            r = real_handle(msg, now=now)
+        def handle_then_upload(msg, now=None, hidden_ok=False):
+            r = real_handle(msg, now=now, hidden_ok=hidden_ok)
             if not done18e:                  # 只插一次
                 done18e.append(1)
                 (_P(td) / "timeline" / "window_09_2026-08-02.md").write_text(
@@ -5821,6 +6104,11 @@ def _selftest():
     #     【本轮补的未知加载异常靶心】`_looks_offline()` 认不出的异常不能再被
     #     自信地说成「语料／--corpus 有问题」。2026.08.06 真机夹具用中文 API key
     #     撞出 UnicodeEncodeError，语料完全没坏，旧兜底却把人引去查语料。
+    #     缺 fastembed 不许说成“没网”：装进 venv、配置却指向 venv 外的解释器时，联网解决不了。
+    #     变异：把 ImportError 并回 _looks_offline → 这条红。
+    missing21 = startup_failure_report("load", ImportError("no fastembed", name="fastembed"), embed=True)
+    assert "没装" in missing21 and "fastembed" in missing21 and "没网" not in missing21, \
+        f"缺库要直说缺库，不许引去查网络：{missing21!r}"
     unknown_load21 = startup_failure_report(
         "load", UnicodeEncodeError("latin-1", "中", 0, 1, "合成配置编码错误"),
         embed=True)
@@ -6166,6 +6454,104 @@ def _selftest():
              f"实际 {body24b.count('进程启动 pid=')} 条")
         assert body24b.startswith(body24a), "追加写：第二次不许把第一次的内容截掉"
 
+    # 25.【隐藏入口按凭证隔离】走真 HTTP，不拿进程内 handle 代替传输结果。
+    #    病灶：服务端过去对所有凭证都全列工具（含隐藏入口）、schema 完整，隔离只在客户端的
+    #    permissions.deny 上——不读那份配置的宿主（自建前端、桌面 App）就是全开，
+    #    模型可直接调 latent_passive_recall 绕过预算账本／去重／闸门。
+    #    判据三条，逐条对应下面三段。
+    #    变异：① 删掉 handle 里 tools/list 的过滤 → 判据 1 红；
+    #          ② 把 _call_tool 的 handlers.pop 挪到参数校验之后 → 判据 2 红；
+    #          ③ _gate 里把 hidden_ok 恒置 True → 判据 1、2 同时红；
+    #          ④ `_gate` 写回旧版的 `is_hook or not hook_token`
+    #             → fail-closed 那段红（没配 hook_token 时又全开了）。
+    with tempfile.TemporaryDirectory() as td25:
+        (_P(td25) / "timeline").mkdir()
+        (_P(td25) / "timeline" / "window_01_2026-09-01.md").write_text(
+            "# 第1个窗口 · 2026-09-01\n\n## 2026-09-01 记\n咖啡机的保险丝烧了。\n"
+            "当下状态：等配件。\n", encoding="utf-8")
+        index25 = _P(td25) / "index"
+        index25.mkdir()
+        loader25 = lambda: load_corpus((td25, index25))
+        srv25 = MemoryServer(index=loader25(), thread_store=ThreadStore(),
+                             corpus_dir=td25, loader=loader25, index_dir=index25,
+                             source_dirs=(td25, index25), enable_passive_recall=True)
+        httpd25 = make_http_server(srv25, host="127.0.0.1", port=0,
+                                   token="plain-2026", hook_token="hook-2026")
+        threading.Thread(target=httpd25.serve_forever, daemon=True).start()
+        base25 = f"http://127.0.0.1:{httpd25.server_address[1]}/mcp"
+
+        def post25(payload, tok):
+            req = urllib.request.Request(
+                base25, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                method="POST")
+            req.add_header("Authorization", f"Bearer {tok}")
+            req.add_header("Content-Type", "application/json")
+            try:
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    return json.loads(r.read().decode("utf-8"))
+            except urllib.error.HTTPError as e:
+                return json.loads(e.read().decode("utf-8"))
+
+        list25 = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+        hook_tools25 = post25(list25, "hook-2026")["result"]["tools"]
+        plain_tools25 = post25(list25, "plain-2026")["result"]["tools"]
+        #    判据 3 前半 ＋ 判据 1：开自动浮现时宿主 10 项（八个公开工具＋回填＋隐藏入口）、
+        #    普通 9 项，且那九项逐字不变
+        assert len(hook_tools25) == 10 \
+            and hook_tools25[-1]["name"] == PASSIVE_RECALL_TOOL, \
+            f"宿主凭证要照旧看见 10 项（含隐藏入口）：{[t['name'] for t in hook_tools25]}"
+        assert len(plain_tools25) == 9 \
+            and PASSIVE_RECALL_TOOL not in {t["name"] for t in plain_tools25} \
+            and FACT_BACKFILL_TOOL in {t["name"] for t in plain_tools25}, \
+            f"普通凭证恰 9 项、含回填、不含隐藏入口：{[t['name'] for t in plain_tools25]}"
+        assert plain_tools25 == hook_tools25[:9], \
+            "只准少掉隐藏入口：其余九项的 name／description／inputSchema 要逐字不变"
+        #    判据 2：普通凭证盲调，参数故意留空 → 必须是「未知工具」而不是参数校验错
+        #    （回参数错等于承认这里有个东西、还把形状一起告诉了对方）
+        blind25 = post25({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                          "params": {"name": PASSIVE_RECALL_TOOL}}, "plain-2026")
+        assert "error" in blind25, \
+            f"普通凭证盲调不许走到工具里去：{blind25}"
+        assert blind25["error"]["code"] == E_METHOD_NOT_FOUND \
+            and "未知工具" in blind25["error"]["message"], \
+            f"普通凭证盲调要回方法不存在类错误：{blind25}"
+        assert "userInput" not in json.dumps(blind25, ensure_ascii=False), \
+            f"错误文案不许泄漏入口的参数形状（凭证判断必须早于参数校验）：{blind25}"
+        #    判据 3 后半：宿主凭证一次完整调用，返回结构与三个 version 字段照旧
+        full25 = post25({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                         "params": {"name": PASSIVE_RECALL_TOOL, "arguments": {
+                             "userInput": "咖啡机保险丝", "turn": {
+                                 "sessionId": "s25", "turnId": "t25",
+                                 "deliveryId": "d25"},
+                             "previousAnchors": [], "contextEvidence": [],
+                             "capability": {}}}}, "hook-2026")["result"]
+        structured25 = full25["structuredContent"]
+        assert structured25["deliveryId"] == "d25" \
+            and structured25["wireVersion"] == WIRE_VERSION \
+            and structured25["policyVersion"] == POLICY_VERSION \
+            and (not JIEBA_AVAILABLE      # 没装 jieba 时是空结果，空结果本来就不带组装版本
+                 or structured25["assemblyPolicyVersion"] == ASSEMBLY_POLICY_VERSION), \
+            f"宿主那条路一个字都不许动，三个 version 对不上宿主会判契约漂移：{structured25}"
+        httpd25.shutdown()
+        #    fail-closed（取代原来的「回滚态」判据）：
+        #    不配 hook_token 不再是「所有凭证都看得见隐藏入口」，而是对所有凭证关闭。
+        #    漏配的后果因此从「全世界都能看见、永远没人发现」变成「宿主 hook 当场
+        #    -32601、立刻发现」——这正是要的，所以它跟「部署必须配 --hook-token」
+        #    是一套；要恢复得把凭证补上，不是把凭证拿掉。
+        httpd25b = make_http_server(srv25, host="127.0.0.1", port=0, token="plain-2026")
+        threading.Thread(target=httpd25b.serve_forever, daemon=True).start()
+        base25 = f"http://127.0.0.1:{httpd25b.server_address[1]}/mcp"
+        tools25b = post25(list25, "plain-2026")["result"]["tools"]
+        assert len(tools25b) == 9 \
+            and PASSIVE_RECALL_TOOL not in {t["name"] for t in tools25b}, \
+            (f"fail-closed：没配 --hook-token 时任何凭证都不许看见隐藏入口："
+             f"{[t['name'] for t in tools25b]}")
+        blind25b = post25({"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                           "params": {"name": PASSIVE_RECALL_TOOL}}, "plain-2026")
+        assert blind25b["error"]["code"] == E_METHOD_NOT_FOUND, \
+            f"fail-closed：没配 --hook-token 时盲调也要当未知工具挡掉：{blind25b}"
+        httpd25b.shutdown()
+
     print("selftest ok（26项断言：握手 / 工具表 / 调用往返 / 薄适配层 / 错误分层（含 "
           "session_start 读取异常只重试一次、未预料异常不空断、写工具不重放）/ "
           "完整链路 / stdio / UTF-8 / 写回当场可查 / 写回预检（零写入、补索引预检、"
@@ -6208,7 +6594,7 @@ def _selftest():
           "长流被关掉＝指出口、开满＝说开满），且三句都不许糊到别的被拒行上）/ "
           "--log-file 让 stderr 留得下痕·真进程（诊断人话落盘、父目录自建、"
           "每次启动一条带 pid 的横幅，同一文件跑两次＝两条横幅且追加不截断——"
-          "「子进程重启过」由此可直接读出，不必再靠 token 账单倒推）")
+          "「子进程重启过」由此可直接读出，不必再靠 token 账单倒推） / 隐藏入口按凭证隔离·真 HTTP（开自动浮现时宿主凭证 10 项、普通凭证恰 9 项且其余九项逐字不变；普通凭证盲调隐藏入口回「未知工具」而非参数校验错——凭证判断早于校验，错误文案不泄漏入口的存在与形状；宿主那条路的返回结构与三个 version 字段照旧；没配 --hook-token 时 fail-closed：所有凭证都看不见、盲调也是未知工具，宿主 hook 自己也用不了，漏配当场坏而不是静默全开）")
 
 
 if __name__ == "__main__":
@@ -6266,6 +6652,13 @@ if __name__ == "__main__":
     ap.add_argument("--token",
                     help="HTTP 传输的 Bearer token（也可用环境变量 MEMORY_HTTP_TOKEN；"
                          "客户端侧填进 bearerToken/Authorization 头）")
+    ap.add_argument("--hook-token", dest="hook_token",
+                    help="只发给宿主 hook 的第二条 Bearer token（也可用环境变量 "
+                         "MEMORY_HTTP_HOOK_TOKEN）。配了它之后：拿这条 token 的请求"
+                         "才看得见、调得动自动浮现宿主入口 latent_passive_recall；"
+                         "--token 那条与其它任何调用方拿到的工具表少这一项，盲调也只"
+                         "得到「未知工具」。⚠ fail-closed：不配＝对所有凭证关闭，宿主 hook 自己"
+                         "也用不了——它跟「部署必须配 token」是一套。")
     ap.add_argument("--log-file", dest="log_file", metavar="路径",
                     help="把本该只走 stderr 的诊断输出（启动横幅、拒绝记录、异常堆栈）"
                          "同时追加落盘一份。stdio 形态下 stderr 由客户端接管、经常被直接"
@@ -6368,16 +6761,25 @@ if __name__ == "__main__":
             host, _, port = args.http.rpartition(":")
             host = host or "127.0.0.1"
             token = args.token or os.environ.get("MEMORY_HTTP_TOKEN") or None
+            hook_token = (args.hook_token
+                          or os.environ.get("MEMORY_HTTP_HOOK_TOKEN") or None)
+            if hook_token and hook_token == token:
+                ap.error("--hook-token 跟 --token 一样等于没分开：两条凭证相同时"
+                         "服务端照样分不出宿主 hook 与模型，隐藏入口仍然全开。")
             try:
                 httpd = make_http_server(srv, host=host, port=int(port), token=token,
-                                         sse_stream=args.sse_stream)
+                                         sse_stream=args.sse_stream,
+                                         hook_token=hook_token)
             except ValueError as e:
                 ap.error(str(e))
             except OSError as e:                     # 端口被占等绑定失败（第 3 条）
                 _startup_failed("bind", e)
             # 起动横幅进 stderr（stdio 传输里 stdout 是协议流，这里沿用习惯）
+            hidden_note = ("仅宿主凭证可见" if hook_token else
+                           "对所有凭证关闭（fail-closed：没配 --hook-token，宿主 hook 自己也用不了）")
             print(f"Streamable HTTP 服务在 http://{host}:{httpd.server_address[1]} "
                   f"（鉴权：{'Bearer token' if token else '无——仅限回环+外层反代'}；"
+                  f"隐藏入口：{hidden_note}；"
                   f"语料变化自动重读）", file=sys.stderr)
             # 非回环绑定多打一行 TLS 提醒：只提示、不拒绝起动，也不看有没有配 token
             notice = http_tls_notice(host)
