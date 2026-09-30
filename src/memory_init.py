@@ -41,6 +41,7 @@ import argparse
 import json
 import re
 import shutil
+import os
 import sys
 from collections import namedtuple
 from datetime import datetime
@@ -1439,7 +1440,9 @@ def python_command(portable=False):
     import shutil
 
     if not portable:
-        return str(Path(sys.executable).resolve()).replace("\\", "/")
+        # 不许 resolve()：venv 的 python 是指向基础解释器的软链接，跟着链接跳过去就出了 venv，
+        # 用户装进 venv 的 jieba、fastembed 在服务启动时全找不到。只取绝对路径，保留软链接本身。
+        return os.path.abspath(sys.executable).replace("\\", "/")
     for name in (Path(sys.executable).stem, "python3", "python"):
         if name and shutil.which(name):
             return name
@@ -2184,6 +2187,23 @@ def line_starts_top_level(line):
 
 def _selftest():
     import tempfile
+
+    # 0a.【venv 解释器不许被解析掉】venv 的 python 是软链接；resolve() 会跳到基础解释器，
+    #    装在 venv 里的 jieba／fastembed 就找不到了。变异：加回 .resolve() → 这条红。
+    with tempfile.TemporaryDirectory() as td:
+        link = Path(td) / "venv-python"
+        try:
+            link.symlink_to(sys.executable)
+        except (OSError, NotImplementedError):
+            link = None                     # 不能建软链接的平台（部分 Windows）跳过这一条
+        if link is not None:
+            real, sys.executable = sys.executable, str(link)
+            try:
+                from os.path import abspath as _abspath   # _selftest 后面另有 import os，这里不能用裸名
+                assert python_command() == _abspath(str(link)).replace("\\", "/"), \
+                    f"配置里的解释器必须是 venv 里那一个，不许顺着软链接跳出去：{python_command()}"
+            finally:
+                sys.executable = real
 
     # 0.【变异靶心：全是选择题】用户只做选择，不写作文——第一版全是问答题，
     #    门槛高、答出来多半是形容词，还跟纪录片纪律打架
@@ -5096,7 +5116,7 @@ def _selftest():
 
 
 _SELFTEST_SUMMARY = (
-    "selftest ok（67项断言：体检识破空泛 / 只问缺口 / 立场题选项与排序 / "
+    "selftest ok（68项断言：venv 解释器不解析软链接 / 体检识破空泛 / 只问缺口 / 立场题选项与排序 / "
           "归属句式 / 默认值不预支历史 / 协议层不问用户 / 导出纪律 / 渲染顺序 / "
           "人称锚死一套 / 用户只有一种称呼形态 / 昵称档不被静默吃掉 / 中性档不丢主语 / 人称从语料读出来 / 中性写法不许漏 / 语料侧判定不许猜 / 全文零它 / 称呼不重复拼接 / 关系状态归开篇 / "
           "答案读回不静默丢 / 任务书不泄漏进人格文件 / 长字面量不崩 / 未决草稿不蒸发 / "

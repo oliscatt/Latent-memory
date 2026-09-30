@@ -1,0 +1,3 @@
+# 自动浮现（--passive-recall）块路径的依赖：准入分词用 jieba。事实模式、主动检索、换窗召回和写回都不需要。
+# 建议装在独立虚拟环境里：pip install -r requirements-passive.txt
+jieba==0.42.1

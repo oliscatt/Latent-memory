@@ -18,7 +18,7 @@
 
 自动浮现的代码已随本仓库公开，但**默认关闭，且目前没有开箱即用的受支持宿主**。
 
-它是一项**可选增强**，不是使用 Latent 的前提。不启用时，主动检索、换窗召回和正常写回的行为与以前完全一致。
+它是一项**可选增强**，不是使用 Latent 的前提。不启用时，主动检索、换窗召回和正常写回的行为不受任何影响。
 
 它要求宿主能在**用户消息提交之后、模型请求发出之前**执行 hook，并能控制注入内容是否进入对话历史。**“支持 MCP”不等于“支持自动浮现”**——只能挂载工具的客户端无法提供这个时机。
 
@@ -107,7 +107,7 @@ embedding 都是可选路线，没把语料去向念给用户听，就不出货�
 | **Claude Code**（电脑） | 直接走，自动读 `CLAUDE.md` | **无**，语料不出本机 |
 | **Claude Code**（手机／云端线程） | 整套放进你自己的 GitHub 私仓，云端会话连着它起 | 记忆库托管 GitHub ＋ 写回要 push 回仓库并合回主干 ＋ 需要订阅 |
 | **Claude 桌面 chat** | 本地 stdio 直连 | 人格要手工贴进 profile；其余无，语料不出本机 |
-| **Claude 手机 chat** | 把记忆库部署到一台公网服务器，接 claude.ai 自定义 Connector | 一台 VPS ＋ 一个 HTTPS 域名 ＋ 一层鉴权；**语料到 VPS**。⚠ 域名不是非买不可（sslip.io 那条代价见《快速上手》部署形态二），**1 GB 机器加 swap 就够**，别被这行吓退 |
+| **Claude 手机 chat** | 把记忆库部署到一台公网服务器，接 claude.ai 自定义 Connector | 一台 VPS ＋ 一个 HTTPS 域名 ＋ 一层鉴权；**语料到 VPS**。⚠ 域名不是非买不可（sslip.io 那条代价见《快速上手》部署形态二），**内存需求取决于语料、重建峰值和同机服务；swap 不构成容量保证** |
 | **Codex**（电脑） | 直接走，自动读 `AGENTS.md` | **无**，语料不出本机 |
 | **Codex**（手机） | 手机当客户端连本地实例，或走 OpenRouter 这类中转 | 前者要**那台电脑常开**；后者中转要自己搭，**未实测** |
 | **Grok 网页 Connector**（grok.com） | 公网 HTTPS 的远程 MCP，通过 grok.com 自定义 Connector 接入 | ⚠ **grok.com 强制 OAuth 发现（AS metadata／PKCE），纯静态 Bearer 无法完成「保存并连接」**——一位外部用户自建最小 OAuth shim（**用户侧扩展、非本项目功能**）后接通；人格仍需手工配置，语料会到公网服务器 |
@@ -126,7 +126,7 @@ embedding 都是可选路线，没把语料去向念给用户听，就不出货�
 
 **如果你自己写前端**：`--client generic` 出 `persona.md` ＋ [`docs/注入契约.md`](docs/注入契约.md)。有宿主的客户端会自动读人格文件，**自建前端没有宿主替你做这件事**——契约那五条各带判据，对着自己拼请求的代码逐条自查。
 
-**需要什么**：Python 3.10+（零第三方依赖，不用 pip install 任何东西）、一个支持 MCP 的客户端。历史对话导出是可选的——没有也能用，走冷启动问卷；已经有的人格文件可以带上（见上面 `--persona`）。**什么材料都没有也能走完**：那种情况下每一节都允许留空，出来的是一份诚实的空底座，不会拿编的内容把它填满。
+**需要什么**：Python 3.10+（基础功能零第三方依赖，不用 pip install 任何东西；开自动浮现且走块路径时要 `pip install -r requirements-passive.txt` 装 jieba）、一个支持 MCP 的客户端。历史对话导出是可选的——没有也能用，走冷启动问卷；已经有的人格文件可以带上（见上面 `--persona`）。**什么材料都没有也能走完**：那种情况下每一节都允许留空，出来的是一份诚实的空底座，不会拿编的内容把它填满。
 
 ⚠ **产出目录准备进 Git 仓库时，不要直接建在本项目的 clone 里**：本仓库的
 `.gitignore` 会忽略 `memory/`、人格文件与 `mcp-config.json`，防止私人记忆误进公开仓库；
@@ -157,18 +157,19 @@ embedding 都是可选路线，没把语料去向念给用户听，就不出货�
 
 ## 技术形态
 
-- **零依赖**：BM25 检索层、RRF 融合、用进废退、时间戳解析、MCP 协议实现全是 Python 标准库。只有可选的真 embedding 走 fastembed。
+- **零依赖**：BM25 检索层、RRF 融合、用进废退、时间戳解析、MCP 协议实现全是 Python 标准库。可选依赖只有两处：真 embedding 走 fastembed（或云端服务），自动浮现块路径的准入分词走 jieba（`requirements-passive.txt`；事实模式不用）。
 - **embedding 提供方可插拔**（`src/embedding_provider.py`）：本地（fastembed）与云端 HTTP 服务走同一个口子，**不内置任何一家的 SDK**（云端走各家通用的 `/v1/embeddings` 形状，stdlib urllib）；换服务商不改检索层。**API key 只走环境变量**，不写进 `mcp-config.json`、不进产出目录、不落任何状态文件。
 - **检索路线是自己用户选的**：初始化流程里有一步专门问——三条路（零依赖／本地模型／云端服务）连同各自的**语料去向**念给他听，云端那条会把查询和被检索的内容发到第三方服务商。**没选过就不出货**（拦的是“没问过”，不是“没选云端”）。默认档仍是零依赖，语料不出本机。
 - **门槛常数跟模型绑定，没量过就说没量过**：可靠命中的余弦门槛是一张按模型的实测标定表，表里没有的模型返回“未标定”，此时向量路只参与排序、不单独放行候选——照抄别的模型的数值会让“库里没有就说没有”无声失灵。
 - **每个文件自带自检**：`python <文件名> --selftest`；正式发布检查可在仓库根目录一条命令跑完：
-  `python tests/run_release_checks.py`。GitHub Actions 会在 Python 3.10／3.11／3.12 上重复同一判据，
-  并保存带采集条件的 JSON 报告。
+  `python tests/run_release_checks.py`。没装 jieba 时，自动浮现相关的自检段落会打印“跳过”。
+  macOS 上会有两项因临时目录的路径别名而红（26/28），不是出货问题，见 [`tests/README.md`](tests/README.md)。
+  GitHub Actions（`.github/workflows/release-checks.yml`）在 Python 3.10／3.11／3.12 上先装 jieba 再跑同一判据，并保存带采集条件的 JSON 报告。
 - **端到端冒烟**：`python src/e2e_smoke.py --selftest` 跑完从导入到检索的整条链。
 - **检索融合**：BM25 词面 + 语义 + 关系图谱三路 RRF 融合。诚实标注：默认零依赖档下语义那一路（字符 bigram 余弦）跟词面路高度重合、几乎没有独立贡献（我们自己的回归集消融实测），实际是词面+图谱两路在干活；装 fastembed 走 `--embed` 后语义路才名副其实。`latent_search` 另接受一个可选 `queryVariant`：自然问法查不到时，由宿主模型补一种更具体的说法，服务器保留原查询并做一次受控 RRF 融合；原查询两票、改述一票，最终 topN 才加一次权重。⚠ 机制已用虚构夹具和真 MCP 调用验证；外部十道私有题没有上交，**不能写成原 5/10 已经提高到某个新分数**。
-- **MCP 协议**：按官方规格 2025-06-18 实现；同时支持本地 stdio 与远程 Streamable HTTP（`--http`＋`--token`）。`--http` 收的是 `[HOST:]PORT`，**省略 HOST 只绑回环、别的机器连不到**；绑非回环时起动横幅会多打一行提醒——那条链路是裸 HTTP，token 与检索回来的记忆内容都是明文，推荐绑回环、公网那一跳交给反代管 TLS（**只提醒，不拦你起动**）。
+- **MCP 协议**：按官方规格 2025-06-18 实现；同时支持本地 stdio 与远程 Streamable HTTP（`--http`＋`--token`；开自动浮现时另配宿主专用的 `--hook-token`，不配则隐藏入口对所有凭证关闭）。`--http` 收的是 `[HOST:]PORT`，**省略 HOST 只绑回环、别的机器连不到**；绑非回环时起动横幅会多打一行提醒——那条链路是裸 HTTP，token 与检索回来的记忆内容都是明文，推荐绑回环、公网那一跳交给反代管 TLS（**只提醒，不拦你起动**）。
 - **按客户端的 `Accept` 给传输形态**：只认 SSE 响应体的客户端拿到单事件 SSE（`event: message` ＋ `data:`），其余拿 `application/json`（`Accept` 里两个都写、写 `*/*`、或没带这个头，都走 JSON）；**GET 会拿到一条只发心跳、永不发消息的空长流**——本服务没有服务器主动推送的场景，这条流存在的理由只有一个：有的客户端先发 GET 建长流，收到 405 之后不改用 POST，就一直等下去。不要它就加 `--no-sse-stream`（那样 GET 恒回 405）。长流同时最多 4 条。⚠ **这两条只有自检盖着、没有真机**：自检是真端口往返，量的是「服务端形态已具备」，**不是「哪个客户端因此接上了」**。
-- **工具名带 `latent_` 前缀**：`latent_search` / `latent_session_start` / `latent_append` / `latent_supersede` / `latent_correct` / `latent_cleanup` / `latent_unresolved` / `latent_thread_close`。真实事实后来变化时用 `latent_supersede` 写新事实并指向旧 `recordId`；旧记录只退出默认检索，历史意图会沿双向链返回。旧值从未真实过才用 `latent_correct`。`latent_append` 与 `latent_supersede` 均可 `mode=preflight`；`latent_append` 的可选 `passive` 会把经原文范围核验的触发词、短句许可、必要引用和确定性 revision 写进辅助账本，也可凭同一 `recordId` 分阶段补齐。显式开启的自动浮现入口会做输入预筛、范围／来源／冲突过滤、单事件线选择、候选级冷却与现场资料组装；资料只在本轮交付，由宿主决定是否进入模型输入及历史。自动路径只读记忆库且不增加权重。真实宿主兼容、自然效果和实际成本仍须逐项验证。老语料没有 `.supersessions.json` 或 `.passive.json` 时无需迁移正文。`latent_session_start` 是一场会话开始时的**换窗召回**，不是逐轮 Passive Recall。`latent_cleanup` 只按稳定 `recordId` 两阶段精准清理误写，链上节点为防断链会拒绝清理；`latent_unresolved` 维护 `<corpus>/未解决.md`。旧 append／thread_close 不带新字段仍继续写入并明确回 `not_reviewed`，需要严格复核时显式加 `--require-unresolved-review`。前缀不是装饰——**通用名（`memory_search` 这类）可能跟宿主自带的同名工具撞上**，撞上之后服务照常连着、工具列表照常看得见、模型照常回话，只是调的不是这一份，**全程零报错**。
+- **工具名带 `latent_` 前缀**：`latent_search` / `latent_session_start` / `latent_append` / `latent_supersede` / `latent_correct` / `latent_cleanup` / `latent_unresolved` / `latent_thread_close`。真实事实后来变化时用 `latent_supersede` 写新事实并指向旧 `recordId`；旧记录只退出默认检索，历史意图会沿双向链返回。旧值从未真实过才用 `latent_correct`。`latent_append` 与 `latent_supersede` 均可 `mode=preflight`；`latent_append` 的可选 `passive` 会把经原文范围核验的触发词、短句许可、必要引用和确定性 revision 写进辅助账本，也可凭同一 `recordId` 分阶段补齐。显式开启的自动浮现入口会做输入预筛、范围／来源／冲突过滤、单事件线选择、候选级冷却与现场资料组装；配了事实库时改走事实模式，按向量递出与用户原句最像的两条事实。资料只在本轮交付，由宿主决定是否进入模型输入及历史。自动路径不改记忆正文、索引与账本，也不增加权重。开 `--passive-recall` 后，模型可见的工具表多一个建事实库用的 `latent_fact_backfill`，`latent_append` 可选的 `facts` 会把新事实追加进事实库。真实宿主兼容、自然效果和实际成本仍须逐项验证。老语料没有 `.supersessions.json` 或 `.passive.json` 时无需迁移正文。`latent_session_start` 是一场会话开始时的**换窗召回**，不是逐轮 Passive Recall。`latent_cleanup` 只按稳定 `recordId` 两阶段精准清理误写，链上节点为防断链会拒绝清理；`latent_unresolved` 维护 `<corpus>/未解决.md`。旧 append／thread_close 不带新字段仍继续写入并明确回 `not_reviewed`，需要严格复核时显式加 `--require-unresolved-review`。前缀不是装饰——**通用名（`memory_search` 这类）可能跟宿主自带的同名工具撞上**，撞上之后服务照常连着、工具列表照常看得见、模型照常回话，只是调的不是这一份，**全程零报错**。
 - **被拒的请求在服务端留一行**：401／403／404／405／400／411／413／501 各说各的原因（含方法、路径、来源 IP），**排查不用猜是哪一种**；正常请求照旧不打日志。⚠ 405 有三种含义，那一行会说清是哪一种（客户端本来就只要 JSON／长流被 `--no-sse-stream` 关掉了／长流开满了）——**只有第一种不是故障**，另两种下不会回退的客户端会一直等。⚠ 那一行**不含 token、不含请求体**（那里面是你的问句和记忆正文），路径也剥掉了 query；被扫时有每分钟上限，**压掉多少条会明说**。
 
 ## 文档
@@ -195,11 +196,20 @@ embedding 都是可选路线，没把语料去向念给用户听，就不出货�
 
 早期项目，完整链路已经跑通；验过的真实环境逐个列在下面这张表里，**没列进来的就是没验过**。当前范围：**陪伴向**。客户端这一侧的成色逐个记，写清楚免得踩空——**跨客户端的结论不能互相借用**：
 
-自动浮现兼容性另按“维护者复现通过／外部实测、维护者未复现／机制或文档推断”三档记录。
-当前唯一参考为 Latent 参考宿主 `reference-host-passive-w5-v1` 在 Windows、Python 3.12.10 的
-维护者开发环境：hook 时序、隐藏入口、候选与组装、临时／历史保留注入、关闭和脱敏观测均已
-跑通。**这是开发环境，不构成受支持宿主**；它不能替真实聊天宿主的保存、恢复、分叉、压缩，
-也不能替真实模型自然效果和成本背书。
+自动浮现兼容性另按“维护者复现通过／外部实测、维护者未复现／机制或文档推断”三档记录，
+每条只证明它自己那个宿主，完整表格见 [`docs/自动浮现.md`](docs/自动浮现.md)：
+
+- **Latent 参考宿主 `reference-host-passive-w5-v1`**，Windows、Python 3.12.10：维护者开发环境跑通
+  hook 时序、隐藏入口、候选／组装、临时与历史保留注入、关闭和脱敏观测。**这是开发环境，不构成
+  受支持宿主**。
+- **Claude Code 2.1.283，`UserPromptSubmit` hook**（hook 把内容写到 stdout），历史保留模式，事实模式，
+  服务端事实模式首版：维护者自用环境真实对话观察 33 回合，递到 28 回合，自然接住 17／28，用错 0，
+  复读 0。判据：“接住”＝回话里自然用上、且让回话更像记得对方；“用错”＝用了但说错事实，或把旧
+  状态当成现在。采集条件：维护者自用的云端 Claude Code 环境，一次连续观察；样本小，不代表其他
+  宿主或模型。
+- **维护者自建聊天前端**（Node 宿主驱动 Claude Code CLI 常驻会话，不公开），历史保留模式，事实
+  模式：维护者自用环境跑通原句一问、结果原样注入、低信息句留空、当天写入的事实次日浮现、关闭
+  注入后不再调用服务端；只证明这一个宿主。
 
 | 客户端 | 成色 |
 |---|---|
@@ -213,7 +223,7 @@ embedding 都是可选路线，没把语料去向念给用户听，就不出货�
 | **Grok 网页 Connector**（grok.com） | ⚠ **这一格要求 OAuth 发现层**：只填 MCP URL 时 grok.com 探测到 401 后弹 OAuth 凭据表（客户端 ID／授权端点／令牌端点／PKCE），**没有静态 API Key 选项，纯 Bearer 无法完成「保存并连接」**。一位外部用户自建最小 OAuth shim（**用户侧扩展、非本项目功能**，本项目源码一行未改）后接通：当时五个业务工具可用，新 Project 窗口换窗召回与写入跑通（**外部实测转录，本项目未复现**；那份报告的采集条件是 1 vCPU／1 GB VPS ＋ Ubuntu 24.04 ＋ Caddy 2 ＋ sslip.io 主机名 ＋ 账号级 Custom Connector，**没给本项目代码基线，也没给客户端版本号**）。⚠ 那一例的成色**不外借**给下面两格，也不是 `grok-4.5` 服从度数据。人格不会自动从本地文件注入，仍需手工配置 |
 | **xAI API／Remote MCP Tools** | ⚠ **本项目无实测**。xAI 官方文档证明 SDK 与 Responses API 支持远程 MCP 工具（“产品具备入口”），但没有任何一次本项目的接入或调用记录；别拿上面网页那格顶替 |
 | **ChatGPT** | OpenAI 官方已提供 [Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)：tunnel-client 从本机主动建立出站 HTTPS，再把 ChatGPT 的调用转给 `127.0.0.1` 上的 MCP，不必暴露公网入站端口。**State Ledger 部署已在 ChatGPT Work 真机接通读链路**：新窗口成功调用 `state_session_start`，并读取经确认的跨窗接力便签。⚠ **端口不公网暴露 ≠ 数据不离机**：工具请求与返回的记忆内容仍经 OpenAI，并适用账号／产品侧的数据与日志政策；回环无 token 还意味着信任同机进程环境。该服务是基于 Latent 的独立 `state_*` 部署，不能拿它替代本项目 `latent_*` 八工具的真机验收；后者的逐项调用、写入后检索与人格自动注入仍未实测。最短操作见《快速上手》§3c「ChatGPT Secure MCP Tunnel」 |
-| **其它聊天端** | ⚠ **未实测、需确认 MCP 支持状态。**各家叫法不一（自定义 Connector／远程 MCP／集成），不能借用 ChatGPT、claude.ai、Grok 三格中任何一格的成色。⚠ **也别默认它跟 grok.com 一样要 OAuth 发现层**——那条当前只有一例，见观察卡 |
+| **其它聊天端** | ⚠ **未实测、需确认 MCP 支持状态。**各家叫法不一（自定义 Connector／远程 MCP／集成），不能借用 ChatGPT、claude.ai、Grok 三格中任何一格的成色。⚠ **也别默认它跟 grok.com 一样要 OAuth 发现层**——那条目前只有一例 |
 | Kelivo（闭源手机前端） | **实测可接 MCP**：原生 `--http` 直连走通（Kelivo 1.1.17 iOS ／ VPS Ubuntu ＋ Python 3.10.12；判据是端口上蹲的确认为 `python3` 不是 Node、POST 回的是 `application/json`）。⚠ **连不上先看绑定地址，不是协议**：省略 HOST 只绑回环，手机连不到。人格要手工导入 system prompt，容量不是阻塞项 |
 | Operit（闭源手机前端） | **实测当时五个业务工具可用，写回后跨新会话仍能检索命中**（Android 的 proot Ubuntu）。⚠ 它走的是「客户端在手机本机按 stdio 拉起」那条——**不用公网服务器、不用域名证书鉴权，语料根本不离开手机**；**别把闭源手机前端一概读成「必须有服务器」**，那只对拉不起 stdio 的客户端（如 iOS 上的 Kelivo）成立。人格不自动注入，要手工粘贴 |
 | 自建前端（`--client generic`） | **维护者生产实测跑通**：采用 Node 宿主＋Claude Code 常驻进程＋Latent HTTP；判据是当时五个业务工具握手成功，真实主聊天主动调用 `latent_search`，并同时命中两段目标原文。采集条件为 VPS 生产环境、Latent `656a044`、Voyage `voyage-3.5`、182 个 Markdown／869 个切块。⚠ 这只证明“借宿主引擎”的这一种自建形态；换成你自己的请求拼装，注入契约仍要逐条自验 |
