@@ -1459,7 +1459,8 @@ class PassiveRecallService:
 
     def _fact_candidate(self, user_input, delivery_id, gate_reason, request,
                         request_key, fingerprint):
-        """事实模式：原句一个向量，取前 2 条非 meta、写入日早于今天、不在冷却的事实，不设门槛。"""
+        """事实模式：原句一个向量，取前 2 条非 meta、写入日早于今天、来源块仍现行的事实，
+        再去掉低于噪音下限的和冷却中的，不补位。"""
         today = self._today()
         cooldown = self.fact_cooldown
 
