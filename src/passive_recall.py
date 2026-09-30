@@ -268,7 +268,8 @@ def _load_admission_policy():
 
 
 _ADMISSION_POLICY = _load_admission_policy()
-# 块路径的准入靠 jieba 分词；没装时块路径一律留空（事实模式与主动检索不受影响）。自检据此跳过依赖它的段落。
+# 块路径的准入靠 jieba 分词；没装时只剩热词表的子串路径，连表也没有就一律留空（事实模式与主动检索不受影响）。
+# 自检据此跳过依赖分词的段落。
 JIEBA_AVAILABLE = importlib.util.find_spec("jieba") is not None
 # 保持现网检索视图的分词／首词不变；新增泛词类别只影响输入准入。
 _GENERIC_TOPICS = frozenset(_ADMISSION_POLICY["query_fillers"])
@@ -719,17 +720,30 @@ def _load_hotwords():
     return _hotwords_cache[1]
 
 
+def _substring_words(value, terms):
+    """没装 jieba 时的切词替身：表里的热词在原句里字面出现就算（英文按词边界）。
+    被另一个更长命中完整盖住的短词不算，免得「江陵府」里再单独冒出「江陵」。
+    ponytail: 每轮线性扫全部热词（两三千个 str.find，亚毫秒级），表大到十万级再换 Aho-Corasick。"""
+    spans = {word: _term_span(value, word) for word, entry in terms.items() if entry.get("hot")}
+    spans = {word: span for word, span in spans.items() if span is not None}
+    return [word for word, (start, end) in spans.items()
+            if not any(other != word and s <= start and end <= e and e - s > end - start
+                       for other, (s, e) in spans.items())]
+
+
 def _hot_terms(value, table):
-    """输入里的热词，按去复盘来源数升序（最稀有的在前，作锚点）。只查表，不猜词性。"""
-    try:
-        import jieba
-    except ImportError:
-        return []
-    _load_userdict()
+    """输入里的热词，按去复盘来源数升序（最稀有的在前，作锚点）。只查表，不猜词性。
+    没装 jieba 时改做子串匹配（表在装了 jieba 的机器上生成、复制过来用）。"""
     terms = table["terms"]
     value = unicodedata.normalize("NFKC", value).lower()
+    if JIEBA_AVAILABLE:
+        import jieba
+        _load_userdict()
+        words = jieba.lcut(value, HMM=False)
+    else:
+        words = _substring_words(value, terms)
     hits = {}
-    for word in jieba.lcut(value, HMM=False):
+    for word in words:
         entry = terms.get(word)
         if entry and entry.get("hot") and word not in hits:
             hits[word] = entry
@@ -1427,7 +1441,8 @@ class PassiveRecallService:
                 response["reasonCodes"] = reasons + ["w4_assembled"] \
                     + [f"topic:{term}" for term in topic_fragments] \
                     + ([f"anchor:{rare}"] if rare is not None else []) \
-                    + (["hotword_path"] if hot else [])
+                    + (["hotword_path"] if hot else []) \
+                    + (["substring_path"] if hot and not JIEBA_AVAILABLE else [])
         if response["status"] in {"candidate", "ready"}:
             # 服务端只登记可交付依赖；是否真正曝光由宿主提交模型请求后另记。
             self._record_delivery(turn["sessionId"], delivery_id, dependencies)
@@ -1736,6 +1751,48 @@ def _selftest_hotwords_path():
     print("selftest 热词路径：通过（建表默认规则、桥回当时那段、复盘后排、hotword_path、无热词不走）")
 
 
+def _selftest_substring_path():
+    """无 jieba＋复制来的表：子串命中热词后走同一条热词路径，响应带 substring_path；被长命中盖住的
+    短热词不算；不在表里的话照旧留空。强制把 JIEBA_AVAILABLE 置假，装没装 jieba 都真跑。"""
+    import tempfile
+    from memory_retrieval import MemoryIndex
+    global JIEBA_AVAILABLE
+    rows = [("风车岛一日：坐船到风车岛，尝了gelato，海边走了一下午。", "timeline"),
+            ("2026-01-01 · 风车岛一日，风车岛冰淇淋，海边散步。", "index")]
+    index = MemoryIndex()
+    for text, layer in rows:
+        index.add(text, {"source": "a-day", "chunk_index": 0, "layer": layer,
+                         "local_date": "2026-01-01", "timestamp_source": "filename"})
+    index.build()
+    day = [["date", "2026-01-01"]]
+    entry = lambda n: {"hot": 1, "clean_sources": n, "index_sources": day, "timeline_sources": day}
+    table = {"version": HOTWORDS_VERSION, "terms": {
+        "冰淇淋": entry(1), "风车岛": entry(2), "风车": entry(3), "检验": {"hot": 0, "clean_sources": 1}}}
+    saved = JIEBA_AVAILABLE
+    JIEBA_AVAILABLE = False
+    try:
+        assert [w for w, _ in _hot_terms("风车岛冰淇淋，捞", table)] == ["冰淇淋", "风车岛"], \
+            "子串命中按来源数升序；「风车」被「风车岛」盖住不算"
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "passive_hotwords.json"
+            path.write_text(json.dumps(table, ensure_ascii=False), encoding="utf-8")
+            with _hotwords_pinned(path):
+                service = PassiveRecallService(index, assemble_candidates=True)
+                ask = lambda q, n: service.candidate({"userInput": q, "turn": {
+                    "sessionId": "sub", "turnId": str(n), "deliveryId": f"sub-{n}"}})
+                result = ask("风车岛冰淇淋，捞", 1)
+                assert [r["recordId"] for r in result.get("records", [])] == [_chunk_key(rows[0][0])], \
+                    "锚点冰淇淋经 index 层确认，桥回正文只写了风车岛的那段"
+                assert {"hotword_path", "substring_path", "anchor:冰淇淋"} <= set(result["reasonCodes"])
+                _assert_excerpt_integrity(service, result)
+                plain = ask("检验记录", 2)
+                # 真没装 jieba 时是 low_information；装了时主题词仍由 jieba 切，换个原因留空。
+                assert plain["status"] == "empty" and "substring_path" not in plain["reasonCodes"]
+    finally:
+        JIEBA_AVAILABLE = saved
+    print("selftest 子串路径（无 jieba）：通过（子串命中热词、长词盖短词、桥回当时那段、substring_path、表外留空）")
+
+
 def _selftest_filler_ranking():
     with _hotwords_pinned(None):
         return __selftest_filler_ranking_body()
@@ -1942,9 +1999,10 @@ def __selftest_rare_excerpt_anchor_body():
 
 
 def _selftest():
+    _selftest_substring_path()
     if not JIEBA_AVAILABLE:
-        print("selftest 跳过：自动浮现块路径需要 jieba（pip install -r requirements-passive.txt）；"
-              "没装时块路径一律留空，事实模式与主动检索不受影响")
+        print("selftest 其余段跳过：分词、稀有词与建表需要 jieba（pip install -r requirements-passive.txt）；"
+              "没装时块路径只剩子串路径（要有热词表），事实模式与主动检索不受影响")
         return
     _selftest_hotwords_path()
     _selftest_topic_admission()

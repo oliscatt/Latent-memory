@@ -395,6 +395,30 @@ class FactModeTests(unittest.TestCase):
         self.assertEqual([r["id"] for r in kept], ["2", "3"], "同日近似留长的；跨天的不合并")
         self.assertEqual(dups, [("1", "2")])
 
+    def test_backfill_tool_can_be_switched_off_by_deployment(self):
+        try:
+            import mcp_server
+        except SyntaxError:
+            self.skipTest("mcp_server 需要 Python 3.12+")
+        corpus = Path(self.tmp.name) / "timeline"
+        corpus.mkdir()
+        old = os.environ.get("LATENT_FACT_BACKFILL")
+        os.environ["LATENT_FACT_BACKFILL"] = "off"
+        try:
+            srv = mcp_server.MemoryServer(index=self._backfill_index(), corpus_dir=str(corpus),
+                                          enable_passive_recall=True)
+            names = {t["name"] for t in srv.tools}
+            self.assertNotIn(mcp_server.FACT_BACKFILL_TOOL, names, "部署关掉回填工具就不许列出")
+            self.assertIn(mcp_server.PASSIVE_RECALL_TOOL, names, "关回填工具不影响隐藏入口")
+            blind = srv._call_tool(1, {"name": mcp_server.FACT_BACKFILL_TOOL,
+                                       "arguments": {"action": "status"}}, hidden_ok=True)
+            self.assertIn("未知工具", blind["error"]["message"], "模型硬调也当未知工具")
+        finally:
+            if old is None:
+                os.environ.pop("LATENT_FACT_BACKFILL", None)
+            else:
+                os.environ["LATENT_FACT_BACKFILL"] = old
+
     def test_backfill_tool_end_to_end_activates_fact_mode(self):
         try:
             import mcp_server

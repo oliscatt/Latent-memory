@@ -964,8 +964,11 @@ class MemoryServer:
             self.index, metadata_reader=self.passive_metadata.read,
             assemble_candidates=True, fact_index=fact_index, fact_cooldown=fact_cooldown,
         ) if enable_passive_recall else None
-        self.tools = list(TOOLS) + ([FACT_BACKFILL_TOOL_SCHEMA, PASSIVE_RECALL_TOOL_SCHEMA]
-                                    if self.passive else [])
+        # 部署开关：LATENT_FACT_BACKFILL=off 时不给模型回填工具（已有全量、不想让模型自己补拆的部署）。
+        self.fact_backfill_enabled = bool(self.passive) and os.environ.get(
+            "LATENT_FACT_BACKFILL", "on").strip().lower() not in {"0", "off", "false", "no"}
+        self.tools = list(TOOLS) + ([FACT_BACKFILL_TOOL_SCHEMA] if self.fact_backfill_enabled else []) \
+            + ([PASSIVE_RECALL_TOOL_SCHEMA] if self.passive else [])
         self.initialized = False
         # 写回与权重持久化（任务卡"记忆写回与权重持久化"）：
         # corpus_dir 是写回的落点，没配就明确拒写；weights_path 没配则权重只活在
@@ -2037,8 +2040,8 @@ class MemoryServer:
             "latent_cleanup": self._tool_memory_cleanup,
             "latent_unresolved": self._tool_unresolved,
             "latent_thread_close": self._tool_thread_close,
-            **({FACT_BACKFILL_TOOL: self._tool_fact_backfill,
-                PASSIVE_RECALL_TOOL: self._tool_passive_recall} if self.passive else {}),
+            **({FACT_BACKFILL_TOOL: self._tool_fact_backfill} if self.fact_backfill_enabled else {}),
+            **({PASSIVE_RECALL_TOOL: self._tool_passive_recall} if self.passive else {}),
         }
 
     # ---------- 协议层 ----------
@@ -3844,7 +3847,7 @@ def _selftest():
     assert PASSIVE_RECALL_TOOL not in {
         t["name"] for t in passive_srv.handle(
             {"jsonrpc": "2.0", "id": 205, "method": "tools/list"})["result"]["tools"]},         "fail-closed：漏传 hidden_ok 的 tools/list 不许列出隐藏入口"
-    if JIEBA_AVAILABLE:     # 没装 jieba 时被动一律留空，下面两条判据无从成立（主动检索另有自检）
+    if JIEBA_AVAILABLE:     # 没装 jieba（这里也没有热词表）时被动一律留空，下面两条判据无从成立（主动检索另有自检）
         assert hidden["structuredContent"]["status"] == "ready" \
             and hidden["structuredContent"]["deliveryId"] == "d1" \
             and passive_index.weights == passive_before, \
@@ -6529,7 +6532,7 @@ def _selftest():
         assert structured25["deliveryId"] == "d25" \
             and structured25["wireVersion"] == WIRE_VERSION \
             and structured25["policyVersion"] == POLICY_VERSION \
-            and (not JIEBA_AVAILABLE      # 没装 jieba 时是空结果，空结果本来就不带组装版本
+            and (not JIEBA_AVAILABLE      # 没装 jieba（这里也没有热词表）时是空结果，空结果本来就不带组装版本
                  or structured25["assemblyPolicyVersion"] == ASSEMBLY_POLICY_VERSION), \
             f"宿主那条路一个字都不许动，三个 version 对不上宿主会判契约漂移：{structured25}"
         httpd25.shutdown()

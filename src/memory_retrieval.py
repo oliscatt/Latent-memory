@@ -48,6 +48,7 @@ recall_recent(topN, per_day_cap=None)——换新窗口/context 压缩这两个�
 
 import argparse
 import hashlib
+import heapq
 import json
 import math
 import re
@@ -400,10 +401,21 @@ class MemoryIndex:
                      if self.cache_path else None)
             self._cvecs = embed_with_cache(self.provider, self.chunks, cache)
         else:
-            self._ccounts = [bigram_counts(c) for c in self.chunks]
+            # 余弦路的词频表与 BM25 词频只差大小写（tokenize 先 lower，bigram_counts
+            # 不 lower）。整份另存一遍在 5039 块语料上约 188 MiB，所以只存差异项：
+            # 每块记 (BM25 词频, 差异项或 None, 范数)，没有大写字母的块差异项必为 None。
+            # 差异项里的 0 表示“余弦路没有这个键”。打分见 _vector_scores。
+            self._ccounts = []
+            for c, tf in zip(self.chunks, self._bm25.tf):
+                if c == c.lower():
+                    diff, cc = None, tf
+                else:
+                    cc = bigram_counts(c)
+                    diff = {k: cc[k] for k in cc.keys() | tf.keys() if cc[k] != tf[k]} or None
+                self._ccounts.append((tf, diff, math.sqrt(sum(v * v for v in cc.values()))))
         self._neighbors = self._build_graph()
-        # 文档频次缓存，供 query_miss_rate 用（零依赖，建库时顺手算一次）
-        self._df_cache = dict(self._bm25.df)
+        # 文档频次，供 query_miss_rate 用；只读，直接共用 BM25 那份，不另复制
+        self._df_cache = self._bm25.df
         return self
 
     def _build_graph(self):
@@ -420,21 +432,32 @@ class MemoryIndex:
 
         每块只存强度前 graph_topK 的邻居。诚实标注局限：这是词面代理，"约定"和
         "兑现"若不共享任何字面（连专名都换了说法），这版连不上——那是实体识别/
-        语义图谱的活，跟检索层 bigram 当分词一样，等真实评估再升级，现在不假装。"""
+        语义图谱的活，跟检索层 bigram 当分词一样，等真实评估再升级，现在不假装。
+
+        **逐块算邻居，不攒全局块对表**（2026.09.30，外部 1 GiB VPS OOM）：旧写法先把
+        所有共享显著词的块对攒进一个 `{(a, b): 强度}` 字典，最后每块只留前 graph_topK。
+        5039 块语料上那张表有 413 万对、建库峰值因此多出约 1.34 GiB，留下的邻居只占
+        0.6%。`GRAPH_DF_CAP` 压的是枚举次数（耗时），压不住块对数（内存）。现在每块
+        只累加自己的候选邻居、取完前 graph_topK 就丢，内存上界是"单块的候选数"。
+        ⚠ 结果与旧写法逐位一致靠一条约束：同一对块的强度仍按**旧写法的累加顺序**求和
+        （先词面、按 inv 的词序，再实体、按 ent_chunks 的顺序）——浮点和换了顺序会差
+        最后一位，并列名次就可能换人。自检 6c 拿旧写法当参考实现逐块比对。"""
         docs = self._bm25.tf
         inv = defaultdict(list)
         for i, d in enumerate(docs):
             for t in d:
                 inv[t].append(i)
         max_df = self._graph_df_cap()
-        link = defaultdict(float)
+        # groups[k] = (强度, 共享这组的块)；own[i] 按 inv 词序记块 i 所在的组号
+        groups = []
+        own = [[] for _ in docs]
         for t, ds in inv.items():
-            if not 2 <= len(ds) <= max_df:
-                continue
-            w = self._bm25.idf(t)
-            for a in range(len(ds)):
-                for b in range(a + 1, len(ds)):
-                    link[(ds[a], ds[b])] += w
+            if 2 <= len(ds) <= max_df:
+                k = len(groups)
+                groups.append((self._bm25.idf(t), ds))
+                for i in ds:
+                    own[i].append(k)
+        del inv
         # 实体边（2026.07.31，设计笔记候选 4 的可插拔槽）：词面代理的已知局限是
         # "同一件事换了说法就连不上"（没有共享字面词）；用户若花过 LLM 调用抽取
         # 实体（load_entities），共享同一实体的块在这里连边，强度用 idf 同款思路
@@ -444,19 +467,26 @@ class MemoryIndex:
         for i in sorted(self._entities):
             for e in self._entities[i]:
                 ent_chunks[e].append(i)
+        ent_own = defaultdict(list)
         for e, ds in ent_chunks.items():
             if len(ds) < 2:
                 continue
-            w = math.log(1.0 + self._bm25.N / len(ds))
-            for a in range(len(ds)):
-                for b in range(a + 1, len(ds)):
-                    link[(ds[a], ds[b])] += w
-        by_node = defaultdict(list)
-        for (a, b), s in link.items():
-            by_node[a].append((s, b))
-            by_node[b].append((s, a))
-        return {i: [j for _, j in sorted(v, key=lambda x: (-x[0], x[1]))][:self.graph_topK]
-                for i, v in by_node.items()}
+            k = len(groups)
+            groups.append((math.log(1.0 + self._bm25.N / len(ds)), ds))
+            for i in ds:
+                ent_own[i].append(k)
+        out = {}
+        for i in range(len(docs)):
+            acc = defaultdict(float)
+            for k in own[i] + ent_own.get(i, []):
+                w, ds = groups[k]
+                for j in ds:
+                    if j != i:
+                        acc[j] += w
+            if acc:
+                out[i] = [j for _, j in heapq.nsmallest(
+                    self.graph_topK, ((-s, j) for j, s in acc.items()))]
+        return out
 
     def prime_query_vectors(self, queries):
         """一次请求取回同一轮要用的几条查询向量，随后 _vector_scores 直接复用。
@@ -481,8 +511,21 @@ class MemoryIndex:
             if qv is None:
                 qv = self.provider.embed([query], is_query=True)[0]
             return [_dot(cv, qv) for cv in self._cvecs]
+        # 与 chunking_experiment.cosine 逐位相同：点积与平方和都是整数运算，
+        # 范数建库时已算好；块侧某键的计数先看差异项，没有再看 BM25 词频
         q = bigram_counts(query)
-        return [cosine(q, cc) for cc in self._ccounts]
+        na = math.sqrt(sum(v * v for v in q.values()))
+        out = []
+        for tf, diff, nb in self._ccounts:
+            if not na or not nb:
+                out.append(0.0)
+                continue
+            if diff is None:
+                dot = sum(v * tf[k] for k, v in q.items())
+            else:
+                dot = sum(v * (diff[k] if k in diff else tf[k]) for k, v in q.items())
+            out.append(dot / (na * nb))
+        return out
 
     def graph_neighbors(self, chunk_idx):
         """与 chunk_idx 关联的块索引，按链接强度降序（"望远镜"→"3.14约定"→
@@ -1994,6 +2037,81 @@ def _selftest(embed=False):
     r6 = idx_g.retrieve("设备", topN=3)
     ids6 = [x["id"] for x in r6]
     assert ids6[0] == 2 and set(ids6) == {2, 1, 3}, f"关联块该被图谱带进 topN，实际 {ids6}"
+    #    6c.【图谱逐块建邻居（2026.09.30 外部 OOM）】旧写法攒全局块对表当参考实现：
+    #        ①新写法逐块结果必须与它相同——夹具带实体边，并且把每第 7 块复制一份，
+    #        制造同分并列，让“按块号定并列名次”和“浮点和的累加顺序”都有机会暴露；
+    #        ②图谱这一步的 tracemalloc 峰值要在 2 MiB 以下。本夹具上参考实现约
+    #        4.8 MiB、新写法约 0.7 MiB（macOS arm64，Python 3.14.7）；把全局块对表
+    #        加回来这条必红。
+    import random
+    import tracemalloc
+
+    def _graph_by_global_pairs(ix):
+        docs = ix._bm25.tf
+        inv = defaultdict(list)
+        for i, d in enumerate(docs):
+            for t in d:
+                inv[t].append(i)
+        max_df = ix._graph_df_cap()
+        link = defaultdict(float)
+        for t, ds in inv.items():
+            if 2 <= len(ds) <= max_df:
+                w = ix._bm25.idf(t)
+                for a in range(len(ds)):
+                    for b in range(a + 1, len(ds)):
+                        link[(ds[a], ds[b])] += w
+        ent = defaultdict(list)
+        for i in sorted(ix._entities):
+            for e in ix._entities[i]:
+                ent[e].append(i)
+        for e, ds in ent.items():
+            if len(ds) >= 2:
+                w = math.log(1.0 + ix._bm25.N / len(ds))
+                for a in range(len(ds)):
+                    for b in range(a + 1, len(ds)):
+                        link[(ds[a], ds[b])] += w
+        by_node = defaultdict(list)
+        for (a, b), s in link.items():
+            by_node[a].append((s, b))
+            by_node[b].append((s, a))
+        return {i: [j for _, j in sorted(v, key=lambda x: (-x[0], x[1]))][:ix.graph_topK]
+                for i, v in by_node.items()}
+
+    rng6 = random.Random(7)
+    han6 = [chr(c) for c in range(0x4e00, 0x4e00 + 300)]
+    words6 = ["".join(rng6.choice(han6) for _ in range(3)) for _ in range(500)]
+    idx_gc = MemoryIndex()
+    for _ in range(300):
+        idx_gc.add("，".join(rng6.choice(words6) for _ in range(12)))
+    for i in range(0, 300, 7):
+        idx_gc.add(idx_gc.chunks[i])
+    idx_gc._entities = {i: {f"e{i % 5}", f"f{i % 11}"} for i in range(0, len(idx_gc.chunks), 3)}
+    idx_gc.build()
+    assert idx_gc._neighbors == _graph_by_global_pairs(idx_gc), \
+        "逐块建邻居必须与全局块对表写法逐块相同（含实体边与并列名次）"
+    tracemalloc.start()
+    idx_gc._build_graph()
+    _, graph_peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert graph_peak < 2 * 1024 * 1024, \
+        f"图谱建邻居峰值过高：{graph_peak / 1024 / 1024:.2f} MiB（全局块对表回来了？）"
+    #    6d.【余弦路共用 BM25 词频（2026.09.30 外部 OOM）】零依赖余弦分必须与
+    #        chunking_experiment.cosine 对整份 bigram_counts 的结果逐位相同——夹具有
+    #        纯中文、大小写混排（Latent／LATENT／latent 三种写法的计数不同）、只剩
+    #        一个字的块；纯小写的块必须直接共用 BM25 那份 Counter，不另存一份
+    idx_cs = MemoryIndex()
+    for t in ("山顶的约定说好要买望远镜", "Latent 部署在 VPS 上，LATENT 进程被杀",
+              "latent 的 api token 配好了", "Api Token 与 API 的写法", "啊", "", "望远镜 Telescope"):
+        idx_cs.add(t)
+    idx_cs.build()
+    for q in ("望远镜", "Latent API", "latent api token", "LATENT", "啊", "", "Tele"):
+        want = [cosine(bigram_counts(q), bigram_counts(c)) for c in idx_cs.chunks]
+        assert idx_cs._vector_scores(q) == want, f"余弦分与参考实现不同：{q!r}"
+    for i, c in enumerate(idx_cs.chunks):
+        if c == c.lower():
+            assert idx_cs._ccounts[i][0] is idx_cs._bm25.tf[i] and idx_cs._ccounts[i][1] is None, \
+                f"纯小写块 {i} 该直接共用 BM25 词频，不另存差异项"
+    assert idx_cs._df_cache is idx_cs._bm25.df, "文档频次只读共用，不另复制一份"
 
     # ---- recall_recent（换窗/压缩召回）----
     DAY = 86400.0

@@ -2188,6 +2188,12 @@ def line_starts_top_level(line):
 def _selftest():
     import tempfile
 
+    # 夹具要短、无软链的临时目录：macOS 默认的 /var/folders/…/T 本身就六十多字，产出目录拼上去
+    # 引导句必撞 100 字长度闸（产品规则，不为测试放宽）；/var 又是 /private/var 的软链，拿 resolve()
+    # 比的断言会平白红。Linux 的 /tmp 原样不变，Windows 不动。子进程经 TMPDIR 继承。
+    import os
+    if os.name == "posix" and os.path.isdir("/tmp"):
+        tempfile.tempdir = os.environ["TMPDIR"] = os.path.realpath("/tmp")
     # 0a.【venv 解释器不许被解析掉】venv 的 python 是软链接；resolve() 会跳到基础解释器，
     #    装在 venv 里的 jieba／fastembed 就找不到了。变异：加回 .resolve() → 这条红。
     with tempfile.TemporaryDirectory() as td:

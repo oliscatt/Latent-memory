@@ -35,6 +35,8 @@
 - GitHub Actions（`.github/workflows/release-checks.yml`）：在 Python 3.10、3.11、3.12 的 Linux 容器中先装 jieba，再运行全部公开自检，并保留 JSON 报告。
 - `latent_search` 的 `structuredContent` 带 `text`。
 - 换窗开场列出未解决事项时，提示模型“由你自己选择合适的时机提起”。
+- `LATENT_FACT_BACKFILL=off`：不把 `latent_fact_backfill` 给模型（已经有全量、不想让模型自己补拆时用）。
+- 自动浮现块路径的零依赖兜底：没装 jieba 时拿热词表对用户原句做子串匹配，不再整轮留空。热词表仍要在装了 jieba 的机器上用 `--build-hotwords` 生成，可以复制到零依赖机器上用；ready 响应的 `reasonCodes` 多一个 `substring_path`。装了 jieba 的部署行为不变。
 
 ### 破坏性变化
 
@@ -58,6 +60,8 @@
 - 工具数量与清单统一为八个（开 `--passive-recall` 时另有模型可见的 `latent_fact_backfill`）；
   显式工具白名单须包含 `latent_supersede`、`latent_cleanup` 与 `latent_unresolved`，漏配会静默
   少工具。
+- 零依赖建库的内存峰值：关系图谱改为逐块计算邻居，不再先攒全部块对再取前几名；余弦路与 BM25 共用同一份词频，只另存大小写不同的部分。检索结果不变，建库也更快。块数越多，峰值下降越明显。
+- 发布检查在 macOS 上 `memory_init.py`、`e2e_smoke.py` 自检误红：默认临时目录本身六十多字，拼出的引导句撞 100 字长度闸，且 `/var` 是软链。两份自检改用短而无软链的临时目录（macOS 为 `/private/tmp`，Linux 不变，Windows 不动），产品的长度闸不放宽。
 
 ### 文档
 
@@ -71,6 +75,8 @@
   sidecar 原位保留；旧语料只有 timeline、索引层为 0 时提供不重复写正文的补索引步骤。
 - 补充公网 IP 入站整体不可达时的 Cloudflare Tunnel 排查路线，以及 Persona 注入属于客户端
   或宿主职责、不能用“记忆能召回”反证人格文件已经注入的边界。
+- 《故障排查》新增“内存不够被系统杀掉、反复重启”：怎么确认、为什么会连成重启循环、用 systemd drop-in 限制内存并止住循环。
+- 《故障排查》同一节补本地 embedding 在小内存 VPS 上的做法：本机用同一模型建好向量缓存再拷上去；运行时仍要加载模型，内存紧的机器改走云端 embedding 或零依赖。
 
 ### 说明
 
