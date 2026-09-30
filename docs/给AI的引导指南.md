@@ -736,7 +736,7 @@ python <src路径>/mcp_server.py --doctor --corpus <TA的叙事语料目录> --i
 
 服务端这边有两件事要你做：
 
-- 在服务端所用的 Python 里 `pip install -r requirements-passive.txt`（jieba）。没装时服务照常启动，块路径（没有事实库时的默认取材方式）每轮都留空，原因码多为 `low_information`；事实模式不用 jieba，不受影响。
+- 在服务端所用的 Python 里 `pip install -r requirements-passive.txt`（jieba）。没装时服务照常启动；有热词表（可在装了 jieba 的机器上生成后复制过来，见《自动浮现宿主接入》）就退回子串匹配，ready 响应带 `substring_path`；连热词表也没有时块路径（没有事实库时的默认取材方式）每轮都留空，原因码多为 `low_information`；事实模式不用 jieba，不受影响。
 - 走 Streamable HTTP 时另配 `--hook-token`（或 `MEMORY_HTTP_HOOK_TOKEN`），与 `--token` 不同，只交给
   宿主 hook。不配时隐藏入口对所有凭证关闭，宿主 hook 调用会得到 `-32601`。走 stdio 时不需要它，
   但要确认宿主把 `latent_passive_recall` 从模型工具表里去掉了。

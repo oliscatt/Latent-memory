@@ -33,6 +33,7 @@ import json
 import re
 import subprocess
 import sys
+import os
 import tempfile
 import time
 from datetime import datetime, timezone
@@ -419,6 +420,11 @@ def _recv_response(sock):
 
 
 def _selftest():
+    # 夹具要短、无软链的临时目录：macOS 默认的 /var/folders/…/T 本身就六十多字，产出目录拼上去
+    # 引导句必撞 100 字长度闸（产品规则，不为测试放宽）；/var 又是 /private/var 的软链，拿 resolve()
+    # 比的断言会平白红。Linux 的 /tmp 原样不变，Windows 不动。子进程经 TMPDIR 继承。
+    if os.name == "posix" and os.path.isdir("/tmp"):
+        tempfile.tempdir = os.environ["TMPDIR"] = os.path.realpath("/tmp")
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
 
