@@ -6,6 +6,7 @@
 
 ### 新增
 
+- Claude Code 参考 hook `src/claude_code_hook.py`：`SessionStart` 调 `latent_session_start` 注入开场上下文；`UserPromptSubmit` 在 `LATENT_PASSIVE_RECALL=on` 时调隐藏入口，按历史保留模式注入（同一条记录每个会话一次，单轮 4000、单会话 40000 UTF-8 字节封顶，失败静默留空）。只用标准库，要求 Latent 以 Streamable HTTP 常驻。配法见《自动浮现》。
 - 实验性自动浮现宿主接入能力：参考宿主支持默认关闭、明确选择临时／历史保留模式、首个模型请求前调度与预算协调；服务端仅在显式 `--passive-recall` 时开放宿主隐藏入口。候选会经过输入预筛、当前范围短句许可、来源／冲突过滤、单事件线选择、上下文覆盖判断与候选级冷却；有效原文与修订会在预算允许时组装成非诱导的现场资料，并协调主动检索、失效与两种生命周期的交付账本。自动路径不改记忆正文、索引与账本，也不增加权重。`latent_append` 可选写入经过原文范围核验的触发词、短句许可、必要引用与确定性 revision，并可按同一 `recordId` 分阶段补齐；更正和精准清理会同步失效或移除辅助账本。旧库不要求迁移。已验证的宿主见《自动浮现》兼容性记录（目前是维护者自用环境下的 Claude Code `UserPromptSubmit` hook 与自建前端），每条只证明它自己那个宿主；真实宿主兼容、真实模型自然效果与实际成本仍需逐项采集。
 - 自动浮现事实模式：开了 `--passive-recall` 且配了事实库（`LATENT_PASSIVE_FACTS`，或语料目录旁 `事实库/` 下的 `全量-…`）时启用，完全替代块路径；按向量递出与用户原句最像的两条一句话事实，需要 `--embed`。同一条事实递出后冷却 12 小时，当天写入的事实次日起才浮现，撤回或被取代的记录拆出的事实不再递。冷却与事实向量缓存写在 `~/.cache/latent-passive-facts/`（`LATENT_PASSIVE_FACT_STATE_DIR` 可改），不在语料目录里。
 - `latent_fact_backfill`：开 `--passive-recall` 后出现的模型可见工具，分批领块、按随附规则拆成事实交回、服务端逐条校验并记进度，`finish` 后生成全量事实库并当场生效。

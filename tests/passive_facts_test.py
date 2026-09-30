@@ -429,6 +429,13 @@ class FactModeTests(unittest.TestCase):
             self.assertIn("收下 2 块、2 条事实", out)
             self.assertIn("全量事实库已生成", call({"action": "finish"}))
             self.assertIsNotNone(srv.passive.fact_index, "finish 后当场开启事实模式，不用重启")
+            # 事实向量在后台线程里算、算完写缓存到 state 目录；等它收尾再清临时目录，
+            # 否则 tearDown 删目录时撞上正在写的缓存文件（约 1/25 偶发 Directory not empty）
+            deadline = time.monotonic() + 10
+            while not (srv.passive.fact_index.ready or srv.passive.fact_index.error) \
+                    and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(srv.passive.fact_index.ready, srv.passive.fact_index.error)
         finally:
             if old is not None:
                 os.environ["LATENT_PASSIVE_FACTS"] = old
