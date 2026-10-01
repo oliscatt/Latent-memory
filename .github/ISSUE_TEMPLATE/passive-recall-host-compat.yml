@@ -12,7 +12,19 @@ body:
     id: commit
     attributes:
       label: Latent 完整 commit
-      description: 请填写 `git rev-parse HEAD` 的完整输出。
+      description: |
+        请填写 `git rev-parse HEAD` 的完整输出。
+
+        拿不到 git（例如下载的是压缩包、没有 `.git`）时，先从当初下载的原压缩包的归档注释里取，打出来的 40 位就是 commit：
+
+        ```bash
+        # tar.gz
+        python3 -c "import sys,tarfile;print(tarfile.open(sys.argv[1]).pax_headers.get('comment'))" <压缩包路径>
+        # zip
+        python3 -c "import sys,zipfile;print(zipfile.ZipFile(sys.argv[1]).comment.decode())" <压缩包路径>
+        ```
+
+        连原压缩包也没有了，就写“commit 未知（tar 快照，无 git）”，并附上 RELEASES.md 最新那段的日期和下载日期。
       placeholder: 40 位 commit
     validations:
       required: true

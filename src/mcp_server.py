@@ -14,7 +14,7 @@ MCP server 外壳参考实现（任务卡"MCP-server外壳"，规格 §9 未决�
 
 零依赖：不引 mcp SDK，stdlib 手写 JSON-RPC，跟本项目其余部分同风格。传输两条：
 stdio（默认，宿主拉起）与 Streamable HTTP（--http，2026.08.03 加，给只认 HTTP 的
-闭源前端直连，替掉 supergateway 桥——为什么与边界见 make_http_server 上面那段）。
+客户端直连，替掉 supergateway 桥——为什么与边界见 make_http_server 上面那段）。
 协议按官方规格 2025-06-18 实现（initialize / notifications/initialized /
 tools/list / tools/call，字段名与错误分层均照规格），**已查证不凭记忆写**。
 
@@ -47,7 +47,8 @@ stdio 只能由宿主拉起（手动 `nohup` 必崩）、懒加载每次调用�
   python mcp_server.py --corpus <md目录> --http 127.0.0.1:8765 --token <口令>  # HTTP 服务
   python mcp_server.py --doctor --corpus <md目录> [--threads <threads.jsonl>]  # 部署体检
 客户端配置（Claude Desktop 之类）里把上面第二条命令填成 server 启动命令即可；
-只认 HTTP 的客户端（Kelivo/Operit 这类）用第三条起服务、客户端里填地址与 token
+要走 HTTP 的客户端（只认远端地址的如 iOS 上的 Kelivo，或本机拉不起 stdio 的如
+proot 下的 Operit）用第三条起服务、客户端里填地址与 token
 （`--http` 的参数是 `[HOST:]PORT`，**省略 HOST 只绑回环、别的机器连不到**；
 公网仍要域名 + 反代管 TLS，见《快速上手》§3c 部署形态二）；
 配完接不上、或者不确定 --corpus 指对了没有时，把同一行参数换成 --doctor 跑一次
@@ -2181,8 +2182,8 @@ class MemoryServer:
 
 # ---------- HTTP 传输（Streamable HTTP，2026.08.03） ----------
 #
-# 为什么要有这条：闭源前端（Kelivo/Operit 这类）只认 Streamable HTTP，此前用户
-# 只能拿 npm 的 supergateway 把 stdio 桥一层。外部实测撞出来的四个坑全在桥上：
+# 为什么要有这条：只能挂工具的手机前端里，有的只认远端 Streamable HTTP（如 iOS 上的
+# Kelivo），有的本机拉不起 stdio（如 proot 下的 Operit），此前用户只能拿 npm 的 supergateway 把 stdio 桥一层。外部实测撞出来的四个坑全在桥上：
 # ① supergateway 服务端模式**没有任何入站鉴权**——latent_search 读全库、
 #    latent_append 可写入，端口被扫到记忆库就既可读又可写；
 # ② 默认 SSE 输出与客户端的 Streamable HTTP 不匹配（`Transport disconnected`）；
@@ -2190,7 +2191,7 @@ class MemoryServer:
 # ④ 常驻只在启动时读一次语料，手动加的 md 静默看不到。
 # 原生实现把四个一起治：鉴权内置且非回环裸跑直接拒绝起动、只说 Streamable HTTP、
 # 少一个常驻进程、语料变化自动重读（_reload_from_disk）。
-# 零依赖不破：http.server 是标准库。TLS 不在这做——闭源前端不认自签证书
+# 零依赖不破：http.server 是标准库。TLS 不在这做——这类前端不认自签证书
 # （两家独立实测），公网仍然要域名 + 反代（Caddy）那条路，反代顺手把 TLS 管了。
 #
 # 规格面（刻意做小，都是规格允许的服务器侧选择）：
@@ -6798,7 +6799,8 @@ if __name__ == "__main__":
                          "key 只从环境变量读；**语料会发到那家服务商**）")
     ap.add_argument("--http", metavar="[HOST:]PORT",
                     help="改走 Streamable HTTP（省略 HOST 默认 127.0.0.1）——给只认 "
-                         "HTTP 的客户端（Kelivo/Operit 这类）直连用，不再需要 "
+                         "HTTP 或本机拉不起 stdio 的客户端（如 Kelivo、proot 下的 "
+                         "Operit）直连用，不再需要 "
                          "supergateway 桥。非回环地址必须配 token，否则拒绝起动；"
                          "绑非回环还会多打一行 TLS 提醒——那条链路是裸 HTTP")
     ap.add_argument("--no-sse-stream", dest="sse_stream", action="store_false",

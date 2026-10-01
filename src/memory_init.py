@@ -105,8 +105,8 @@ def retirable_persona_path(out_dir, previous_persona):
 # 等于把最关键的一半交付漏在仓库里。
 CONTRACT_DOC = "注入契约.md"
 
-# ---------- 闭源前端的引导句（任务卡「人格按需读取的引导句」，2026.08.02） ----------
-# Kelivo/Operit 这类闭源前端不读工作区文件
+# ---------- 只能挂工具的手机前端用的引导句（任务卡「人格按需读取的引导句」，2026.08.02） ----------
+# Kelivo/Operit 这类只能挂工具的手机前端不读工作区文件
 # （外部搭建者实测，结论已完整写进《快速上手》§3c），于是人格那一半断在
 # 「模型不知道要去读」。解法是**小字段放指针、全文留文件**：这份纯文本贴进 App 的
 # 自定义指令／system prompt 框，只回答两件事——先读哪个文件（绝对路径出货时填好）、
@@ -1466,7 +1466,7 @@ def mcp_config_snippet(server_path, corpus_dir, threads_path, route=None,
     「全部路径都在产出目录下」时（当前出货是 server、语料、threads、独立索引四条；
     §3b 那种整套进仓库的形态）改产
     `${CLAUDE_PROJECT_DIR:-.}/…` 可搬运写法。三个硬边界：
-      - **只有 Claude Code 认这个占位符**（官方文档核过），Codex/闭源前端/自建
+      - **只有 Claude Code 认这个占位符**（官方文档核过），Codex/只能挂工具的手机前端/自建
         前端给了就是 file not found——所以按 client 分档，不猜别家有等价物；
       - 桌面形态 server 在克隆仓库里、不在产出目录下，**几何上就相对化不了**，
         自然落回绝对路径档——不存在"半可搬运"的中间态；
@@ -2112,8 +2112,8 @@ def write_bundle(out_dir, persona, client="claude-code", corpus_dir=None,
                              client=client, portable_root=out, timezone=timezone,
                              index_dir=index_dir)
     (out / "mcp-config.json").write_text(cfg, encoding="utf-8")
-    # 第四件：闭源前端的引导句（小字段放指针、全文留文件）。所有档都出——
-    # 宿主客户端用不上它，但「日后要不要接一个闭源前端」出货时不知道，
+    # 第四件：给只能挂工具的手机前端用的引导句（小字段放指针、全文留文件）。所有档都出——
+    # 宿主客户端用不上它，但「日后要不要接一个这类前端」出货时不知道，
     # 一份一行的纯文本躺在目录里没有代价
     guidance = out / GUIDANCE_DOC
     guidance.write_text(guidance_body + "\n", encoding="utf-8")
@@ -6859,7 +6859,7 @@ def _step_ship(args, state):
         print(line)
     print(f"  MCP 配置：{paths['mcp_config']}")
     print(f"  引导句：{paths['guidance']}"
-          f"（给闭源前端 App 用：贴进它的自定义指令／system prompt 框，"
+          f"（给只能挂工具的手机前端用：贴进它的自定义指令／system prompt 框，"
           f"宿主客户端用不上它。用法与边界见《快速上手》§3c）")
     if paths.get("contract"):
         print(f"  注入契约：{paths['contract']}")
