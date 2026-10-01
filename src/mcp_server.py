@@ -1708,7 +1708,11 @@ class MemoryServer:
         except ValueError as e:
             raise ToolError(str(e))
         old_record_id = _chunk_key(self.index.chunks[old_idx])
-        msg = ("已撤回那段旧记录：检索不会再返回它（原文件保留，撤回原因入账可追溯）。"
+        # 推荐索引摘要跟随正文一起退出检索（retract 内已处理）；回执如实报条数（issue #39）
+        followers = self.index._index_followers(old_idx)
+        follow_note = (f"，它的 {len(followers)} 条索引摘要也一并退出检索" if followers else "")
+        msg = (f"已撤回那段旧记录：检索不会再返回它{follow_note}"
+               "（原文件保留，撤回原因入账可追溯）。"
                f" retractionStatus=applied；旧 recordId={old_record_id} 的 passiveStatus=invalidated。")
         if correction:
             if self.corpus_dir is None:
@@ -2103,7 +2107,7 @@ class MemoryServer:
             result = {"content": [{"type": "text", "text": str(e)}], "isError": True}
             # isError 只说明调用整体失败，不代表撤回／清理等前置状态没有生效。
             if self.passive is not None and self.index is not None and name != PASSIVE_RECALL_TOOL:
-                result["structuredContent"] = {"passiveRecall": self.passive.inspect()}
+                result["structuredContent"] = self._ledger_with_text(str(e))
             return self._ok(mid, result)
         except Exception as e:
             # 最终错误边界：不让工具内部异常冲破 HTTP/stdio，客户端只看见空白。
@@ -2113,18 +2117,32 @@ class MemoryServer:
                        "而是工具执行异常；请查看服务端日志并检查相关文件与配置。")
             result = {"content": [{"type": "text", "text": message}], "isError": True}
             if self.passive is not None and self.index is not None and name != PASSIVE_RECALL_TOOL:
-                result["structuredContent"] = {"passiveRecall": self.passive.inspect()}
+                result["structuredContent"] = self._ledger_with_text(message)
             return self._ok(mid, result)
         if isinstance(payload, dict) and isinstance(payload.get("text"), str):
             result = {"content": [{"type": "text", "text": payload["text"]}],
                       "isError": False}
             if isinstance(payload.get("structuredContent"), dict):
-                result["structuredContent"] = payload["structuredContent"]
+                structured = payload["structuredContent"]
+                if name != PASSIVE_RECALL_TOOL:
+                    # 模型可见工具：structuredContent 也必须带完整正文（issue #33）
+                    structured = dict(structured, text=payload["text"])
+                result["structuredContent"] = structured
             return self._ok(mid, result)
         result = {"content": [{"type": "text", "text": payload}], "isError": False}
         if self.passive is not None and self.index is not None and name != PASSIVE_RECALL_TOOL:
-            result["structuredContent"] = {"passiveRecall": self.passive.inspect()}
+            result["structuredContent"] = self._ledger_with_text(payload)
         return self._ok(mid, result)
+
+    def _ledger_with_text(self, text):
+        """模型可见工具的 structuredContent：交付账本＋与 content 逐字相同的正文。
+
+        issue #33：Claude Code（2.1.284，`claude -p`）在结果带 structuredContent 时只把它交给
+        模型，content 被丢掉；只放 passiveRecall 账本，模型看到的就是一份空账、回执全丢。
+        MCP 规范要求带结构化结果的工具同时给 TextContent（这里一直有），反过来让
+        structuredContent 自带 text，两种消费路径都看得到正文——与 latent_search 同一做法。
+        隐藏宿主入口不走这里：它只给宿主凭证，结构就是候选本身。"""
+        return {"passiveRecall": self.passive.inspect(), "text": text}
 
     @staticmethod
     def _ok(mid, result):
@@ -3641,8 +3659,152 @@ def _selftest_search_visible_body():
     print("selftest 搜索正文可见：通过（中性双记录、正文与来源编号）")
 
 
+def _selftest_structured_text_every_tool(now=1_800_000_000.0):
+    """issue #33：开自动浮现后，每个模型可见工具的 structuredContent 都要带与 content 相同的正文。
+
+    判据（先写后跑）：从 tools/list（普通凭证，不含隐藏入口）逐个工具各调一次“正常”与一次
+    “空参数”；凡结果带 structuredContent，其 `text` 必须与 content[0].text 逐字相同。
+    session_start、append、fact_backfill 三个正常调用必须真的带了 structuredContent，
+    否则这条判据没咬到 issue 里那几个工具（夹具没开自动浮现时会静默全绿）。
+    采集条件：stdlib 服务端、临时双层语料、零依赖检索、不配 --embed。"""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        corpus, index_dir = Path(td) / "corpus", Path(td) / "index"
+        corpus.mkdir()
+        index_dir.mkdir()
+        source_dirs, loader = make_corpus_loader(corpus, index_dir)
+        srv = MemoryServer(index=loader(), thread_store=ThreadStore(), corpus_dir=corpus,
+                           index_dir=index_dir, source_dirs=source_dirs, loader=loader,
+                           retractions_path=corpus / ".retractions.json",
+                           supersessions_path=corpus / ".supersessions.json",
+                           enable_passive_recall=True)
+        def call(name, args):
+            return srv.handle({"jsonrpc": "2.0", "id": 33, "method": "tools/call",
+                               "params": {"name": name, "arguments": args}}, now=now)["result"]
+        appended = call("latent_append", {
+            "text": "结构化验证用的灯罩是橙色的。", "current_state": "虚构验证数据",
+            "indexEvidence": [{"type": "state", "quote": "结构化验证用的灯罩是橙色的"}]})
+        record_id = re.search(r"recordId=([0-9a-f]{16})", appended["content"][0]["text"]).group(1)
+        normal = {
+            "latent_search": {"query": "灯罩是什么颜色"},
+            "latent_session_start": {},
+            "latent_append": {"text": "结构化验证用的台灯放在窗边。",
+                              "current_state": "虚构验证数据"},
+            "latent_supersede": {"supersedes": record_id, "text": "结构化验证用的灯罩换成了白色。",
+                                 "current_state": "虚构验证数据", "mode": "preflight"},
+            "latent_correct": {"quote": "结构化验证用的台灯放在窗边", "reason": "虚构验证"},
+            "latent_cleanup": {"recordId": record_id, "action": "preview"},
+            "latent_unresolved": {"action": "none"},
+            "latent_thread_close": {"summary": "结构化验证收尾。", "current_state": "虚构验证数据"},
+            FACT_BACKFILL_TOOL: {"action": "status"},
+        }
+        tools = [t["name"] for t in srv.handle(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})["result"]["tools"]]
+        assert PASSIVE_RECALL_TOOL not in tools and FACT_BACKFILL_TOOL in tools, tools
+        assert set(tools) == set(normal), f"新增工具要补进这条判据：{sorted(set(tools) ^ set(normal))}"
+        must_carry = {"latent_session_start", "latent_append", FACT_BACKFILL_TOOL}
+        carried = set()
+        for name in tools:
+            for is_normal, args in ((True, normal[name]), (False, {})):
+                result = call(name, args)
+                structured = result.get("structuredContent")
+                if structured is None:
+                    continue
+                assert structured.get("text") == result["content"][0]["text"], \
+                    f"{name} 的 structuredContent 缺正文或与 content 不一致：{structured}"
+                if is_normal and not result["isError"]:
+                    carried.add(name)
+        assert must_carry <= carried, \
+            f"夹具没咬到 issue #33 点名的工具（正常调用未带 structuredContent）：{must_carry - carried}"
+    print("selftest 结构化正文：通过（每个模型可见工具 structuredContent.text 与 content 一致）")
+
+
+def _selftest_retract_index_followers(now=1_800_000_000.0):
+    """issue #39：latent_correct 撤回某条记录时，它自己的推荐索引摘要也要退出检索。
+
+    判据（先写后跑，按 issue 复现原样）：A 带 indexEvidence 写入 → correct 撤回 A 并写更正 B →
+    ① latent_search 不再返回 A 的正文、index 摘要或 recordId；② 回执如实说出摘要条数；
+    ③ 换窗召回（recall_recent）与 session_start 不再端出 A；④ 重启（从盘上重建并接回撤回账本）
+    后同样成立；⑤ 只含摘要原句（不带句号、正文与摘要同时命中）的 quote 不算“多条歧义”；
+    ⑥ B 可以按 recordId 补自己的索引并被检索到。采集条件：stdlib 服务端、临时双层语料、零依赖检索。"""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        corpus, index_dir = Path(td) / "corpus", Path(td) / "index"
+        corpus.mkdir()
+        index_dir.mkdir()
+        source_dirs, loader = make_corpus_loader(corpus, index_dir)
+        mk = lambda: MemoryServer(index=loader(), thread_store=ThreadStore(), corpus_dir=corpus,
+                                  index_dir=index_dir, source_dirs=source_dirs, loader=loader,
+                                  retractions_path=corpus / ".retractions.json",
+                                  supersessions_path=corpus / ".supersessions.json")
+        srv = mk()
+        def call(server, name, args, at):
+            return server.handle({"jsonrpc": "2.0", "id": 39, "method": "tools/call",
+                                  "params": {"name": name, "arguments": args}}, now=at)["result"]
+        # 无关填充：区分性词面上限是 max(3, N//5) 块（撤回块仍计入 df），A、A 摘要、B、
+        # B 摘要四块都含“帐篷”，库太小时它不算区分性词面、检索整体留空，
+        # 下面“不再返回 A”就成了空转判据。16 条填充让 N≥20。
+        for filler in ("周末去河边公园散步，看见两只白鹭。", "阁楼那台天文镜换了目镜。",
+                       "厨房的咖啡机换了保险丝。", "阳台的薄荷又发了新芽。",
+                       "楼下面包店周三休息。", "自行车后胎补过一次。", "书架第二层放旧杂志。",
+                       "冰箱里的酸奶下周过期。", "邻居家的狗叫豆豆。", "雨伞落在了地铁上。",
+                       "台灯的灯泡换成了暖光。", "楼道的感应灯坏了。", "网球拍重新穿了线。",
+                       "花瓶里插了几枝桂花。", "电饭煲的内胆有划痕。", "钥匙扣是一只小鲸鱼。"):
+            call(srv, "latent_append", {"text": filler, "current_state": "虚构填充"}, now - 100)
+        appended = call(srv, "latent_append", {
+            "text": "验证用帐篷是蓝色的。", "current_state": "虚构验证数据",
+            "indexEvidence": [{"type": "state", "quote": "验证用帐篷是蓝色的"}]}, now)
+        text_a = appended["content"][0]["text"]
+        assert "indexStatus=indexed" in text_a, text_a
+        id_a = re.search(r"recordId=([0-9a-f]{16})", text_a).group(1)
+        assert list(index_dir.rglob(f"*_record_{id_a}_item_01.md")), "夹具：A 的索引摘要应已落盘"
+        corrected = call(srv, "latent_correct", {
+            "quote": "验证用帐篷是蓝色的。", "reason": "虚构验证：颜色记错了",
+            "correction": "验证用帐篷其实是绿色的。", "current_state": "虚构验证数据"}, now + 10)
+        receipt = corrected["content"][0]["text"]
+        assert corrected["isError"] is False and "retractionStatus=applied" in receipt, receipt
+        assert "1 条索引摘要也一并退出检索" in receipt, f"回执要如实报出跟着退出的摘要条数：{receipt}"
+        id_b = re.search(r"新 recordId=([0-9a-f]{16})", receipt).group(1)
+
+        def assert_gone(server, label):
+            res = call(server, "latent_search", {"query": "验证用帐篷是什么颜色", "topN": 8}, now + 20)
+            body = res["content"][0]["text"]
+            assert res["isError"] is False and id_b in body, f"{label}：检索应照常返回更正 B：{body}"
+            assert "蓝色" not in body and id_a not in body, f"{label}：检索仍返回被撤回的 A：{body}"
+            recent = server.index.recall_recent(topN=20, now=now + 20)
+            assert all(r["meta"].get("record_id") != id_a and "蓝色" not in r["text"]
+                       for r in recent), f"{label}：换窗召回仍端出 A 的块"
+            opening = call(server, "latent_session_start", {}, now + 20)["content"][0]["text"]
+            assert "蓝色" not in opening, f"{label}：session_start 仍端出 A：{opening}"
+        assert_gone(srv, "撤回当场")
+        assert_gone(mk(), "重启后")
+
+        backfill = call(srv, "latent_append", {
+            "recordId": id_b,
+            "indexEvidence": [{"type": "event", "quote": "验证用帐篷其实是绿色的"}]}, now + 30)
+        assert backfill["isError"] is False and "indexStatus=indexed" in backfill["content"][0]["text"], \
+            f"更正 B 必须能按 recordId 补自己的索引：{backfill}"
+        found_b = call(srv, "latent_search", {"query": "验证用帐篷是什么颜色", "topN": 8}, now + 31)
+        body_b = found_b["content"][0]["text"]
+        assert "绿色" in body_b and f"_record_{id_b}_item_01" in body_b and "蓝色" not in body_b, body_b
+
+    # ⑤ 摘要是从正文逐字摘的：quote 同时命中正文和它自己的摘要，按一条记录撤回
+    idx = MemoryIndex()
+    idx.add("## 记录\n验证用水壶是黄色的。", {"layer": "timeline"})
+    rid = idx.meta[0]["record_id"]
+    idx.add("**2026.10.01** · 原文证据索引\n状态：验证用水壶是黄色的",
+            {"layer": "index", "record_id": rid, "record_id_aliases": [rid]})
+    idx.add("## 别的记录\n验证用水杯是白色的。", {"layer": "timeline"})
+    idx.build()
+    hit, _ = idx.retract("验证用水壶是黄色的", "虚构验证")
+    assert hit == 0 and idx.retracted == {0, 1}, f"正文与它自己的摘要要一起撤、且不算歧义：{idx.retracted}"
+    print("selftest 撤回带走索引摘要：通过（检索、换窗召回、session_start、重启、补更正索引）")
+
+
 def _selftest():
     _selftest_search_visible_body()
+    _selftest_structured_text_every_tool()
+    _selftest_retract_index_followers()
     now = 1_800_000_000.0
     srv = _build_server(now)
 

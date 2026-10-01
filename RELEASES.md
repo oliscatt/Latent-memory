@@ -2,6 +2,13 @@
 
 这里记录公开版本对用户可见的变化。内部任务史、私人复测记录和未发布实验不写进本文件。
 
+## 2026-10-01
+
+### 修复
+
+- `latent_correct` 撤回一条记录时，这条记录写入时带的索引摘要（文件名带同一 `recordId`）也一起退出检索、换窗召回与自动浮现，重启后同样生效；此前摘要仍会以 `status=current` 把旧值带回来。回执会报出跟着退出的摘要条数。`quote` 同时命中正文和它自己的摘要时按一条记录处理，不再报“命中了 2 条”。
+- 开 `--passive-recall` 后，所有模型可见工具（不只是 `latent_search`）的 `structuredContent` 都带与正文相同的 `text`，出错时也一样。有的宿主（例如 Claude Code）在结果带 `structuredContent` 时只把它交给模型，此前模型只能看到一份空的交付账本，`latent_session_start`、`latent_append`、`latent_fact_backfill` 等的回执都看不到。
+
 ## 2026-09-30
 
 ### 新增

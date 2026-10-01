@@ -1078,6 +1078,12 @@ class MemoryIndex:
         quote = quote.strip()
         matches = [i for i, c in enumerate(self.chunks)
                    if quote in c and i not in self.retracted]
+        # 推荐索引摘要逐字摘自正文，quote 同时命中正文和它自己的摘要是常态；
+        # 摘要跟随正文撤回（issue #39），所以只按正文计数，不把这当成“多条歧义”。
+        followers = {j for i in matches
+                     if self.meta[i].get("layer", "timeline") == "timeline"
+                     for j in self._index_followers(i)}
+        matches = [i for i in matches if i not in followers]
         if not matches:
             raise ValueError("没有找到包含这段原文的记录（或它已被撤回）。"
                              "quote 要从 latent_search 返回的原文里逐字摘，别转述。")
@@ -1088,6 +1094,9 @@ class MemoryIndex:
         now = time.time() if now is None else now
         self.retracted.add(i)
         self.weights[i] = 1.0        # 权重归位：误召回攒的命中数是错误信号，不留
+        for j in self._index_followers(i):
+            self.retracted.add(j)
+            self.weights[j] = 1.0
         self.retraction_log[_chunk_key(self.chunks[i])] = {
             "reason": reason.strip(), "time": now,
             "source": self.meta[i].get("source"), "heading": self.meta[i].get("heading"),
@@ -1124,7 +1133,36 @@ class MemoryIndex:
             if _chunk_key(c) in self.retraction_log:
                 self.retracted.add(i)
                 n += 1
+        # 账本只记正文哈希；推荐索引摘要按文件名里的来源 recordId 跟着退出检索，
+        # 重启／重建后也一样（issue #39）。不计入 n：n 是账本命中的记录数。
+        for i in list(self.retracted):
+            if self.meta[i].get("layer", "timeline") == "timeline":
+                self.retracted.update(self._index_followers(i))
         return n
+
+    def _index_followers(self, chunk_idx):
+        """某条 timeline 正文的推荐索引摘要（文件名带 `_record_<recordId>_`）的块下标。
+
+        撤回的是“这条记录”，它的摘要是从同一条正文逐字摘出来的，同样从未真实过；
+        只撤正文、留摘要，检索仍会以 status=current 把旧值端回来（issue #39）。
+        没有来源 recordId 的老 index 用自身哈希作 ID，不会被误认成跟随者。
+        `--index-dir` 目录不叫 index 时这些文件会被 layer_of 判成叙事层、record_id 退成
+        自身哈希，所以再按文件名里的来源 recordId 认一遍，不只靠 layer。"""
+        if self.meta[chunk_idx].get("layer", "timeline") != "timeline":
+            return []
+        meta = self.meta[chunk_idx]
+        ids = set(meta.get("record_id_aliases") or ()) | {
+            meta.get("record_id"), _chunk_key(self.chunks[chunk_idx])}
+        ids.discard(None)
+        out = []
+        for j, m in enumerate(self.meta):
+            if j == chunk_idx:
+                continue
+            named = _SOURCE_RECORD_RE.search(str(m.get("source") or ""))
+            if (m.get("layer") == "index" and m.get("record_id") in ids) \
+                    or (named and named.group(1).lower() in ids):
+                out.append(j)
+        return out
 
     # ---------- 事实变迁与双向追溯 ----------
 
