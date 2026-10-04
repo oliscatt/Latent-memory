@@ -124,6 +124,11 @@ GRAPH_RRF_K = 5
 # 的教训——先把它是什么写清楚，别假装它被调过）：它只需要够低到把平方项压住、
 # 又够高到在 N ≤ 320 时完全不生效。
 GRAPH_DF_CAP = 64
+# 增量写入的校准阈值：自上次整库 build 以来
+# 增量写入的块数 ≥ 50，或 ≥ 全库 2.5%，任一满足就从盘上整库校准。依据是 B 步量出的漂移
+# 曲线：真实语料 50 块（2.5%）时 top-5 全同 0.975、overlap@10 0.988，仍过判据。
+CALIBRATE_MIN_NEW = 50
+CALIBRATE_RATIO = 0.025
 
 # 真 embedding 路径（--embed）的可靠命中门槛（2026.08.01 实测定的）。
 #
@@ -300,6 +305,16 @@ def _load_plugins():
         plugin.register(module)
 
 
+def _ccount_entry(text, tf):
+    """余弦路一块的条目 (BM25 词频, 差异项或 None, 范数)。整库 build 与增量写入共用这一份。"""
+    if text == text.lower():
+        diff, cc = None, tf
+    else:
+        cc = bigram_counts(text)
+        diff = {k: cc[k] for k in cc.keys() | tf.keys() if cc[k] != tf[k]} or None
+    return (tf, diff, math.sqrt(sum(v * v for v in cc.values())))
+
+
 class MemoryIndex:
     """记忆检索索引：add 片段 → build → retrieve。权重随命中浮沉（用进废退）。"""
 
@@ -337,9 +352,7 @@ class MemoryIndex:
         self.graph_topK = graph_topK
         self.graph_seeds = graph_seeds
         self.chunks, self.meta, self.weights = [], [], []
-        self._bm25 = self._cvecs = self._ccounts = None
-        self._df_cache = {}
-        self._neighbors = {}
+        self._release_structures()
         # 撤回集（2026.07.31 验收反馈"记错以后怎么办"闭环）：被撤回的块不再被
         # retrieve/recall 返回，但原文件与 chunks 本体都不动——时间线是档案，
         # 不销毁；退出的只是检索可见性。撤回账本按内容哈希持久化（同权重先例）
@@ -393,6 +406,22 @@ class MemoryIndex:
         return frozenset(hidden)
 
     def build(self):
+        # 原地重建先放掉旧结构再建新的，否则峰值是“旧＋新”（issue #36）。
+        # 中途抛错时全部置空再上抛：宁可检索报错，也不留半新半旧的结构照常出结果。
+        self._release_structures()
+        try:
+            return self._build_structures()
+        except BaseException:
+            self._release_structures()
+            raise
+
+    def _release_structures(self):
+        self._bm25 = self._cvecs = self._ccounts = None
+        self._df_cache = {}
+        self._neighbors = {}
+        self.pending_new = 0
+
+    def _build_structures(self):
         self._bm25 = BM25(tokenize(c) for c in self.chunks)
         if self.embed:
             # 块向量：缓存里有的不重算（见 embedding_provider.VectorCache）。
@@ -405,18 +434,54 @@ class MemoryIndex:
             # 不 lower）。整份另存一遍在 5039 块语料上约 188 MiB，所以只存差异项：
             # 每块记 (BM25 词频, 差异项或 None, 范数)，没有大写字母的块差异项必为 None。
             # 差异项里的 0 表示“余弦路没有这个键”。打分见 _vector_scores。
-            self._ccounts = []
-            for c, tf in zip(self.chunks, self._bm25.tf):
-                if c == c.lower():
-                    diff, cc = None, tf
-                else:
-                    cc = bigram_counts(c)
-                    diff = {k: cc[k] for k in cc.keys() | tf.keys() if cc[k] != tf[k]} or None
-                self._ccounts.append((tf, diff, math.sqrt(sum(v * v for v in cc.values()))))
+            self._ccounts = [_ccount_entry(c, tf) for c, tf in zip(self.chunks, self._bm25.tf)]
         self._neighbors = self._build_graph()
         # 文档频次，供 query_miss_rate 用；只读，直接共用 BM25 那份，不另复制
         self._df_cache = self._bm25.df
+        self.pending_new = 0
         return self
+
+    def needs_calibration(self):
+        """自上次整库 build 以来的增量块数是否到了校准阈值（见 CALIBRATE_MIN_NEW）。"""
+        return (self.pending_new >= CALIBRATE_MIN_NEW
+                or self.pending_new >= CALIBRATE_RATIO * len(self.chunks))
+
+    def add_incremental(self, text, meta):
+        """增量写入一块（增量构建卡第三之二节）：只碰新块，不整库 build。
+
+        即时更新：BM25 词频、df、N、avgdl（idf 每次检索按它们现算，所以不陈旧），余弦条目
+        或块向量，以及**新块自己**的邻居（按写入这一刻的 df 与显著词上限）。旧块的邻居表
+        不动，等校准。漂移只来自这一处，B 步量过；到阈值由调用方整库校准。
+        邻居要扫一遍全库词频表找共享显著词，代价随块数线性，但远小于整库 build；
+        不常驻倒排表，换的是不多占内存。"""
+        self.add(text, meta)
+        i, bm = len(self.chunks) - 1, self._bm25
+        tf = Counter(tokenize(text))
+        bm.tf.append(tf)
+        bm.doc_lengths.append(sum(tf.values()))
+        bm.df.update(tf.keys())
+        bm.N = len(bm.tf)
+        bm.avgdl = sum(bm.doc_lengths) / bm.N        # 与整库 build 同一个整数和、同一次除法
+        if self.embed:
+            cache = (VectorCache(self.cache_path, self.provider.id)
+                     if self.cache_path else None)
+            self._cvecs.append(embed_with_cache(self.provider, [text], cache)[0])
+        else:
+            self._ccounts.append(_ccount_entry(text, tf))
+        cap = self._graph_df_cap()
+        shared = [(t, bm.idf(t)) for t in tf if 2 <= bm.df[t] <= cap]
+        acc = {}
+        for j in range(i):
+            tf_j, s = bm.tf[j], 0.0
+            for t, w in shared:
+                if t in tf_j:
+                    s += w
+            if s:
+                acc[j] = s
+        if acc:
+            self._neighbors[i] = [j for _, j in heapq.nsmallest(
+                self.graph_topK, ((-s, j) for j, s in acc.items()))]
+        self.pending_new += 1
 
     def _build_graph(self):
         """第三层·关系图谱（零依赖词面代理版）：共享"显著词"的块相连。
@@ -1218,39 +1283,83 @@ class MemoryIndex:
                 self.superseded.add(i)
         return len(records)
 
-    def supersession_plan(self, old_record_id, new_record_id, now=None):
-        """校验一次 current→new 变迁并返回新版账本数据，不修改内存。"""
+    def _timeline_matches(self, record_id):
+        return [i for i, meta in enumerate(self.meta)
+                if meta.get("layer", "timeline") == "timeline"
+                and record_id in meta.get("record_id_aliases", [meta.get("record_id")])]
+
+    def supersession_plan(self, old_record_id, new_record_id, now=None, link_only=False):
+        """校验一次 current→new 变迁并返回新版账本数据，不修改内存。
+
+        link_only：新记录已经用 latent_append 写进库了，只补这一段链（只补链模式），
+        这时新记录必须已存在；否则新记录必须还不存在（随这次变迁一起写入）。"""
         if not isinstance(old_record_id, str) or not re.fullmatch(r"[0-9a-f]{16}", old_record_id):
             raise ValueError("supersedes 必须是 latent_search／latent_append 返回的 16 位 recordId")
-        old = [i for i, meta in enumerate(self.meta)
-               if meta.get("layer", "timeline") == "timeline"
-               and old_record_id in meta.get("record_id_aliases", [meta.get("record_id")])]
+        old = self._timeline_matches(old_record_id)
         if len(old) != 1:
             reason = "没有找到" if not old else "找到多条"
-            raise ValueError(f"按 supersedes={old_record_id} {reason} timeline 记录，拒绝猜测")
+            raise ValueError(f"按 supersedes={old_record_id} {reason} timeline 记录，拒绝猜测；"
+                             "请先 latent_search 核对旧记录的 recordId")
         if old[0] in self.retracted:
             raise ValueError("目标记录已经被 correct 撤回，不能再作为真实历史被取代")
         old_entry = self.supersession_log.get(old_record_id, {})
         if old_entry.get("status", "current") != "current" or old_entry.get("superseded_by"):
             raise ValueError("目标记录已经被后续事实取代；请沿 superseded_by 使用当前链尾")
         if old_record_id == new_record_id:
-            raise ValueError("新旧 recordId 相同，不能建立自指变迁")
-        if any(meta.get("layer", "timeline") == "timeline"
-               and meta.get("record_id") == new_record_id for meta in self.meta):
-            raise ValueError("新事实与现有 timeline 记录重复，拒绝建立歧义链")
-        at = time.time() if now is None else now
+            raise ValueError("新旧 recordId 相同，不能建立自指变迁；请核对 supersedes 和 by 是不是填重了")
         records = json.loads(json.dumps(self.supersession_log, ensure_ascii=False))
+        at = time.time() if now is None else now
+        if link_only:
+            new = self._timeline_matches(new_record_id)
+            if len(new) != 1:
+                reason = "没有找到" if not new else "找到多条"
+                raise ValueError(f"按 by={new_record_id} {reason} timeline 记录；by 要填 latent_append "
+                                 "回执里新记录的 recordId（索引摘要不算）")
+            if new[0] in self.retracted:
+                raise ValueError("by 指向的记录已经被 correct 撤回，不能拿它取代旧记录")
+            previous = records.get(new_record_id, {}).get("supersedes")
+            if previous:
+                raise ValueError(f"by={new_record_id} 已经取代了 {previous}，一条记录只能直接取代一条；"
+                                 "若旧记录也该退场，请把它接在链尾上")
+            if new_record_id in self.chain_record_ids(old_record_id):
+                raise ValueError(f"by={new_record_id} 本来就在 supersedes={old_record_id} 的上游，"
+                                 "补这段链会成环；请核对两条哪条是新的")
+            new_copy = dict(records.get(new_record_id, {}))
+            new_copy.setdefault("status", "current")
+            new_copy.setdefault("superseded_by", None)
+            new_copy.setdefault("recorded_at", self.meta[new[0]].get("timestamp"))
+            new_copy["supersedes"] = old_record_id
+        else:
+            if any(meta.get("layer", "timeline") == "timeline"
+                   and meta.get("record_id") == new_record_id for meta in self.meta):
+                raise ValueError("新事实与现有 timeline 记录重复，拒绝建立歧义链")
+            new_copy = {"status": "current", "supersedes": old_record_id,
+                        "superseded_by": None, "recorded_at": at}
         old_copy = dict(records.get(old_record_id, {}))
         old_copy.update({"status": "superseded", "superseded_by": new_record_id,
                          "superseded_at": at})
         old_copy.setdefault("supersedes", None)
         old_copy.setdefault("recorded_at", self.meta[old[0]].get("timestamp"))
         records[old_record_id] = old_copy
-        records[new_record_id] = {
-            "status": "current", "supersedes": old_record_id,
-            "superseded_by": None, "recorded_at": at,
-        }
+        records[new_record_id] = new_copy
         return {"version": 1, "records": records}
+
+    # ---------- 写入端旧记录提示（#45 第 2 步） ----------
+
+    def record_similarities(self, idx):
+        """块 idx 与每一块的相似度，只用现成向量、不发请求：向量档是块向量点积，零依赖档是字符 bigram 余弦。"""
+        if self.embed:
+            v = self._cvecs[idx]
+            return [_dot(cv, v) for cv in self._cvecs]
+        return self._vector_scores(self.chunks[idx])
+
+    def supersede_pool(self, idx):
+        """写入端提示的比较对象：现行的 timeline 记录，去掉 idx 自己和与它同文的块。"""
+        rid = self.meta[idx].get("record_id")
+        skip = self.retracted | self.superseded | set(self.hidden_indices())
+        return [i for i, meta in enumerate(self.meta)
+                if i != idx and i not in skip and meta.get("layer", "timeline") == "timeline"
+                and meta.get("record_id") != rid]
 
     def chain_record_ids(self, record_id):
         """从链中任一 recordId 返回 root→current 的完整有序 ID。"""
@@ -1426,6 +1535,19 @@ def annotate_block(block, rate, threshold=None):
 def _chunk_key(text):
     """权重持久化的键：chunk 文本的内容哈希（md5 前 16 位，非安全用途）。"""
     return hashlib.md5(text.encode("utf-8")).hexdigest()[:16]
+
+
+def pick_supersede_hint(scored, min_score, lead):
+    """写入端旧记录提示选哪几条。scored 是按分数降序的 [(分数, 块下标)]。
+
+    第一名 ≥ min_score 且领先第二名 ≥ lead：给第一名；前两名都 ≥ min_score、一起领先第三名 ≥ lead：
+    给前两名；否则不给。宁可漏提示，也不满屏误报——分不开的就不提。不足三名的位置按 0 分算。"""
+    s = [score for score, _ in scored[:3]] + [0.0] * 3
+    if s[0] >= min_score and s[0] - s[1] >= lead:
+        return scored[:1]
+    if s[1] >= min_score and s[1] - s[2] >= lead:
+        return scored[:2]
+    return []
 
 
 def _record_id_aliases(text):
@@ -1774,54 +1896,67 @@ def load_corpus(corpus_dir, embed=False, recursive=True, provider=None, cache_pa
     for p in files:
         raw[p] = (p.read_text(encoding="utf-8"), p.stat().st_mtime)
     date_order = infer_date_order([t for t, _ in raw.values()])
-    file_info = {}
-    for p in files:
-        text, mtime = raw[p]
-        head = "\n".join(_head_lines(text))
-        ts, ts_source = parse_chunk_timestamp(p.name, head,
-                                              datetime.fromtimestamp(mtime).year, date_order)
-        # 自然日跟着 epoch 一起在这里定死：file_ts 可能是**精确时刻**（自生成写回块
-        # 的 record_iso 标记），不再是"某日本地零点"，所以下游不能拿它反格式化出日期
-        file_info[p] = {"text": text, "mtime": mtime, "file_ts": ts,
-                        "file_date": _local_date_of(head, ts, ts_source),
-                        "window": parse_window_no(p.name), "layer": layer_of(p)}
-    # 窗口号 → 该窗已知的时间戳与自然日（同一窗口号的不同层共享一次会话，取先解析
-    # 出的那个）。**两个数一起借，且必须来自同一个文件**：epoch 管排序，自然日管
-    # "这是哪天的事"，拆开借就会出现"同一窗两个日期"
+    file_info = {p: _file_info(p, *raw[p], date_order) for p in files}
     window_ts, window_date = {}, {}
     for info in file_info.values():
-        if info["window"] is not None and info["file_ts"] is not None:
-            if info["window"] not in window_ts:
-                window_ts[info["window"]] = info["file_ts"]
-                window_date[info["window"]] = info["file_date"]
-
+        _note_window(info, window_ts, window_date)
     for p in files:
-        info = file_info[p]
-        for chunk, meta in timeline_chunks(info["text"], p.name, info["mtime"], date_order):
-            meta["window"], meta["layer"] = info["window"], info["layer"]
-            source_record = _SOURCE_RECORD_RE.search(p.name) if info["layer"] == "index" else None
-            # timeline 自己的内容哈希就是 recordId；索引摘要沿用文件名里的来源 recordId。
-            # 没有来源标识的老 index 仍给自身哈希，兼容读取但不冒充关联正文。
-            meta["record_id"] = (source_record.group(1).lower() if source_record
-                                 else _chunk_key(chunk))
-            meta["record_id_aliases"] = ([meta["record_id"]] if source_record
-                                         else _record_id_aliases(chunk))
-            meta["status"] = "current"
-            if meta["timestamp_source"] == "mtime":
-                borrowed = window_ts.get(info["window"])
-                if borrowed is not None:
-                    meta["timestamp"], meta["timestamp_source"] = borrowed, "window_sibling"
-                    # 日期跟着一起借：借的是"同一次会话"这个依据，不是只借个排序位。
-                    # ⚠ **借的是兄弟文件定死的那个自然日，不是把 epoch 在这里格式化
-                    # 一遍**——兄弟是自生成写回块时，borrowed 是带 offset 的精确时刻，
-                    # 在这里 fromtimestamp 一次就变回"读它的这个进程所在时区"的日期，
-                    # UTC 的服务器上东八区凌晨那条又少一天（正是这张卡要杀的那个形状）
-                    meta["local_date"] = window_date.get(info["window"])
+        for chunk, meta in _file_chunks(p, file_info[p], date_order, window_ts, window_date):
             index.add(chunk, meta)
+    # 增量写入要复用同一份“窗口号 → 时间戳／自然日”借用表与日期顺序结论，挂在库上
+    index._window_ts, index._window_date = window_ts, window_date
     # 推断结论挂在库上，**让它可见**：出了问题能一眼看出"这份语料被按哪种顺序解的"，
     # 而不是只能从时间戳倒推。None＝没找到决定性证据，那些歧义日期没被采信
     index.date_order = date_order
     return index.build()
+
+
+def _file_info(p, text, mtime, date_order):
+    """单个语料文件的文件级日期与窗口号（load_corpus 第一趟；增量写入复用）。"""
+    head = "\n".join(_head_lines(text))
+    ts, ts_source = parse_chunk_timestamp(p.name, head,
+                                          datetime.fromtimestamp(mtime).year, date_order)
+    # 自然日跟着 epoch 一起在这里定死：file_ts 可能是**精确时刻**（自生成写回块
+    # 的 record_iso 标记），不再是"某日本地零点"，所以下游不能拿它反格式化出日期
+    return {"text": text, "mtime": mtime, "file_ts": ts,
+            "file_date": _local_date_of(head, ts, ts_source),
+            "window": parse_window_no(p.name), "layer": layer_of(p)}
+
+
+def _note_window(info, window_ts, window_date):
+    """窗口号 → 该窗已知的时间戳与自然日（同一窗口号的不同层共享一次会话，取先解析
+    出的那个）。**两个数一起借，且必须来自同一个文件**：epoch 管排序，自然日管
+    "这是哪天的事"，拆开借就会出现"同一窗两个日期"。"""
+    if info["window"] is not None and info["file_ts"] is not None:
+        if info["window"] not in window_ts:
+            window_ts[info["window"]] = info["file_ts"]
+            window_date[info["window"]] = info["file_date"]
+
+
+def _file_chunks(p, info, date_order, window_ts, window_date):
+    """单个语料文件 → (块正文, meta)（load_corpus 第二趟；增量写入复用同一段，
+    新块的 meta 才与全量加载给的一致）。"""
+    for chunk, meta in timeline_chunks(info["text"], p.name, info["mtime"], date_order):
+        meta["window"], meta["layer"] = info["window"], info["layer"]
+        source_record = _SOURCE_RECORD_RE.search(p.name) if info["layer"] == "index" else None
+        # timeline 自己的内容哈希就是 recordId；索引摘要沿用文件名里的来源 recordId。
+        # 没有来源标识的老 index 仍给自身哈希，兼容读取但不冒充关联正文。
+        meta["record_id"] = (source_record.group(1).lower() if source_record
+                             else _chunk_key(chunk))
+        meta["record_id_aliases"] = ([meta["record_id"]] if source_record
+                                     else _record_id_aliases(chunk))
+        meta["status"] = "current"
+        if meta["timestamp_source"] == "mtime":
+            borrowed = window_ts.get(info["window"])
+            if borrowed is not None:
+                meta["timestamp"], meta["timestamp_source"] = borrowed, "window_sibling"
+                # 日期跟着一起借：借的是"同一次会话"这个依据，不是只借个排序位。
+                # ⚠ **借的是兄弟文件定死的那个自然日，不是把 epoch 在这里格式化
+                # 一遍**——兄弟是自生成写回块时，borrowed 是带 offset 的精确时刻，
+                # 在这里 fromtimestamp 一次就变回"读它的这个进程所在时区"的日期，
+                # UTC 的服务器上东八区凌晨那条又少一天（正是这张卡要杀的那个形状）
+                meta["local_date"] = window_date.get(info["window"])
+        yield chunk, meta
 
 
 # ---------- 写回：记忆库正文层的笔（任务卡"记忆写回与权重持久化"） ----------
@@ -2383,6 +2518,11 @@ def _selftest(embed=False):
         i2.build()
         assert pv2.texts_embedded == 0 and pv2.calls == 0, \
             f"重启后块向量该全部走缓存，实际又算了 {pv2.texts_embedded} 条"
+        #   块向量常驻成 float32（块向量改存float32卡）：现算的、缓存读的、增量补的都不是 Python float list
+        i2.add_incremental("增量补进来的一块：咖啡机又坏了", {"source": "x.md"})
+        from array import array as _array
+        assert all(type(v) is _array and v.typecode == "f" for v in i1._cvecs + i2._cvecs), \
+            "块向量还有 Python float list"
         #   缓存文件里只有提供方标识和向量——key 这类凭证一个字都不许落盘
         assert set(json.loads(cpath.read_text(encoding="utf-8"))) == {"provider", "vectors"}
 

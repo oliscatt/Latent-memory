@@ -11,7 +11,8 @@
   之前调隐藏入口 `latent_passive_recall`，服务端组装好（ready）就把资料写到 stdout。
 
 Claude Code 会把 UserPromptSubmit 的输出写进对话记录，所以这是**历史保留**模式：同一条记录
-一个会话只注入一次，按会话累计字节封顶，超了就留空。压缩、恢复之后预算不退还。
+一个会话只注入一次（一轮里注入过的那几段剔掉、其余照常注入），按会话累计字节封顶，超了就留空。
+压缩、恢复之后预算不退还。
 
 只走 Streamable HTTP：Claude Code 和这两个 hook 连同一个常驻服务端。服务端这样起：
   mcp_server.py --corpus … --http 127.0.0.1:8765 --token <普通> --hook-token <宿主专用> --passive-recall
@@ -29,6 +30,9 @@ Claude Code 用普通 token 连 MCP，工具列表里就没有隐藏入口；hoo
   PASSIVE_RECALL_OBSERVATIONS  可选，脱敏观测 JSONL（不记原句、证据与凭证）
 
 任何失败都静默放行、退出码 0：宁可这一轮没有记忆，也不能卡住对话。
+
+hook 输入带 `agent_id`（只在子代理里出现）时两个命令都直接返回，不召回、不检索；主会话里后台任务的
+完成通知（prompt 以 <task-notification> 开头）也不检索（issue #43）。
 """
 
 import hashlib
@@ -125,11 +129,35 @@ def session_start(payload, out):
         out.write(text + "\n")
 
 
+def _drop_delivered(content, records, delivered):
+    """把注入过的记录那几段从服务端组装好的 content 里剔掉，返回 (新 content, 留下的 recordId)。
+
+    content 是「外壳头＋若干段〔来源：<recordId>；…〕＋原文＋〔历史证据结束〕」，原文里的〔〕服务端已转义，
+    所以按「〔来源：」开头的行切段是确定的。段与 records 对不上（格式变了、拆不开）就返回 None，
+    调用方按整轮注入过处理，不硬拆。"""
+    lines = content.split("\n")
+    heads = [i for i, line in enumerate(lines) if line.startswith("〔来源：")]
+    if not heads or lines[-1] != "〔历史证据结束〕":
+        return None
+    bounds = heads + [len(lines) - 1]
+    segments = [lines[a:b] for a, b in zip(bounds, bounds[1:])]
+    ids = [seg[0][len("〔来源："):].split("；")[0].rstrip("〕") for seg in segments]
+    if sorted(ids) != sorted(records):
+        return None
+    kept = [(rid, seg) for rid, seg in zip(ids, segments) if rid not in delivered]
+    text = "\n".join(lines[:heads[0]] + [line for _rid, seg in kept for line in seg] + lines[-1:])
+    return text, [rid for rid, _seg in kept]
+
+
 def user_prompt_submit(payload, out):
     if os.environ.get("LATENT_PASSIVE_RECALL") != "on":
         return
     prompt, session_id = payload.get("prompt") or "", payload.get("session_id") or ""
     if not prompt.strip() or not session_id:
+        return
+    # 后台子代理、后台命令的完成通知也会作为一轮 UserPromptSubmit 进主会话，prompt 原样以 <task-notification>
+    # 开头（2026.10.04 Claude Code 2.1.251 实测）。不是人说的话：不检索、不占预算（#43）。只认这个标签，不按措辞猜。
+    if prompt.lstrip().startswith("<task-notification>"):
         return
     led = Ledger(session_id)
     led.data["turn"] += 1
@@ -178,8 +206,11 @@ def user_prompt_submit(payload, out):
     if sc.get("status") != "ready" or not content or not records:
         return done("empty")
     if set(records) & set(led.data["records"]):
-        # ponytail: 有一条注入过就整轮不注入，不拆开投剩下的；服务端组装是整块的，拆了会改动原文
-        return done("already_delivered")
+        # 注入过的那几段已经在历史里：剔掉它们，剩下的照常注入；全剔光或拆不开才整轮不注入。
+        trimmed = _drop_delivered(content, records, set(led.data["records"]))
+        if trimmed is None or not trimmed[1]:
+            return done("already_delivered")
+        content, records = trimmed
     text = HEADER + "\n\n" + content
     size = len(text.encode("utf-8"))
     if size > TURN_BYTES or led.data["spent"] + size > SESSION_BYTES:
@@ -190,18 +221,27 @@ def user_prompt_submit(payload, out):
     done("injected", text)
 
 
+HANDLERS = {"session-start": session_start, "user-prompt-submit": user_prompt_submit}
+
+
+def dispatch(command, payload, out):
+    # 子代理里触发的 hook 输入带 agent_id（只在子代理里有）：开场召回和自动浮现都不做（issue #43）。
+    if payload.get("agent_id"):
+        return
+    HANDLERS[command](payload, out)
+
+
 def main(argv):
     command = argv[1] if len(argv) > 1 else ""
     if command == "--selftest":
         return _selftest()
-    handler = {"session-start": session_start, "user-prompt-submit": user_prompt_submit}.get(command)
-    if handler is None:
+    if command not in HANDLERS:
         print(__doc__, file=sys.stderr)
         return 0
     try:
         if os.environ.get("LATENT_MCP_URL"):
             sys.stdout.reconfigure(encoding="utf-8")
-            handler(json.loads(sys.stdin.buffer.read().decode("utf-8") or "{}"), sys.stdout)
+            dispatch(command, json.loads(sys.stdin.buffer.read().decode("utf-8") or "{}"), sys.stdout)
     except Exception:
         pass
     return 0
@@ -257,7 +297,7 @@ def _selftest():
                 os.environ.pop(k, None)
         out = io.StringIO()
         try:
-            {"session-start": session_start, "user-prompt-submit": user_prompt_submit}[command](payload, out)
+            dispatch(command, payload, out)
         finally:
             for k, v in saved.items():
                 os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
@@ -276,12 +316,25 @@ def _selftest():
         name, auth, args = calls[-1]
         assert (name, auth) == ("latent_passive_recall", "Bearer hook"), "自动浮现必须走宿主专用凭证"
         assert args["capability"]["mode"] == "retained" and args["previousAnchors"] == []
-        # 3. 同一条记录再递回来：历史里已经有了，不再注入；锚点带上一轮的 delivery
+        # 3. 同一条记录再递回来、content 又拆不开（段落与 records 对不上）：整轮不注入；锚点带上一轮的 delivery
         replies["latent_passive_recall"] = ready(["r1", "r2"])
         assert run("user-prompt-submit", turn) == ""
         assert calls[-1][2]["previousAnchors"][0]["assemblyVersion"] == "a-r1"
         assert calls[-1][2]["turn"]["deliveryId"] != calls[-2][2]["turn"]["deliveryId"], \
             "同一句话说两次也是两轮，deliveryId 不能相同，否则服务端会原样重放上一轮"
+        # 3b. 一轮里有注入过的也有新的：剔掉注入过的那段，新的照常注入，不整轮丢
+        two = ("〔历史证据〕\n〔来源：r1；2026-09-01〕\n她周六在楼下吃了牛肉面。\n"
+               "〔来源：r2；2026-09-02〕\n她说汤有点咸。\n〔历史证据结束〕")
+        replies["latent_passive_recall"] = ready(["r1", "r2"], two)
+        got = run("user-prompt-submit", turn)
+        assert "汤有点咸" in got and "牛肉面" not in got and got.rstrip().endswith("〔历史证据结束〕"), got
+        assert set(Ledger("s1").data["records"]) == {"r1", "r2"}
+        # 3c. 这一轮的记录全都注入过：整轮不注入
+        assert run("user-prompt-submit", turn) == ""
+        # 3d. 来源行格式认不出 recordId：不硬拆，否则注入过的那段会被重复注入
+        odd = "〔历史证据〕\n〔来源：r1/2026-09-01〕\n她周六在楼下吃了牛肉面。\n〔来源：r5/2026-09-03〕\n她说下次去吃馄饨。\n〔历史证据结束〕"
+        replies["latent_passive_recall"] = ready(["r1", "r5"], odd)
+        assert run("user-prompt-submit", turn) == ""
         # 4. 单轮超预算：整轮不注入，不截断
         replies["latent_passive_recall"] = ready(["r3"], "长" * 2000)
         assert run("user-prompt-submit", turn) == ""
@@ -317,6 +370,18 @@ def _selftest():
         assert Ledger("s1").data == Ledger("never-seen").data, "新会话要从空账本开始"
         replies["latent_session_start"] = {"isError": True, "content": [{"type": "text", "text": "坏了"}]}
         assert run("session-start", {"session_id": "s4", "source": "startup"}) == ""
+        # 9. 子代理里触发（输入带 agent_id）：两个 hook 都不发请求、不动账本、不输出（#43）
+        replies["latent_passive_recall"] = ready(["r7"])
+        replies["latent_session_start"] = {"content": [{"type": "text", "text": "【上次聊到】面馆"}]}
+        before = len(calls)
+        assert run("user-prompt-submit", {"session_id": "s5", "prompt": "晚上想吃点热的",
+                                          "agent_id": "a1"}) == ""
+        assert run("session-start", {"session_id": "s5", "source": "startup", "agent_id": "a1"}) == ""
+        assert len(calls) == before and not Ledger("s5").path.exists(), "子代理回合不能检索，也不能动账本"
+        # 10. 后台任务的完成通知进主会话（prompt 以 <task-notification> 开头）：不检索、不动账本、不输出（#43）
+        note = "<task-notification>\n<task-id>t1</task-id>\n<status>completed</status>\n</task-notification>"
+        assert run("user-prompt-submit", {"session_id": "s6", "prompt": note}) == ""
+        assert len(calls) == before and not Ledger("s6").path.exists(), "完成通知不是人说的话，不能检索"
     if saved_state is None:
         os.environ.pop("LATENT_HOOK_STATE_DIR", None)
     else:
@@ -351,8 +416,8 @@ def _selftest():
         assert run("session-start", {"session_id": "real", "source": "startup"},
                    LATENT_MCP_URL=url).strip(), "开场召回要有内容"
     real.shutdown()
-    print("selftest ok（claude_code_hook：关闭不联网 / 宿主凭证 / 同记录不重复注入 / 单轮与会话预算 / "
-          "否认只追加一次状态 / 坏响应与断连静默 / 开场召回与账本重置 / 真服务端隐藏入口"
+    print("selftest ok（claude_code_hook：关闭不联网 / 宿主凭证 / 同记录不重复注入、剔掉注入过的段落照常递其余 / 单轮与会话预算 / "
+          "否认只追加一次状态 / 坏响应与断连静默 / 开场召回与账本重置 / 带 agent_id 不召回不检索 / 完成通知不检索 / 真服务端隐藏入口"
           + ("·含注入" if passive_recall.JIEBA_AVAILABLE else "·无 jieba 留空") + "）")
     return 0
 

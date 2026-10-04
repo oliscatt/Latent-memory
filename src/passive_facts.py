@@ -5,6 +5,10 @@
 
 - 每轮：原句一个查询向量，与全部非 meta 事实点积，排除写入日不早于今天的与来源块已撤回／被取代的，取前 2；
   低于噪音下限 FACT_FLOOR 的、冷却中的再去掉，不由后面的名次顶上；
+- 同源成组：前 2 名所在块（同一条记忆）里另外几条也过下限、不在冷却的，一并递出，最多 FACT_SIBLINGS 条，
+  整段不超过 FACT_GROUP_BYTES 字节；
+- 状态软标注：同一轮里两条 kind=state 同块、事件日不同，较早的那条标“较早的状态”，只标不删；
+  设了 STATE_SIM 才把不同块、彼此余弦 ≥ 它的也算进来（默认关）；
 - 冷却：递出的事实 12 小时内不再递，跨窗口生效，状态落盘在服务端；
 - 没有 embedding（零依赖档）时暂不浮，返回 fact_no_embedding（暗号模式另做）。
 """
@@ -27,6 +31,15 @@ FACT_TOP = 2
 # 默认 0.42 是在 voyage-3.5 上定的（开发集 89 句：砍掉约两成无用递送、该接的 28 道一道不丢）；
 # 换了向量模型余弦分布会变，用 LATENT_PASSIVE_FACT_FLOOR 调。
 FACT_FLOOR = float(os.environ.get("LATENT_PASSIVE_FACT_FLOOR") or 0.42)
+# 同源成组：一条记忆拆出的几条是同一件事的几个面，前 2 名之外每轮最多再带这么多条同块的。
+FACT_SIBLINGS = 3
+# 带兄弟行时整段递送文本的字节上限（前 2 名不受它限制）。默认 1000：有的宿主单轮上限 1200 字节
+# 是连外壳一起算的，这里留出余量，正常情况下一轮到宿主不用再裁。
+FACT_GROUP_BYTES = int(os.environ.get("LATENT_PASSIVE_FACT_GROUP_BYTES") or 1000)
+# 不同块的两条状态事实算“说的是同一件事”的余弦线。默认不设＝跨块比较关闭，只在同一条记忆里比。
+# 在维护者自用语料上量过（voyage-3.5）：不相干的状态对余弦中位数 0.585、P95 0.690，0.6 会误标约四成；
+# 没有取代记录可作正例时定不了线。要开先在自己的语料上标定。
+STATE_SIM = float(os.environ["LATENT_PASSIVE_STATE_SIM"]) if os.environ.get("LATENT_PASSIVE_STATE_SIM") else None
 # 同一条事实递出后多久不再递（12 小时）。
 COOLDOWN_SECONDS = 12 * 3600
 FACT_LAYER = "fact"
@@ -124,7 +137,7 @@ class FactIndex:
                     "written": item.get("written"), "timestamp_source": FACT_LAYER,
                     "tag": item.get("tag"), "kind": item.get("kind", "event"),
                     "block": item.get("block"),
-                    # 不经 latent_append 写入的事实拿不到块号：记来源文件名，按「那个文件还有现行正文」核对。
+                    # 没带块号的事实（不经 latent_append、写入方也没按切块规则自己算块号）：记来源文件名，按「那个文件还有现行正文」核对。
                     "source_file": item.get("source_file"),
                 }}
                 by_id[record_id] = row
@@ -188,8 +201,16 @@ class FactIndex:
     def row(self, record_id):
         return self.by_id.get(record_id)
 
+    def similarity(self, a, b):
+        """两条事实向量的余弦；按正文在同一份快照里找，后台重读换了快照也不会错位。找不到给 0。"""
+        _rows, by_id, vectors = self._snapshot
+        ia, ib = by_id.get(_chunk_key(a["text"])), by_id.get(_chunk_key(b["text"]))
+        if vectors is None or ia is None or ib is None:
+            return 0.0
+        return _dot(vectors[ia["id"]], vectors[ib["id"]])
+
     def ranked(self, query, *, exclude=lambda row: False, top=FACT_TOP):
-        """按与原句的相似度取前 top 条；没有向量返回 None（调用方回 fact_no_embedding）。"""
+        """按与原句的相似度取前 top 条（top=None 给全部）；没有向量返回 None（调用方回 fact_no_embedding）。"""
         rows, _by_id, vectors = self._snapshot
         if vectors is None or self.provider is None or not self.ready:
             return None
@@ -528,7 +549,7 @@ class FactCooldown:
 class FactVectorCache:
     """事实向量的二进制缓存：同目录 <名>.vec（float32 连续存放）＋ <名>.vec.json（provider 与文本哈希顺序）。
 
-    不用 VectorCache 的 JSON：一万条×1024 维写成文本约 90MB，读进来是 300MB+ 的 Python float。"""
+    不用 VectorCache 的 JSON：一万条×1024 维写成文本约 90MB，读盘时整份文本要先常驻再逐条解析。"""
 
     def __init__(self, base, provider_id):
         import hashlib

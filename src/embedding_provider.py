@@ -27,6 +27,7 @@ embedding 提供方可插拔层（任务卡"云端 embedding 作为一等检索�
   python embedding_provider.py --describe        # 打印当前环境解析出来的提供方
 """
 
+from array import array
 import argparse
 import hashlib
 import json
@@ -363,6 +364,9 @@ class VectorCache:
     只会让余弦分数变成噪声（同"门槛不许照抄"是同一个坑的两面）。
 
     存 6 位小数：单位化向量的有效精度本来就有限，文件小一半多。
+    内存里每条是 float32 的 `array('f')`（同 passive_facts.FactIndex）：1024 维一条 4 KiB，
+    Python float list 要 32 KiB。读盘逐条解析、逐条转，不一次物化整份 list；写盘还原成
+    同样的 6 位小数，文件逐字节不变（float32 误差 ≤ 6e-8，舍回 6 位必回到原值）。
     缓存文件是**用户产出目录里的中间物，不进仓库**（见 .gitignore）。"""
 
     def __init__(self, path, provider_id):
@@ -377,19 +381,19 @@ class VectorCache:
         if not self.path or not self.path.exists():
             return
         try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-        except (ValueError, OSError):
+            provider, vectors = _parse_cache(self.path.read_text(encoding="utf-8"))
+        except (ValueError, TypeError, OSError):
             return          # 缓存坏了就当没有，重算即可，不该让检索起不来
-        if data.get("provider") != self.provider_id:
+        if provider != self.provider_id:
             return          # 换了模型/服务商：整份作废
-        self.vectors = {k: v for k, v in (data.get("vectors") or {}).items()}
+        self.vectors = vectors
         self.loaded_from_disk = True
 
     def get(self, text):
         return self.vectors.get(text_key(text))
 
     def put(self, text, vec):
-        self.vectors[text_key(text)] = [round(x, 6) for x in vec]
+        self.vectors[text_key(text)] = array("f", (round(x, 6) for x in vec))
         self.dirty = True
 
     def save(self):
@@ -398,23 +402,60 @@ class VectorCache:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(
             {"provider": self.provider_id, "vectors": self.vectors},
-            ensure_ascii=False), encoding="utf-8")
+            ensure_ascii=False, default=lambda a: [round(x, 6) for x in a]), encoding="utf-8")
         self.dirty = False
         return True
 
 
+def _parse_cache(text):
+    """缓存 JSON → (provider, {哈希: array('f')})。vectors 段逐条 raw_decode、逐条转 float32，
+    同一时刻只有一条向量是 Python float list。格式不对抛 ValueError／TypeError。"""
+    dec, ws = json.JSONDecoder(), json.decoder.WHITESPACE.match
+
+    def skip(i, ch=None):
+        i = ws(text, i).end()
+        if ch is not None:
+            if text[i:i + 1] != ch:
+                raise ValueError(f"缓存第 {i} 个字符应为 {ch!r}")
+            i = ws(text, i + 1).end()
+        return i
+
+    top, vectors = {}, {}
+    i = skip(0, "{")
+    while text[i:i + 1] != "}":
+        key, i = dec.raw_decode(text, i)
+        i = skip(i, ":")
+        if key == "vectors" and text[i:i + 1] == "{":
+            i = skip(i, "{")
+            while text[i:i + 1] != "}":
+                k, i = dec.raw_decode(text, i)
+                v, i = dec.raw_decode(text, skip(i, ":"))
+                vectors[k] = array("f", v)
+                i = skip(i)
+                if text[i:i + 1] == ",":
+                    i = skip(i, ",")
+            i = skip(i, "}")
+        else:
+            top[key], i = dec.raw_decode(text, i)
+            i = skip(i)
+        if text[i:i + 1] == ",":
+            i = skip(i, ",")
+    return top.get("provider"), vectors
+
+
 def embed_with_cache(provider, texts, cache=None):
-    """块向量：缓存里有的直接取，没有的才算，算完写回。返回单位化向量列表。
+    """块向量：缓存里有的直接取，没有的才算，算完写回。返回单位化的 float32 `array('f')` 列表。
 
     这就是"建库时算一次、之后只补新块"的全部实现——**云端档的成本模型全靠它**。"""
     if cache is None:
-        return provider.embed(texts)
+        return [array("f", v) for v in provider.embed(texts)]
+    # 命中的直接用缓存里那份：缓存对象建完库就释放，_cvecs 是唯一持有者，不留副本
     out = [cache.get(t) for t in texts]
     todo = [i for i, v in enumerate(out) if v is None]
     if todo:
         fresh = provider.embed([texts[i] for i in todo])
         for i, v in zip(todo, fresh):
-            out[i] = v
+            out[i] = array("f", v)
             cache.put(texts[i], v)
         cache.save()
     return out
@@ -521,6 +562,37 @@ def _selftest():
         bad.write_text("{不是合法 json", encoding="utf-8")
         assert VectorCache(bad, "local:x").vectors == {}
 
+    # 7b.【内存里存 float32、磁盘格式不动】现行格式（json.dumps 默认分隔符、6 位小数）写的缓存
+    #     读进来每条是 array('f')、全部命中不重算；原样写出逐字节相同。
+    with tempfile.TemporaryDirectory() as td:
+        old_file, new_file = Path(td) / "old.json", Path(td) / "new.json"
+        pv = HTTPCloudProvider("https://api.example.com/v1/embeddings", "BAAI/bge-m3",
+                               transport=_fake_transport(dim=1024), env=env)
+        raw = {text_key(t): [round(x, 6) for x in v]
+               for t, v in zip(texts, pv.embed(texts))}
+        raw[text_key("边角值")] = [0.0, -0.0, 1e-06, -1e-06, 0.999999, -1.0, 0.5, 0.123457]
+        old_file.write_text(json.dumps({"provider": pv.id, "vectors": raw}, ensure_ascii=False),
+                            encoding="utf-8")
+        c = VectorCache(old_file, pv.id)
+        assert c.loaded_from_disk and len(c.vectors) == len(raw)
+        assert all(type(v) is array and v.typecode == "f" for v in c.vectors.values())
+        pv.texts_embedded = 0
+        got = embed_with_cache(pv, texts, c)
+        assert pv.texts_embedded == 0 and all(type(v) is array for v in got)
+        assert got[3] is c.vectors[text_key(texts[3])], "命中的向量另拷了一份"
+        c.path, c.dirty = new_file, True
+        c.save()
+        assert new_file.read_bytes() == old_file.read_bytes(), "读入再写出改了缓存文件"
+        # 写盘时 put 进来的新向量也还原成 6 位小数，和旧写法同一字节
+        c.put("新块", raw[text_key(texts[0])])
+        c.save()
+        assert json.loads(new_file.read_text(encoding="utf-8"))["vectors"][text_key("新块")] \
+            == raw[text_key(texts[0])]
+        # 缓存格式不对（vectors 里混进非数字）当坏缓存处理，不让检索起不来
+        bad_file = Path(td) / "bad.json"
+        bad_file.write_text('{"provider": "%s", "vectors": {"k": ["x"]}}' % pv.id, encoding="utf-8")
+        assert VectorCache(bad_file, pv.id).vectors == {}
+
     # 8.【未知提供方名要报错，别默默跑成本地档】——静默降级在这里等于"用户以为
     #    自己选了云端，其实一直在本地跑"，或者反过来，两个方向都不能接受
     for bad_spec in ("openai", "", "本地"):
@@ -597,8 +669,8 @@ def _selftest():
     assert get_hit_floor("BAAI/bge-m3", env={ENV_HIT_FLOOR: "0.55"}) == 0.55, \
         "自己量过的人给的覆盖值，在外部标定过的模型上同样该优先"
 
-    print("selftest ok（11 项：key 不外泄 / 缺 key 报错 / 分批不乱序 / 前缀按模型 / "
-          "未标定即 None / 缓存只算一次 / 坏缓存不致命 / 未知档报错 / "
+    print("selftest ok（12 项：key 不外泄 / 缺 key 报错 / 分批不乱序 / 前缀按模型 / "
+          "未标定即 None / 缓存只算一次 / 坏缓存不致命 / 缓存内存存 float32、磁盘逐字节不变 / 未知档报错 / "
           "超长块截断（发出去的截、本地的不动）/ 门槛覆盖口（设歪了当没设）/ "
           "第三类口径「外部标定」（数照用、出处进用户可见文本、返回值仍是纯 float））")
 

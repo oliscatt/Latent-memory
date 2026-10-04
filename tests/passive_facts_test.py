@@ -103,6 +103,25 @@ class FactModeTests(unittest.TestCase):
         self.assertNotIn("〔使用说明〕", content)
         self.assertIn("九月一滴酒", content)
 
+    def test_origin_derived_empty_and_unrecorded(self):
+        """#43 第 2 步 P1（事实模式）：同一句不带 origin 会 ready，声明为派生就回空、不登记、不记冷却。"""
+        service = self.service()
+        ask = {"userInput": "九月想喝酒", "turn": {"sessionId": "s", "turnId": "1", "deliveryId": "d1"},
+               "origin": "derived"}
+        result = service.candidate(ask)
+        self.assertEqual((result["status"], result["reasonCodes"]), ("empty", ["origin_derived"]))
+        self.assertNotIn("records", result)
+        self.assertEqual((service._deliveries, self.cool_path.exists()), ({}, False))
+        self.assertNotIn("d1", json.dumps(service.inspect()))
+        main = service.candidate(dict(ask, origin="main", turn=dict(ask["turn"], deliveryId="d2")))
+        self.assertEqual(main["status"], "ready", "主会话照常浮")
+
+    def test_origin_bad_value_rejected(self):
+        """P3：origin 只认 main／derived，报错写明可选值。"""
+        with self.assertRaisesRegex(pr.PassiveRecallRequestError, "main.*derived"):
+            self.service().candidate({"userInput": "九月想喝酒", "origin": "subagent", "turn": {
+                "sessionId": "s", "turnId": "1", "deliveryId": "d1"}})
+
     def test_same_day_written_excluded(self):
         result = _ask(self.service(), "楼下那家面", 1)
         self.assertNotIn("楼下那家面", result.get("content", ""))
@@ -467,6 +486,428 @@ class FactModeTests(unittest.TestCase):
     def test_block_mode_gate_unchanged(self):
         admitted, reason, _ = pr._input_gate("想喝酒", short_terms=set(), index=None)
         self.assertEqual((admitted, reason), (False, "low_information"))
+
+
+# issue #45 第 1 步：同源成组＋状态软标注。夹具是 issue #45 第 7 节的虚构考研数据，S1～S7 是本组判据。
+# 向量是手写的，只验逻辑、不验真实模型效果。
+KAOYAN = [
+    ("f1", "blk-0101", "2026-01-01", "阿离的考研冲刺校是 B 校。", (2, 1, 0, 0, 0)),
+    ("f2", "blk-0101", "2026-01-01", "阿离的考研稳妥校是 C 校、D 校。", (2, 0, 1, 0, 0)),
+    ("f3", "blk-0101", "2026-01-01", "阿离的考研保底校是 A 校。", (2, 0, 0, 1, 0)),
+    ("f4", "blk-0601", "2026-06-01", "阿离改主意了，考研只报 E 校。", (2, 0, 0, 0, 1)),
+]
+ASK_ALL = "我考试那事你还记得吧"          # 四条都过下限，前 2 名是 f1、f4
+ASK_SAFE = "我的保底校是哪所来着"         # f1～f3 过下限，f4 不过
+ASK_ONLY = "那个保底校现在还作数吗"       # 只有 f3 过下限
+OLDER = "这是较早的状态，可能已被更新"
+# 跨块相似度默认关（STATE_SIM 为 None）；要测打开后的行为就临时设成这个值。
+CROSS_SIM = 0.6
+
+
+class TableProvider:
+    """按原文查表给向量，查不到就报错——夹具里每个相似关系都是写死的。"""
+    id = "table"
+
+    def __init__(self, table):
+        self.table = table
+
+    def embed(self, texts, is_query=False):
+        return [list(self.table[text]) for text in texts]
+
+
+class FactGroupTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cool_path = Path(self.tmp.name) / "cool.json"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def service(self, facts=KAOYAN, kind="state", max_piece_bytes=pr.DEFAULT_MAX_PIECE_BYTES):
+        path = Path(self.tmp.name) / "facts.jsonl"
+        # day 是一个日期（事件日＝写入日），或 (事件日, 写入日)。
+        path.write_text("".join(json.dumps({"id": fid, "block": block, "fact": text,
+                                            "event_date": day if isinstance(day, str) else day[0],
+                                            "written": day if isinstance(day, str) else day[1],
+                                            "tag": "life", "kind": kind}, ensure_ascii=False) + "\n"
+                                for fid, block, day, text, _vec in facts), encoding="utf-8")
+        table = {text: vec for *_rest, text, vec in facts}
+        table.update({ASK_ALL: (3, 0.6, 0.2, 0.4, 0.5), ASK_SAFE: (1.2, 0.4, 0.4, 1.5, -1.8),
+                      ASK_ONLY: (0.5, 0.3, 0.2, 2, -1), "我那时候住哪来着": (0.2, 0, 0, 1.5, -0.6),
+                      "那 B 校和 E 校最后怎么定的": (1, 0, 0, 1, 0)})
+        self.index = FactIndex(path, provider=TableProvider(table))
+        return pr.PassiveRecallService(StubIndex("2026-07-01"), assemble_candidates=True,
+                                       max_piece_bytes=max_piece_bytes, fact_index=self.index,
+                                       fact_cooldown=FactCooldown(self.cool_path))
+
+    @staticmethod
+    def segments(result):
+        """{事实原文: 来源行}，按递送顺序。"""
+        out = {}
+        for seg in re.split(r"(?=〔来源：)", result.get("content", ""))[1:]:
+            head, body = seg.split("\n", 1)
+            out[body.replace("〔历史证据结束〕", "").strip()] = head
+        return out
+
+    def text(self, fid):
+        return next(text for f, _b, _d, text, _v in KAOYAN if f == fid)
+
+    def test_fixture_preconditions(self):
+        self.service()
+        rows = {fid: self.index.by_id[pr._chunk_key(text)] for fid, _b, _d, text, _v in KAOYAN}
+        for fid in ("f1", "f2", "f3"):
+            self.assertGreaterEqual(self.index.similarity(rows["f4"], rows[fid]), CROSS_SIM)
+        scored = dict((row["text"], s) for row, s in self.index.ranked(ASK_ALL, top=None))
+        self.assertTrue(all(s >= pr.FACT_FLOOR for s in scored.values()), scored)
+        self.assertEqual(sorted(scored, key=lambda t: -scored[t])[:2], [self.text("f1"), self.text("f4")])
+
+    def test_s1_s2_group_and_older_label(self):
+        # 默认：跨块不比；f1～f3 同块同一天也不互标——一轮四条都不带“较早”。
+        self.assertIsNone(pr.STATE_SIM)
+        plain = _ask(self.service(), ASK_ALL, 1)
+        self.assertEqual(list(self.segments(plain)), [self.text(f) for f in ("f1", "f3", "f2", "f4")])
+        self.assertIn("fact_group", plain["reasonCodes"])
+        self.assertNotIn(OLDER, plain["content"])
+        self.assertNotIn("fact_state_older", plain["reasonCodes"])
+        # 设了 LATENT_PASSIVE_STATE_SIM 才比跨块：f4 与 f1～f3 余弦 0.8，较早的三条带标注。
+        self.cool_path.unlink()
+        with self.patched("STATE_SIM", CROSS_SIM):
+            result = _ask(self.service(), ASK_ALL, 2)
+        self.assertEqual(result["status"], "ready", result)
+        segs = self.segments(result)
+        self.assertEqual(list(segs), [self.text(f) for f in ("f1", "f3", "f2", "f4")])
+        self.assertIn("fact_group", result["reasonCodes"])
+        self.assertIn("fact_state_older", result["reasonCodes"])
+        for fid in ("f1", "f2", "f3"):
+            self.assertIn(OLDER, segs[self.text(fid)], fid)
+        self.assertNotIn(OLDER, segs[self.text("f4")])
+        self.assertTrue(all("当时的状态" in head for head in segs.values()))
+        with self.patched("STATE_SIM", CROSS_SIM):
+            self.assertEqual(result["content"], self.service()._assemble(result["records"]))
+
+    def test_s2_dissimilar_states_not_labelled(self):
+        # 变异检查补的：跨块比较打开时，不同块、余弦 < 线的两条状态，日期再有先后也不互标。
+        home = ("f5", "blk-0301", "2026-03-01", "阿离现在住在学校旁边的出租屋。", (0, 0, 0, 1, -1))
+        with self.patched("STATE_SIM", CROSS_SIM):
+            result = _ask(self.service(KAOYAN + [home]), "我那时候住哪来着", 1)
+        rows = {r["text"]: r for r in self.index.rows}
+        self.assertLess(self.index.similarity(rows[self.text("f3")], rows[home[3]]), CROSS_SIM)
+        self.assertEqual(list(self.segments(result)), [home[3], self.text("f3")], result)
+        self.assertNotIn(OLDER, result["content"])
+
+    def test_s2_same_block_counts_as_related(self):
+        # 同块就算同一件事：余弦再低、跨块比较关着（默认），事件日较早的那条也标。
+        recap = ("f6", "blk-0601", ("2026-01-15", "2026-06-01"), "阿离一月时还打算冲 B 校。", (0, 0, 0, 1, -1))
+        result = _ask(self.service([KAOYAN[3], recap]), "那 B 校和 E 校最后怎么定的", 1)
+        rows = {r["text"]: r for r in self.index.rows}
+        self.assertLess(self.index.similarity(rows[self.text("f4")], rows[recap[3]]), CROSS_SIM)
+        segs = self.segments(result)
+        self.assertEqual(set(segs), {self.text("f4"), recap[3]}, result)
+        self.assertIn(OLDER, segs[recap[3]])
+        self.assertNotIn(OLDER, segs[self.text("f4")])
+
+    def test_s3_no_label_without_newer_state(self):
+        result = _ask(self.service(), ASK_SAFE, 1)
+        segs = self.segments(result)
+        self.assertEqual(set(segs), {self.text(f) for f in ("f1", "f2", "f3")}, result)
+        self.assertNotIn(OLDER, result["content"])
+        self.assertNotIn("fact_state_older", result["reasonCodes"])
+
+    def test_s4_lone_old_state_not_labelled_and_siblings_need_floor(self):
+        result = _ask(self.service(), ASK_ONLY, 1)
+        self.assertEqual(list(self.segments(result)), [self.text("f3")], result)
+        self.assertNotIn(OLDER, result["content"])
+        self.assertNotIn("fact_group", result["reasonCodes"])
+
+    def test_s5_at_most_three_siblings(self):
+        six = [(f"g{i}", "blk-six", "2026-01-01", f"阿离那年考研准备的第{i}件小事。", (2, 0.1 * i, 0, 0, 0))
+               for i in range(1, 7)]
+        result = _ask(self.service(six, kind="event"), ASK_ALL, 1)
+        self.assertEqual(len(result["records"]), 2 + pr.FACT_SIBLINGS, result)
+
+    def test_s6_budget(self):
+        result = _ask(self.service(), ASK_ALL, 1)
+        self.assertLessEqual(len(result["content"].encode("utf-8")), pr.FACT_GROUP_BYTES)
+        long = [(fid, block, day, text.rstrip("。") + "，" + "那天她把每所学校的分数线和往年报录比都抄在本子上" * 4 + "。", vec)
+                for fid, block, day, text, vec in KAOYAN]
+        cut = _ask(self.service(long), ASK_ALL, 1)
+        self.assertLessEqual(len(cut["content"].encode("utf-8")), pr.FACT_GROUP_BYTES, cut)
+        self.assertLess(len(cut["records"]), 4, "长事实时兄弟行要被预算截掉")
+        bodies = list(self.segments(cut))
+        self.assertTrue(bodies[0].startswith("阿离的考研冲刺校") and any(b.startswith("阿离改主意") for b in bodies))
+        # 前 2 名本身超预算时照旧递，只是不再带兄弟行。
+        self.cool_path.unlink()
+        with self.patched("FACT_GROUP_BYTES", 100):
+            tight = _ask(self.service(), ASK_ALL, 1)
+        self.assertEqual(len(tight["records"]), 2, tight)
+
+    def test_item4_group_about_1300_bytes_trimmed_to_default(self):
+        # 上线前清单第 4 件 b：同一块 6 条都过下限，不设上限时整段约 1300 字节；默认上限下截到 1000 以内。
+        six = [(f"g{i}", "blk-six", "2026-01-01", f"阿离那年考研准备的第{i}件小事：" + "把真题按年份装订好，每天早上先做一套英语再去图书馆占座" + "，晚上回宿舍对答案，周末把错题本重新抄一遍再讲给我听。",
+                (2, 0.1 * i, 0, 0, 0)) for i in range(1, 7)]
+        with self.patched("FACT_GROUP_BYTES", 10 ** 6):
+            full = _ask(self.service(six, kind="event"), ASK_ALL, 1)
+        size = len(full["content"].encode("utf-8"))
+        self.assertTrue(1200 <= size <= 1400 and len(full["records"]) == 5, (size, len(full["records"])))
+        self.cool_path.unlink()
+        cut = _ask(self.service(six, kind="event"), ASK_ALL, 2)
+        self.assertEqual(pr.FACT_GROUP_BYTES, 1000)
+        self.assertLessEqual(len(cut["content"].encode("utf-8")), 1000, cut)
+        self.assertLess(len(cut["records"]), 5)
+        self.assertEqual([r["recordId"] for r in cut["records"]][:2], [r["recordId"] for r in full["records"]][:2])
+
+    @staticmethod
+    def patched(name, value):
+        """临时改 passive_recall 里按名字导入的常量（FACT_GROUP_BYTES、STATE_SIM）。"""
+        import contextlib
+        @contextlib.contextmanager
+        def swap():
+            saved = getattr(pr, name)
+            setattr(pr, name, value)
+            try:
+                yield
+            finally:
+                setattr(pr, name, saved)
+        return swap()
+
+    def test_s7_cooldown(self):
+        service = self.service()
+        FactCooldown(self.cool_path).mark([pr._chunk_key(self.text("f2"))], service._now())
+        result = _ask(self.service(), ASK_ALL, 1)
+        self.assertNotIn(self.text("f2"), result["content"], "冷却中的兄弟行不带")
+        self.assertEqual(len(result["records"]), 3)
+        self.cool_path.unlink()
+        FactCooldown(self.cool_path).mark([pr._chunk_key(self.text(f)) for f in ("f1", "f4")], service._now())
+        cooled = _ask(self.service(), ASK_ALL, 2)
+        self.assertEqual(cooled["reasonCodes"], ["fact_cooled"], "前 2 名都冷却时不由兄弟行顶上")
+
+
+
+class SnippetProvider:
+    """按原文片段查表给单位向量：先整句对上，再找第一个出现在文本里的片段；都对不上就报错。记调用次数。"""
+    id = "snippet"
+
+    def __init__(self, table):
+        self.table, self.calls = table, 0
+
+    def hit_floor(self):
+        return 0.3
+
+    def embed(self, texts, is_query=False):
+        self.calls += 1
+        out = []
+        for text in texts:
+            vec = self.table.get(text) or next(v for k, v in self.table.items() if k in text)
+            norm = sum(x * x for x in vec) ** 0.5
+            out.append([x / norm for x in vec])
+        return out
+
+
+def _pad(vec):
+    return tuple(vec) + (0, 0)
+
+
+# #45 第 2 步夹具：f1～f4 写成 latent_append 记录。R1 与 R4 余弦约 0.68，R2、R3 与谁都是 0。
+HINT_TABLE = {**{text: _pad(vec) for _f, _b, _d, text, vec in KAOYAN},
+              ASK_ALL: _pad((3, 0.6, 0.2, 0.4, 0.5)),
+              "冲刺校是 B 校": (2, 1, 1, 1, 0, 0, 0), "改主意": (2, 0, 0, 0, 1, 0, 0),
+              "会发光的球": (0, 0, 0, 0, 0, 1, 0), "备份脚本": (0, 0, 0, 0, 0, 0, 1)}
+HINT_RECORDS = [
+    ("R1", (2026, 1, 1), "阿离定了考研志愿：冲刺校是 B 校，稳妥校是 C 校、D 校，保底校是 A 校。",
+     "志愿已定：冲刺 B、稳妥 C 和 D、保底 A", ["f1", "f2", "f3"]),
+    ("R2", (2026, 2, 1), "阿离给猫买了一个会发光的球，猫不理它。", "球放在客厅，猫还是不理", []),
+    ("R3", (2026, 3, 1), "阿离把备份脚本改成每半小时拉一次，保留最新三份。", "已改好，在跑", []),
+    ("R4", (2026, 6, 1), "阿离改主意了，考研只报 E 校，B、C、D、A 都不报了。", "考研只报 E 校", ["f4"]),
+]
+HINT_ENV = {"LATENT_SUPERSEDE_HINT_MIN": "0.6", "LATENT_SUPERSEDE_HINT_LEAD": "0.2"}
+
+
+def _epoch(ymd, hour=10):
+    return dt.datetime(*ymd, hour, tzinfo=dt.timezone(dt.timedelta(hours=8))).timestamp()
+
+
+class SupersedeHintTests(unittest.TestCase):
+    """#45 第 2 步判据 H1～H5、L1～L4、C1、T1（见任务卡第三节）；T2 在 mcp_server.py 自检里。"""
+
+    def setUp(self):
+        try:
+            import mcp_server
+        except SyntaxError:
+            self.skipTest("mcp_server 需要 Python 3.12+")
+        self.mcp = mcp_server
+        self.tmp = tempfile.TemporaryDirectory()
+        base = Path(self.tmp.name)
+        self.corpus, self.facts = base / "timeline", base / "事实库"
+        self.log = base / "state" / "hints.jsonl"
+        self.corpus.mkdir()
+        self.facts.mkdir()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def build(self, hint=True):
+        """按日期依次写 R1～R4，返回 (server, {名字: recordId}, {名字: 回执})。"""
+        from unittest import mock
+        from memory_retrieval import MemoryIndex, load_corpus
+        from passive_facts import FactIndex
+        self.provider = SnippetProvider(HINT_TABLE)
+        env = {"LATENT_PASSIVE_FACTS": str(self.facts),
+               "LATENT_PASSIVE_FACT_STATE_DIR": str(Path(self.tmp.name) / "state"),
+               "LATENT_SUPERSEDE_HINT_LOG": str(self.log), **(HINT_ENV if hint else {})}
+        with mock.patch.dict(os.environ, env):
+            if not hint:
+                for key in HINT_ENV:
+                    os.environ.pop(key, None)
+            srv = self.mcp.MemoryServer(
+                index=MemoryIndex(embed=True, provider=self.provider).build(),
+                corpus_dir=str(self.corpus), enable_passive_recall=True,
+                loader=lambda: load_corpus(str(self.corpus), embed=True, provider=self.provider,
+                                           cache_path=""))
+        ids, receipts = {}, {}
+        facts = {fid: text for fid, _b, _d, text, _v in KAOYAN}
+        for name, ymd, text, state, fids in HINT_RECORDS:
+            args = {"text": text, "current_state": state}
+            if fids:
+                args["facts"] = [{"fact": facts[f], "kind": "state", "event_date": "%04d-%02d-%02d" % ymd}
+                                 for f in fids]
+            if name == "R3":    # 带一条索引摘要，L3 要拿它当“索引摘要不算 timeline 记录”的反例
+                args["indexEvidence"] = [{"type": "event", "quote": "把备份脚本改成每半小时拉一次"}]
+            receipts[name] = srv._tool_memory_append(args, now=_epoch(ymd))
+            ids[name] = re.search(r"recordId=([0-9a-f]{16})", receipts[name]).group(1)
+        # 事实库是启动时建的空库，增量靠后台按分钟重读；这里直接换成同步建好的那份，只为夹具确定
+        srv.passive.fact_index = FactIndex(self.facts, provider=self.provider)
+        return srv, ids, receipts
+
+    def ask(self, srv, ymd, n):
+        srv.index.fixed_now = _epoch(ymd, 12)
+        return _ask(srv.passive, ASK_ALL, n, session=f"s{n}")
+
+    def test_h1_h2_c1_hint_lists_only_the_old_state(self):
+        srv, ids, receipts = self.build()
+        self.assertIn("supersedeHint：库里有 1 条现行记录", receipts["R4"])
+        self.assertIn(f"recordId={ids['R1']}（2026-01-01，当时的状态：志愿已定：冲刺 B、稳妥 C 和 D、保底 A）",
+                      receipts["R4"])
+        self.assertIn(f"supersedes＝那条的 recordId，by={ids['R4']}，不带 text；不是就什么都不用做", receipts["R4"])
+        for other in ("R2", "R3"):
+            self.assertNotIn(ids[other] + "（", receipts["R4"], "只列 1 条")
+        for name in ("R1", "R2", "R3"):
+            self.assertNotIn("supersedeHint", receipts[name], f"{name} 不相干，不提示")
+        rows = [json.loads(line) for line in self.log.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual([(r["record"], r["candidates"]) for r in rows], [(ids["R4"], [ids["R1"]])])
+        self.assertEqual(self.mcp.supersede_hint_stats(self.log), {"hinted": 1, "linked": 0, "ignored": 1})
+        self.assertIsNone(re.search(r"[一-鿿]", self.log.read_text(encoding="utf-8")), "账本不落正文")
+
+    def test_h3_off_by_default(self):
+        srv, ids, receipts = self.build(hint=False)
+        self.assertNotIn("supersedeHint", receipts["R4"])
+        self.assertFalse(self.log.exists(), "没开提示就不生成账本")
+        default = self.mcp.MemoryServer(index=srv.index, corpus_dir=str(self.corpus)).hint_log_path
+        self.assertFalse(default.resolve().is_relative_to(self.corpus.resolve().parent), "账本默认不在语料旁")
+
+    def test_h4_no_extra_embedding_calls(self):
+        srv, ids, _ = self.build()
+        before = self.provider.calls
+        self.assertIn(ids["R1"], srv._supersede_hint(ids["R4"], now=_epoch((2026, 6, 1))))
+        self.assertEqual(self.provider.calls, before, "算提示只用现成向量")
+
+    def test_h5_pick_rule(self):
+        from memory_retrieval import pick_supersede_hint
+        self.assertEqual(pick_supersede_hint([(0.9, 1), (0.6, 2), (0.5, 3)], 0.6, 0.2), [(0.9, 1)])
+        self.assertEqual(pick_supersede_hint([(0.9, 1), (0.85, 2), (0.5, 3)], 0.6, 0.2), [(0.9, 1), (0.85, 2)])
+        self.assertEqual(pick_supersede_hint([(0.9, 1), (0.85, 2), (0.8, 3)], 0.6, 0.2), [], "分不开就不提")
+        self.assertEqual(pick_supersede_hint([(0.55, 1)], 0.6, 0.2), [], "不过线不提")
+        self.assertEqual(pick_supersede_hint([(0.7, 1)], 0.6, 0.2), [(0.7, 1)], "只有一名时第二名按 0 算")
+        self.assertEqual(pick_supersede_hint([], 0.6, 0.2), [])
+
+    def test_l1_l2_c1_link_only(self):
+        srv, ids, _ = self.build()
+        before = self.ask(srv, (2026, 7, 1), 1)
+        self.assertIn(KAOYAN[0][3], before["content"], "补链前 f1 会递")
+        self.assertIn("冲刺校是 B 校", srv._tool_memory_search({"query": "冲刺校是 B 校"})["text"])
+        md_before = {p: p.read_bytes() for p in self.corpus.rglob("*.md")}
+        chunks_before = len(srv.index.chunks)
+        signature = self.mcp._corpus_signature(srv.source_dirs)
+        reloads = []
+        srv._reload_from_disk = lambda: reloads.append(1)
+        out = srv._call_tool(1, {"name": "latent_supersede",
+                                 "arguments": {"supersedes": ids["R1"], "by": ids["R4"]}})["result"]
+        self.assertFalse(out["isError"], out)
+        self.assertIn("只写了取代账本，没有写新正文", out["content"][0]["text"])
+        self.assertEqual({p: p.read_bytes() for p in self.corpus.rglob("*.md")}, md_before, "不产生新正文块")
+        self.assertEqual((len(srv.index.chunks), reloads), (chunks_before, []), "块数不变、不整库重建")
+        self.assertEqual(self.mcp._corpus_signature(srv.source_dirs), signature)
+        r1 = next(m for m in srv.index.meta if m.get("record_id") == ids["R1"])
+        self.assertEqual(r1["status"], "superseded")
+        after = self.ask(srv, (2026, 7, 2), 2)        # 隔天再问，前一轮的冷却已过
+        for fid, _b, _d, text, _v in KAOYAN:
+            (self.assertIn if fid == "f4" else self.assertNotIn)(text, after["content"], fid)
+        try:
+            search = srv._tool_memory_search({"query": "冲刺校是 B 校"})["text"]
+        except self.mcp.ToolError:
+            search = ""
+        self.assertNotIn("冲刺校是 B 校", search)
+        self.assertEqual(self.mcp.supersede_hint_stats(self.log), {"hinted": 1, "linked": 1, "ignored": 0})
+
+    def test_h6_superseded_record_no_longer_a_candidate(self):
+        """判据写定后补的：第七节写了候选池去掉已被取代的记录，判据里漏了这条（变异“候选池不去掉已被取代的”
+        只有这条会红）。补链后再写一条和 R1 一样的，提示只能指向现行的 R4，不能指回已退场的 R1。"""
+        srv, ids, _ = self.build()
+        srv._tool_memory_supersede({"supersedes": ids["R1"], "by": ids["R4"]})
+        out = srv._tool_memory_append({"text": "阿离又提起冲刺校是 B 校的事。", "current_state": "只是聊起"},
+                                      now=_epoch((2026, 6, 2)))
+        self.assertIn(f"recordId={ids['R4']}（", out)
+        self.assertNotIn(ids["R1"], out)
+
+    def test_l3_bad_args_are_fixable_and_write_nothing(self):
+        srv, ids, _ = self.build()
+        srv._tool_memory_supersede({"supersedes": ids["R1"], "by": ids["R4"]})
+        index_chunk = next(c for c, m in zip(srv.index.chunks, srv.index.meta) if m.get("layer") == "index")
+        r1, r2, r4 = ids["R1"], ids["R2"], ids["R4"]
+        cases = [
+            ({"supersedes": r2, "by": r4, "text": "又写一遍"}, "去掉这些字段"),
+            ({"supersedes": r2, "by": r4, "current_state": "又写一遍"}, "去掉这些字段"),
+            ({"supersedes": r2}, "就带 by＝新记录的 recordId"),
+            ({"supersedes": r2, "by": "R4"}, "16 位小写十六进制 recordId"),
+            ({"supersedes": "0" * 16, "by": r4}, "请先 latent_search 核对"),
+            ({"supersedes": r2, "by": "0" * 16}, "by 要填 latent_append"),
+            ({"supersedes": r2, "by": pr._chunk_key(index_chunk)}, "索引摘要不算"),
+            ({"supersedes": r2, "by": r2}, "是不是填重了"),
+            ({"supersedes": r1, "by": r2}, "请沿 superseded_by 使用当前链尾"),
+            ({"supersedes": r2, "by": r4}, "请把它接在链尾上"),
+            ({"supersedes": r4, "by": r1}, "请核对两条哪条是新的"),
+        ]
+        ledger = (self.corpus / ".supersessions.json").read_bytes()
+        hints = self.log.read_bytes()
+        for args, fix in cases:
+            out = srv._call_tool(1, {"name": "latent_supersede", "arguments": args})["result"]
+            self.assertTrue(out["isError"], args)
+            self.assertIn(fix, out["content"][0]["text"], args)
+        self.assertEqual(((self.corpus / ".supersessions.json").read_bytes(), self.log.read_bytes()),
+                         (ledger, hints), "报错时什么都不写")
+
+    def test_l4_preflight_writes_nothing(self):
+        srv, ids, _ = self.build()
+        out = srv._tool_memory_supersede({"mode": "preflight", "supersedes": ids["R1"], "by": ids["R4"]})
+        self.assertIn("预检通过", out)
+        self.assertFalse((self.corpus / ".supersessions.json").exists())
+        self.assertEqual(self.mcp.supersede_hint_stats(self.log)["linked"], 0)
+
+    def test_t1_tool_counts_unchanged(self):
+        from unittest import mock
+        from memory_retrieval import MemoryIndex
+        with mock.patch.dict(os.environ, {"LATENT_FACT_BACKFILL": "off",
+                                          "LATENT_PASSIVE_FACTS": str(self.facts),
+                                          "LATENT_PASSIVE_FACT_STATE_DIR": str(Path(self.tmp.name) / "state")}):
+            srv = self.mcp.MemoryServer(index=MemoryIndex().build(), corpus_dir=str(self.corpus),
+                                        enable_passive_recall=True)
+
+        def listed(ok):
+            return [t["name"] for t in srv.handle(
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, hidden_ok=ok)["result"]["tools"]]
+        names = [t["name"] for t in self.mcp.TOOLS]
+        self.assertEqual(listed(False), names)
+        self.assertEqual(listed(True), names + [self.mcp.PASSIVE_RECALL_TOOL])
+        self.assertEqual((len(listed(False)), len(listed(True))), (8, 9))
 
 
 if __name__ == "__main__":

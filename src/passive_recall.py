@@ -18,7 +18,7 @@ import threading
 import unicodedata
 
 from memory_retrieval import _chunk_key
-from passive_facts import FACT_FLOOR
+from passive_facts import FACT_FLOOR, FACT_GROUP_BYTES, FACT_SIBLINGS, FACT_TOP, STATE_SIM
 from passive_metadata import source_signature
 from session_recall import DEFAULT_MAX_ITEM_CHARS
 
@@ -889,7 +889,7 @@ class PassiveRecallService:
                  assemble_candidates=False, max_piece_bytes=DEFAULT_MAX_PIECE_BYTES,
                  fact_index=None, fact_cooldown=None):
         self.index = index
-        # 事实模式：给了事实索引就不走块路径，每轮递前 2 条事实。
+        # 事实模式：给了事实索引就不走块路径，每轮递前 2 条事实，外加它们同块的几条。
         self.fact_index = fact_index
         self.fact_cooldown = fact_cooldown
         self.max_candidates = int(max_candidates)
@@ -1083,12 +1083,28 @@ class PassiveRecallService:
             return str(meta["local_date"])
         return "时间未知"
 
+    def _older_states(self, rows):
+        """同一轮里的状态事实，另有一条同块、事件日（没填按写入日）更晚的，就算“较早的状态”；同一天的不标，
+        同一条记忆里同一天的两条状态多半是一件事的两个面。设了 STATE_SIM 才把不同块、余弦 ≥ 它的也算进来。
+        只标不删；单独一条旧状态不标——年头久不等于过期。返回行 id 集合。"""
+        states = [row for row in rows if row["meta"].get("kind") == "state" and row["meta"].get("local_date")]
+        older = set()
+        for a in states:
+            for b in states:
+                if str(b["meta"]["local_date"]) > str(a["meta"]["local_date"]) and (
+                        (a["meta"].get("block") and a["meta"].get("block") == b["meta"].get("block"))
+                        or (STATE_SIM is not None and self.fact_index.similarity(a, b) >= STATE_SIM)):
+                    older.add(a["id"])
+                    break
+        return older
+
     def _assemble(self, records):
         rows = [self._record_row(record["recordId"]) for record in records]
         if rows and all(row is not None and (row.get("meta") or {}).get("layer") == "fact"
                         for row in rows):
             # 事实模式：引导句在会话开场常驻一次，这里只给日期与事实本身（每段约 140 字节）。
             blocks = ["〔历史证据〕"]
+            older = self._older_states(rows)
             for record, row in zip(records, rows):
                 excerpt = self._safe_excerpt(row["text"], record["ranges"])
                 if not excerpt:
@@ -1097,6 +1113,8 @@ class PassiveRecallService:
                 if (row.get("meta") or {}).get("kind") == "state":
                     # 「现在是什么状态」类的事实会过期：标明是当时的状态，免得被当成此刻。
                     when += "；当时的状态"
+                if row["id"] in older:
+                    when += "；这是较早的状态，可能已被更新"
                 blocks.extend([f"〔来源：{record['recordId']}；{when}〕", excerpt])
             blocks.append("〔历史证据结束〕")
             return "\n".join(blocks)
@@ -1157,6 +1175,16 @@ class PassiveRecallService:
                 for key in ("sessionId", "turnId", "deliveryId")):
             raise PassiveRecallRequestError("turn 必须提供 sessionId／turnId／deliveryId")
         delivery_id = turn["deliveryId"]
+        origin = request.get("origin")
+        if origin not in (None, "main", "derived"):
+            raise PassiveRecallRequestError(
+                "origin 只能是 main（人和主会话之间这一轮）或 derived（子智能体、派生会话、不是人说的回合）；"
+                "分不清就传 derived 或干脆别调")
+        if origin == "derived":
+            # #43：派生来源一律不浮——不检索、不登记交付、不记冷却、不进请求缓存。没声明的照旧（兼容优先）。
+            return {"status": "empty", "deliveryId": delivery_id,
+                    "wireVersion": WIRE_VERSION, "policyVersion": POLICY_VERSION,
+                    "reasonCodes": ["origin_derived"]}
         scope_value = request.get("scope")
         scope = "general" if scope_value is None else scope_value
         if not isinstance(scope, str) or not scope.strip():
@@ -1460,7 +1488,7 @@ class PassiveRecallService:
     def _fact_candidate(self, user_input, delivery_id, gate_reason, request,
                         request_key, fingerprint):
         """事实模式：原句一个向量，取前 2 条非 meta、写入日早于今天、来源块仍现行的事实，
-        再去掉低于噪音下限的和冷却中的，不补位。"""
+        再去掉低于噪音下限的和冷却中的，不补位；剩下的每条再带上同块里也过下限、不在冷却的几条。"""
         today = self._today()
         cooldown = self.fact_cooldown
 
@@ -1491,23 +1519,60 @@ class PassiveRecallService:
         self.fact_index.reload_if_changed()
         if self.fact_index.provider is not None and not self.fact_index.ready:
             return empty("fact_index_failed" if self.fact_index.error else "fact_index_warming")
-        ranked = self.fact_index.ranked(user_input, exclude=exclude)
-        if ranked is None:
+        scored = self.fact_index.ranked(user_input, exclude=exclude, top=None)
+        if scored is None:
             return empty("fact_no_embedding")
+        above = [(row, score) for row, score in scored if score >= FACT_FLOOR]
         # 只看最像的前 2 名，不往下挖：冷却中的直接去掉、不由第 3、4 名顶上——
         # 同一话题连着聊时第一轮递过，后面就安静；否则越挖越不沾边，递的全是噪音。
-        ranked = [(row, score) for row, score in ranked if score >= FACT_FLOOR]
+        ranked = above[:FACT_TOP]
         if not ranked:
             return empty("fact_below_floor")
-        ranked = [(row, score) for row, score in ranked
-                  if cooldown is None or not cooldown.cooling(_chunk_key(row["text"]), self._now())]
+
+        def cooling(row):
+            return cooldown is not None and cooldown.cooling(_chunk_key(row["text"]), self._now())
+
+        ranked = [(row, score) for row, score in ranked if not cooling(row)]
         if not ranked:
             return empty("fact_cooled")
-        records, dependencies = [], []
-        for row, _score in ranked:
-            recs, deps = self._candidate_dependencies(row, None)
-            records.extend(recs)
-            dependencies.extend(deps)
+
+        def ordered(siblings):
+            # 每条前 2 名后面紧跟它同块的兄弟行，同一件事的几个面挨在一起。
+            out = []
+            for row, score in ranked:
+                out.append((row, score))
+                out.extend(s for s in siblings if s[0]["meta"]["block"] == row["meta"].get("block")
+                           and s not in out)
+            return out
+
+        def records_of(pairs):
+            records, dependencies = [], []
+            for row, _score in pairs:
+                recs, deps = self._candidate_dependencies(row, None)
+                records.extend(recs)
+                dependencies.extend(deps)
+            return records, dependencies
+
+        # 同源成组：兄弟行同样要过下限、不在冷却，最多 FACT_SIBLINGS 条；加上它整段递送文本要仍在
+        # FACT_GROUP_BYTES（默认 1000）内，放不下就不带。前 2 名本身照旧递，不受这道闸影响。
+        blocks = {row["meta"].get("block") for row, _ in ranked} - {None}
+        taken = {row["id"] for row, _ in ranked}
+        siblings = []
+        for row, score in above:
+            if len(siblings) >= FACT_SIBLINGS:
+                break
+            if row["id"] in taken or row["meta"].get("block") not in blocks or cooling(row):
+                continue
+            try:
+                size = len(self._assemble(records_of(ordered(siblings + [(row, score)]))[0]).encode("utf-8"))
+            except ValueError:
+                continue
+            if size <= FACT_GROUP_BYTES:
+                siblings.append((row, score))
+        ranked = ordered(siblings)
+        records, dependencies = records_of(ranked)
+        extra = (["fact_group"] if siblings else []) + (
+            ["fact_state_older"] if self._older_states([row for row, _ in ranked]) else [])
         context_evidence = request.get("contextEvidence")
         if context_evidence is not None and not isinstance(context_evidence, list):
             raise PassiveRecallRequestError("contextEvidence 必须是数组")
@@ -1516,14 +1581,14 @@ class PassiveRecallService:
                     "assemblyPolicyVersion": ASSEMBLY_POLICY_VERSION,
                     "assemblyVersion": _digest(dependencies),
                     "records": records, "dependencies": dependencies,
-                    "reasonCodes": [gate_reason, "fact_top2"]}
+                    "reasonCodes": [gate_reason, "fact_top2"] + extra}
         if self.assemble_candidates:
             try:
                 response["content"] = self._assemble(records)
             except ValueError:
                 return empty("source_unresolved")
             response["status"] = "ready"
-            response["reasonCodes"] = [gate_reason, "w4_assembled", "fact_top2"] \
+            response["reasonCodes"] = [gate_reason, "w4_assembled", "fact_top2"] + extra \
                 + [f"fact_score:{score:.3f}" for _row, score in ranked]
         self._record_delivery(request["turn"]["sessionId"], delivery_id, dependencies)
         if cooldown is not None:

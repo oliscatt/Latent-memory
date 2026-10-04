@@ -126,6 +126,10 @@ def chunk_heading(text: str, max_chars=1500, merge_bodyless=True):
     合并保留原标题行（那些标题本身是内容），且**不破 max_chars 上界**：
     攒到装不下就先出一块。
 
+    ⚠ **切法就是 recordId**：recordId 是块正文的哈希（`memory_retrieval._chunk_key`），有宿主不经
+    `latent_append` 写语料、照这套规则自己算 recordId 给事实记 `block`（VPS 的 timeline 推送器）。
+    改这里的切法或 `max_chars`，那边已经写下的事实就对不上块了，要两边一起改。
+
     `merge_bodyless=False` 只给**诊断**用（`mcp_server --doctor`）：合并会把病态形态
     在建库阶段吃掉，体检就再也报不出来了——**两条防线不能互相吃掉**，
     所以体检要能看一眼合并前的样子。这个参数不是给建库路径留的开关，
