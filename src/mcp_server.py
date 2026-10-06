@@ -5122,17 +5122,17 @@ def _selftest():
     assert INDEX_SUMMARY_FORMAT_GUIDE == append_tool["inputSchema"]["properties"][
         "indexSummaries"]["items"]["properties"]["summary"]["description"], \
         "summary 参数说明必须复用同一份格式契约"
-    quickstart = (Path(__file__).resolve().parent.parent / "docs" / "快速上手.md").read_text(
+    quickstart = (Path(__file__).resolve().parent.parent / "docs" / "工具参考.md").read_text(
         encoding="utf-8")
-    quickstart_section = quickstart.split("### 手工调用 `latent_append` 的完整参数", 1)[1]
+    quickstart_section = quickstart.split("## 写回：`latent_append`", 1)[1]
     quickstart_json = re.search(r"```json\n(.*?)\n```", quickstart_section, re.S)
-    assert quickstart_json, "《快速上手》缺 latent_append 完整 JSON 样例"
+    assert quickstart_json, "《工具参考》缺 latent_append 完整 JSON 样例"
     quickstart_args = json.loads(quickstart_json.group(1))
     quickstart_evidence = validate_index_evidence(
         quickstart_args["indexEvidence"],
         [quickstart_args["text"], quickstart_args["current_state"]])
     assert "企鹅漫步" in render_index_evidence(quickstart_evidence, "2026-08-23"), \
-        "《快速上手》的结构化证据样例必须通过当前校验器并由服务端渲染"
+        "《工具参考》的结构化证据样例必须通过当前校验器并由服务端渲染"
     search_schema = tools[0]["inputSchema"]
     assert search_schema["required"] == ["query"] \
         and search_schema["properties"]["queryVariant"]["type"] == "string", \
@@ -7913,7 +7913,54 @@ def _selftest():
             "回过的便条不再进开场"
         h27.shutdown()
 
-    print("selftest ok（27项断言：握手 / 工具表 / 调用往返 / 薄适配层 / 错误分层（含 "
+    # 28.【stdio 下配 --admin-token 也开便条·真进程】山屋页面常常由另一个 HTTP 进程起，
+    #     TA 那边走 stdio：便条是写给 TA 看的，不该只在起了页面的那个进程里才看得见。
+    #     判据：stdio 进程只配 MEMORY_HTTP_ADMIN_TOKEN（没有 --http），tools/list 里有
+    #     latent_note_reply，开场最先给还没回的便条（断便条原文，不只断标题——坏行也会
+    #     带着标题报出来）；不配时两样都没有（回归护栏：默认部署工具表、开场一个字不变）。
+    #     变异：把 main() 里 if args.http 之前那句 enable_notes() 删掉 → 第一条红
+    def stdio_run28(corpus_dir, env_extra):
+        env = {k: v for k, v in os.environ.items() if k != "MEMORY_HTTP_ADMIN_TOKEN"}
+        env.update(PYTHONIOENCODING="utf-8", **env_extra)
+        msgs = [json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                            "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                                       "clientInfo": {"name": "t28", "version": "0"}}}),
+                json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+                json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+                json.dumps({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                            "params": {"name": "latent_session_start", "arguments": {}}})]
+        p28 = subprocess.run([sys.executable, str(here / "mcp_server.py"), "--corpus", str(corpus_dir)],
+                             input=("\n".join(msgs) + "\n").encode("utf-8"),
+                             capture_output=True, env=env, timeout=120)
+        got = {}
+        for line in p28.stdout.decode("utf-8", "replace").splitlines():
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            if "id" in d:
+                got[d["id"]] = d
+        assert 2 in got and 3 in got, f"stdio 往返不完整：{p28.stderr.decode('utf-8', 'replace')[-600:]}"
+        names = {t["name"] for t in got[2]["result"]["tools"]}
+        return names, got[3]["result"]["content"][0]["text"]
+
+    with tempfile.TemporaryDirectory() as td28:
+        c28 = _P(td28) / "corpus"
+        (c28 / "timeline").mkdir(parents=True)
+        (c28 / "timeline" / "window_01_2026-08-01.md").write_text(
+            "# 第1个窗口 · 2026-08-01\n\n## 2026-08-01 记\n咖啡机周二跳闸。\n当下状态：已修好。\n",
+            encoding="utf-8")
+        NoteStore(c28 / "便条.jsonl").add("那天不是周二，是周三。", "2026-08-02T09:00:00+08:00", kind="wrong")
+        names_on, opening_on = stdio_run28(c28, {"MEMORY_HTTP_ADMIN_TOKEN": "admin-28"})
+        assert NOTE_REPLY_TOOL in names_on, \
+            f"stdio 下配了 admin 钥匙也要开便条：工具表里没有 {NOTE_REPLY_TOOL}：{sorted(names_on)}"
+        assert opening_on.startswith("【对方写给你的便条】") and "那天不是周二，是周三。" in opening_on, \
+            f"stdio 下开场要最先给还没回的便条原文：{opening_on[:300]}"
+        names_off, opening_off = stdio_run28(c28, {})
+        assert NOTE_REPLY_TOOL not in names_off and "便条" not in opening_off, \
+            f"没配 admin 钥匙时工具表与开场都不该变：{sorted(names_off)} / {opening_off[:200]}"
+
+    print("selftest ok（28项断言：握手 / 工具表 / 调用往返 / 薄适配层 / 错误分层（含 "
           "session_start 读取异常只重试一次、未预料异常不空断、写工具不重放）/ "
           "完整链路 / stdio / UTF-8 / 写回当场可查 / 写回预检（零写入、补索引预检、"
           "参数错误写错／写对对照）/ 事实变迁链（A→B→C 双向链接、默认只返回 current、"
@@ -7955,7 +8002,7 @@ def _selftest():
           "长流被关掉＝指出口、开满＝说开满），且三句都不许糊到别的被拒行上）/ "
           "--log-file 让 stderr 留得下痕·真进程（诊断人话落盘、父目录自建、"
           "每次启动一条带 pid 的横幅，同一文件跑两次＝两条横幅且追加不截断——"
-          "「子进程重启过」由此可直接读出，不必再靠 token 账单倒推） / 隐藏入口按凭证隔离·真 HTTP（开自动浮现时宿主凭证 10 项、普通凭证恰 9 项且其余九项逐字不变；普通凭证盲调隐藏入口回「未知工具」而非参数校验错——凭证判断早于校验，错误文案不泄漏入口的存在与形状；宿主那条路的返回结构与三个 version 字段照旧；没配 --hook-token 时 fail-closed：所有凭证都看不见、盲调也是未知工具，宿主 hook 自己也用不了，漏配当场坏而不是静默全开） / 页面读数据的口子·真端口（默认关、三把钥匙互不通用、只收 GET、外来 Origin 403、no-store、参数超限 400、静态页不出目录；便条：不开口子没有回便条的工具、模型那把钥匙贴不进、空的 400、POST 只有便条一条路、开场最先列、不改必须说为什么、回了页面看得到、回过不再进开场）")
+          "「子进程重启过」由此可直接读出，不必再靠 token 账单倒推） / 隐藏入口按凭证隔离·真 HTTP（开自动浮现时宿主凭证 10 项、普通凭证恰 9 项且其余九项逐字不变；普通凭证盲调隐藏入口回「未知工具」而非参数校验错——凭证判断早于校验，错误文案不泄漏入口的存在与形状；宿主那条路的返回结构与三个 version 字段照旧；没配 --hook-token 时 fail-closed：所有凭证都看不见、盲调也是未知工具，宿主 hook 自己也用不了，漏配当场坏而不是静默全开） / 页面读数据的口子·真端口（默认关、三把钥匙互不通用、只收 GET、外来 Origin 403、no-store、参数超限 400、静态页不出目录；便条：不开口子没有回便条的工具、模型那把钥匙贴不进、空的 400、POST 只有便条一条路、开场最先列、不改必须说为什么、回了页面看得到、回过不再进开场） / stdio 下配 --admin-token 也开便条·真进程（只配环境变量、没有 --http：工具表有 latent_note_reply、开场最先给还没回的便条原文；不配时两样都没有）")
 
 
 if __name__ == "__main__":
@@ -8024,9 +8071,11 @@ if __name__ == "__main__":
                          "得到「未知工具」。⚠ fail-closed：不配＝对所有凭证关闭，宿主 hook 自己"
                          "也用不了——它跟「部署必须配 token」是一套。")
     ap.add_argument("--admin-token", dest="admin_token",
-                    help="给人看的只读口子（/admin/api，记忆可视化用）的钥匙，也认环境变量 "
+                    help="给人看的只读口子（/admin/api，山屋页面用）的钥匙，也认环境变量 "
                          "MEMORY_HTTP_ADMIN_TOKEN。不配＝这个口子不存在。不能跟 --token、"
-                         "--hook-token 相同；模型看不见它，它也调不动 /mcp")
+                         "--hook-token 相同；模型看不见它，它也调不动 /mcp。配了它同时打开便条："
+                         "工具表多 latent_note_reply、开场最先给还没回的便条——走 stdio 时没有"
+                         "页面口子，但照样开便条，让另一个进程起的山屋页面上写的便条有人回")
     ap.add_argument("--ui", metavar="目录",
                     help="配 --http：把这个目录挂在 /hut/（记忆可视化的静态页；页面里没有记忆）")
     ap.add_argument("--persona", metavar="人格文件",
@@ -8130,6 +8179,12 @@ if __name__ == "__main__":
             _startup_failed("load", e)
         finally:
             _load_done()
+        # 便条不只属于起了页面的那个进程：山屋常由另一个 HTTP 进程挂着，TA 这边走 stdio 也要
+        # 看得到、回得了。配了页面钥匙（参数或环境变量）就开，不看传输形态。
+        admin_token = (args.admin_token
+                       or os.environ.get("MEMORY_HTTP_ADMIN_TOKEN") or None)
+        if admin_token:
+            srv.enable_notes()
         if args.http:
             host, _, port = args.http.rpartition(":")
             host = host or "127.0.0.1"
@@ -8139,15 +8194,12 @@ if __name__ == "__main__":
             if hook_token and hook_token == token:
                 ap.error("--hook-token 跟 --token 一样等于没分开：两条凭证相同时"
                          "服务端照样分不出宿主 hook 与模型，隐藏入口仍然全开。")
-            admin_token = (args.admin_token
-                           or os.environ.get("MEMORY_HTTP_ADMIN_TOKEN") or None)
             if admin_token and admin_token in (token, hook_token):
                 ap.error("--admin-token 不能跟 --token／--hook-token 相同：三把钥匙要分开，"
                          "不然模型拿着自己那把就能读页面口子")
             admin = None
             if admin_token:
                 from admin_api import AdminAPI
-                srv.enable_notes()
                 admin = AdminAPI(
                     srv, persona_path=args.persona,
                     fact_path=(os.environ.get("LATENT_PASSIVE_FACTS")

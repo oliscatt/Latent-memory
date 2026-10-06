@@ -1523,7 +1523,7 @@ def mcp_config_snippet(server_path, corpus_dir, threads_path, route=None,
         args += ["--index-dir", vals[3]]
     args += ["--threads", vals[2], "--timezone", tz]
     cfg = {CONFIG_NOTE_KEY: note,
-           "mcpServers": {"memory": {
+           "mcpServers": {"latent": {
                "command": command,
                "args": args + route_args(route or ROUTE_DEFAULT),
            }}}
@@ -3145,7 +3145,7 @@ def _selftest():
         assert len(paths["corpus_files"]) == 2, "出货时语料要真的落进 memory/"
         assert paths["persona"].name == "CLAUDE.md" and paths["persona"].exists()
         cfg = json.loads(paths["mcp_config"].read_text(encoding="utf-8"))
-        assert "memory" in cfg["mcpServers"] and "--corpus" in cfg["mcpServers"]["memory"]["args"]
+        assert "latent" in cfg["mcpServers"] and "--corpus" in cfg["mcpServers"]["latent"]["args"]
         #    客户端适配：codex 出 AGENTS.md
         assert write_bundle(td, p5, client="codex", confirmed=True)["persona"].name == "AGENTS.md"
         assert paths.get("contract") is None, "有宿主的档不该塞契约副本（那是 generic 档的活）"
@@ -3246,7 +3246,7 @@ def _selftest():
         #    选了云端，启动参数就得真的是云端档——选择点不改产出物的话，"选过一次"
         #    只是走了个过场
         cfg_r = json.loads((Path(td) / "mcp-config.json").read_text(encoding="utf-8"))
-        cargs = cfg_r["mcpServers"]["memory"]["args"]
+        cargs = cfg_r["mcpServers"]["latent"]["args"]
         assert "--embed" in cargs and "cloud" in cargs, f"云端档没写进启动参数：{cargs}"
         #    **但 key 一个字都不许进产出目录**：mcp-config.json 会跟着产出目录走，
         #    用户会随手贴给别人；key 只从环境变量读（变异靶心：把 key 写进 args 必红）
@@ -3282,7 +3282,7 @@ def _selftest():
         #    MCP 配置里的 server 路径必须是能直接用的绝对路径——自建前端作者没有
         #    《快速上手》那条 claude mcp add 绝对路径示范，配置给什么他就用什么
         cfg = json.loads((Path(td) / "mcp-config.json").read_text(encoding="utf-8"))
-        server_arg = Path(cfg["mcpServers"]["memory"]["args"][0])
+        server_arg = Path(cfg["mcpServers"]["latent"]["args"][0])
         assert server_arg.is_absolute() and server_arg.exists(), \
             f"mcp-config.json 里的 server 路径不可直接使用：{server_arg}"
         #    **样板说明必须在文件里**（2026.08.01 维护者拍板"不改名、加说明"）：
@@ -3300,7 +3300,7 @@ def _selftest():
         #    `command == "python"`——**那正好把缺陷本身写成了断言**，2026.08.05 外部
         #    实测第 2 条撞的就是它（只装 python3 的机器照抄必挂）。
         assert set(cfg) == {CONFIG_NOTE_KEY, "mcpServers"} and \
-            set(cfg["mcpServers"]["memory"]) == {"command", "args"}, \
+            set(cfg["mcpServers"]["latent"]) == {"command", "args"}, \
             f"那一行说明把配置结构挤歪了：{sorted(cfg)}"
         #    **说明本身不许把 key 漏出去**：它是随产出目录走的文件，同 key 那条纪律
         assert "sk-" not in cfg[CONFIG_NOTE_KEY]
@@ -3411,7 +3411,7 @@ def _selftest():
     #     文件会跟着产出目录被随手分享出去。
     snips = {r: json.loads(mcp_config_snippet("/x/mcp_server.py", "/x/memory",
                                               "/x/threads.jsonl", route=r)
-                           )["mcpServers"]["memory"]["args"] for r in RETRIEVAL_ROUTES}
+                           )["mcpServers"]["latent"]["args"] for r in RETRIEVAL_ROUTES}
     assert "--embed" not in snips["zero-dep"], "零依赖档不该带 --embed"
     assert snips["local"][-1:] == ["--embed"], f"本地档该只多一个 --embed：{snips['local']}"
     assert snips["cloud"][-3:] == ["--embed", "--embed-provider", "cloud"], \
@@ -3430,7 +3430,7 @@ def _selftest():
     #      变异不红才发现。**"断言在缺陷面前全绿"跟"没有这条断言"是一回事。**
     rel_args = json.loads(mcp_config_snippet(
         "mcp_server.py", "memory", "threads.jsonl",
-        index_dir="bundle/memory/index"))["mcpServers"]["memory"]["args"]
+        index_dir="bundle/memory/index"))["mcpServers"]["latent"]["args"]
     for label, value in (("server", rel_args[0]), ("--corpus", rel_args[2]),
                          ("--index-dir", rel_args[4]), ("--threads", rel_args[6])):
         assert Path(value).is_absolute(), \
@@ -3448,7 +3448,7 @@ def _selftest():
     try:
         no_tz = json.loads(mcp_config_snippet("/x/mcp_server.py", "/x/memory",
                                               "/x/threads.jsonl"))
-        n_args = no_tz["mcpServers"]["memory"]["args"]
+        n_args = no_tz["mcpServers"]["latent"]["args"]
         assert n_args[-2:] == ["--timezone", DEFAULT_TIMEZONE], \
             f"没人给时区时，落进 args 的该是默认值 {DEFAULT_TIMEZONE}：{n_args}"
         assert "Etc/UTC" not in " ".join(n_args), \
@@ -3457,7 +3457,7 @@ def _selftest():
             "说明里必须写明这是默认值、且如实说这台机器探到的是别的（让人有机会发现不一致）"
         given = json.loads(mcp_config_snippet("/x/mcp_server.py", "/x/memory",
                                               "/x/threads.jsonl", timezone="Europe/Berlin"))
-        g_args = given["mcpServers"]["memory"]["args"]
+        g_args = given["mcpServers"]["latent"]["args"]
         assert g_args[-2:] == ["--timezone", "Europe/Berlin"], f"人给了就得落进 args：{g_args}"
         assert "Etc/UTC" not in given[CONFIG_NOTE_KEY] and "默认值" not in given[CONFIG_NOTE_KEY], \
             "人给了之后不该再提探测值或默认值，免得几个值打架"
@@ -3484,7 +3484,7 @@ def _selftest():
                       index_dir=root / "memory" / "index")
         cc = json.loads(mcp_config_snippet(**inside, client="claude-code",
                                            portable_root=root))
-        cc_args = cc["mcpServers"]["memory"]["args"]
+        cc_args = cc["mcpServers"]["latent"]["args"]
         assert cc_args[0] == PORTABLE_PREFIX + "src/mcp_server.py", \
             f"Claude Code 档 server 路径没走占位符：{cc_args[0]}"
         assert not any(str(root).replace("\\", "/") in x for x in cc_args), \
@@ -3497,7 +3497,7 @@ def _selftest():
         for other in ("codex", "generic", None):
             oc = json.loads(mcp_config_snippet(**inside, client=other,
                                                portable_root=root))
-            oa = oc["mcpServers"]["memory"]["args"]
+            oa = oc["mcpServers"]["latent"]["args"]
             assert not any("${" in x for x in oa), \
                 f"{other} 档的配置里出现了只有 Claude Code 认的占位符：{oa}"
             assert "换机器/换容器要重新跑" in oc[CONFIG_NOTE_KEY], \
@@ -3509,7 +3509,7 @@ def _selftest():
             root / "memory", root / "threads.jsonl",
             client="claude-code", portable_root=root,
             index_dir=root / "memory" / "index"))
-        oargs = outside["mcpServers"]["memory"]["args"]
+        oargs = outside["mcpServers"]["latent"]["args"]
         assert not any("${" in x for x in oargs), \
             f"server 不在产出目录下还产占位符，就是半套可搬运的假货：{oargs}"
         assert "换机器/换容器要重新跑" in outside[CONFIG_NOTE_KEY]
@@ -4363,7 +4363,7 @@ def _selftest():
                    for p in v2_timeline.glob("*.md")), \
             "v2 真 CLI 收了 --import 却没把正文写进 timeline"
         v2_cfg = json.loads((root / "mcp-config.json").read_text(encoding="utf-8"))
-        v2_args = v2_cfg["mcpServers"]["memory"]["args"]
+        v2_args = v2_cfg["mcpServers"]["latent"]["args"]
         v2_configured_corpus = Path(v2_args[v2_args.index("--corpus") + 1])
         assert v2_configured_corpus.resolve() == (root / "memory").resolve(), \
             "v2 的 inspect 虽保存过外部 --corpus，显式 --import 后配置必须改指新落库目录"
@@ -4702,10 +4702,10 @@ def _selftest():
         #    而症状是客户端 spawn 静默失败、没有一行指回这个字段）。
         probe_cfg = json.loads(
             (probe_out / "mcp-config.json").read_text(encoding="utf-8"))
-        probe_args = probe_cfg["mcpServers"]["memory"]["args"]
+        probe_args = probe_cfg["mcpServers"]["latent"]["args"]
         assert probe_args[probe_args.index("--index-dir") + 1].replace("\\", "/").endswith(
             "/memory/index"), f"配置没有接入独立索引目录：{probe_args}"
-        probe_command = probe_cfg["mcpServers"]["memory"]["command"]
+        probe_command = probe_cfg["mcpServers"]["latent"]["command"]
         assert subprocess.run([probe_command, "-c", "import sys"],
                               capture_output=True).returncode == 0, \
             f"mcp-config.json 里的 command 在这台机器上起不来：{probe_command!r}"
@@ -4860,7 +4860,7 @@ def _selftest():
             direct_state["shipping"]["direct_persona_selected"] is True, \
             "直接模式把跳过编译伪装成了编译闸门通过"
         direct_cfg = json.loads((direct_out / "mcp-config.json").read_text(encoding="utf-8"))
-        direct_args = direct_cfg["mcpServers"]["memory"]["args"]
+        direct_args = direct_cfg["mcpServers"]["latent"]["args"]
         configured_corpus = Path(direct_args[direct_args.index("--corpus") + 1])
         assert configured_corpus.resolve() == (direct_out / "memory").resolve(), \
             "直接模式配置没有指向实际语料目录"

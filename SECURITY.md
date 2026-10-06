@@ -49,6 +49,9 @@ Latent 处理的是人格文件、长期记忆和会话线索。安全问题里�
 - 开自动浮现且走 HTTP 时，隐藏入口 `latent_passive_recall` 只对 `--hook-token`（或
   `MEMORY_HTTP_HOOK_TOKEN`）开放，不配则对所有凭证关闭；这条 token 只交给宿主 hook，不要交给
   模型或普通客户端，且不能与 `--token` 相同。stdio 下宿主必须自己把隐藏入口从模型工具表中去掉。
+- 山屋页面的 `/admin/api` 只认 `--admin-token`，能读全库（含被取代与撤回的记录），只回同源请求、
+  不进工具表；这把钥匙不能与 `--token`／`--hook-token` 相同，存在浏览器本地存储里，与 `--token`
+  同等保管。页面唯一的写入是便条，追加进 `<corpus>/便条.jsonl`，不改记忆正文。
 - 云端 embedding 会把语料块和查询发送给所选服务商；开了事实模式时，还会发送事实文本与每轮
   用户原句。本地 embedding 与零依赖档不发送这些内容。无论使用哪种检索档，召回结果一旦返回聊天客户端，就会进入该客户端／模型的上下文。
 - `latent_supersede` 把当时真实、后来变化的旧事实保留在 `.supersessions.json` 关系链中，

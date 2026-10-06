@@ -41,7 +41,8 @@ class McpClient:
     """按产出目录里的 mcp-config.json 起 stdio server，握手后只做转发。"""
 
     def __init__(self, config_path):
-        cfg = json.loads(Path(config_path).read_text(encoding="utf-8"))["mcpServers"]["memory"]
+        servers = json.loads(Path(config_path).read_text(encoding="utf-8"))["mcpServers"]
+        cfg = servers.get("latent") or next(iter(servers.values()))   # 旧产出的键叫 memory，也认
         # encoding 锁死 UTF-8：MCP 规格定死 stdio 是 UTF-8，Windows 默认 cp936 会
         # 静默乱码（mcp_server.py serve_stdio 的注释记着那次真机 bug，两头都要锁）
         self.proc = subprocess.Popen([cfg["command"], *cfg["args"]],
@@ -279,7 +280,7 @@ def _selftest():
         (corpus / "w.md").write_text("## 修咖啡机\n保险丝熔断，换上通电正常。", encoding="utf-8")
         cfgp = Path(td) / "mcp-config.json"
         server = Path(__file__).resolve().parent / "mcp_server.py"
-        cfgp.write_text(json.dumps({"mcpServers": {"memory": {
+        cfgp.write_text(json.dumps({"mcpServers": {"latent": {
             "command": sys.executable,
             "args": [str(server), "--corpus", str(corpus)]}}}), encoding="utf-8")
         mcp = McpClient(cfgp)
@@ -338,7 +339,7 @@ for line in sys.stdin:
     print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": result}), flush=True)
 ''', encoding="utf-8")
         cfgp = Path(td) / "mcp-config.json"
-        cfgp.write_text(json.dumps({"mcpServers": {"memory": {
+        cfgp.write_text(json.dumps({"mcpServers": {"latent": {
             "command": sys.executable, "args": [str(fake_server)]}}}), encoding="utf-8")
         slow_mcp = McpClient(cfgp)
         try:

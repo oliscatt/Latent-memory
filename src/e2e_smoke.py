@@ -475,7 +475,7 @@ def _selftest():
         #    接缝断言①：mcp-config 的 --corpus 必须指向真写了语料的那个目录——
         #    config 指错目录时四件套各自看都正常，接上客户端才发现库是空的
         cfg = json.loads(got["mcp_config"].read_text(encoding="utf-8"))
-        cfg_args = cfg["mcpServers"]["memory"]["args"]
+        cfg_args = cfg["mcpServers"]["latent"]["args"]
         cfg_corpus = Path(cfg_args[cfg_args.index("--corpus") + 1])
         assert cfg_corpus == got["memory_dir"], \
             f"config 指向 {cfg_corpus}，语料实际在 {got['memory_dir']}"
