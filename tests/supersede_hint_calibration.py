@@ -3,16 +3,18 @@
 只读：语料、块向量缓存、事实变迁账本、撤回账本；不调向量服务（缓存里没有向量的块跳过、计数）；不写任何文件；
 **不打印任何正文**，只出计数、分位数和提示率表。规则：
 
-- 反例（触发总体）：--population（写回目录）下的每条 timeline 记录，只和写入时间早于它的现行 timeline 记录比，
+- 反例（触发总体）：--population（写回目录）下的每条 timeline 记录，只和写入时间早于它、不是同一天的现行 timeline 记录比
+  （同一天按记录自己的日期，与服务端 supersede_pool 同一个判断 same_record_day），
   记第一名分数 s1、领先量 s1−s2；提示与否按 memory_retrieval.pick_supersede_hint 判（一条或两条都算一次）。
 - 网格 T∈{0.30, 0.35, …, 0.95}、M∈{0.02, 0.04, …, 0.20} 逐格算提示率。给了 --max-rate，就取提示率不超过它的格里
   提示率最高的那格；并列取 M 大的，再并列取 T 大的。整张表照样打出来。
 - 正例：账本里新记录在写回目录里、两条都有向量的每一对，按选定的线看提示能不能列出旧的那条；一对都没有就是
   “未知，待正例”。
+- 给了 --line T M，另按这条线列出会提示的每条：新记录与提示到的旧记录的 recordId、相似度（只有 recordId 和分数）。
 
 用法（内存紧的机器上建议限内存跑，参数照服务的启动命令带）：
   python tests/supersede_hint_calibration.py --corpus <语料> --population <写回目录> \\
-      --cache <语料>/.embed_cache.json [--max-rate 0.05]
+      --cache <语料>/.embed_cache.json [--max-rate 0.05] [--line 0.90 0.10]
 """
 import argparse
 import heapq
@@ -24,7 +26,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from embedding_provider import text_key                                  # noqa: E402
-from memory_retrieval import load_corpus, pick_supersede_hint, _dot      # noqa: E402
+from memory_retrieval import load_corpus, pick_supersede_hint, same_record_day, _dot      # noqa: E402
 
 QS = (5, 10, 25, 50, 75, 90, 95, 99)
 GRID_T = [round(0.30 + 0.05 * k, 2) for k in range(14)]
@@ -52,6 +54,7 @@ def main(argv=None):
     ap.add_argument("--supersessions", help="默认 <语料>/.supersessions.json")
     ap.add_argument("--retractions", help="默认 <语料>/.retractions.json")
     ap.add_argument("--max-rate", type=float, help="提示频率上限（0～1），由部署方自己定；不给就只出表")
+    ap.add_argument("--line", type=float, nargs=2, metavar=("T", "M"), help="按这条线列出提示明细（只有 recordId 和分数）")
     args = ap.parse_args(argv)
 
     corpus = Path(args.corpus)
@@ -90,11 +93,12 @@ def main(argv=None):
             continue
         at, rid = index.meta[p].get("timestamp") or 0, index.meta[p].get("record_id")
         # 还原写入那一刻的候选池：比它早写的现行记录。后来才被取代的旧记录那时还是现行的，要算进来
-        # （正例里的旧记录正是这种）；撤回与插件隐藏按现状算。
+        # （正例里的旧记录正是这种）；撤回与插件隐藏按现状算。同一天的不算（same_record_day，与服务端同一判断）。
         pool = [j for j in vecs if j != p and j not in index.retracted and j not in hidden
                 and index.meta[j].get("record_id") != rid
                 and (index.meta[j].get("timestamp") or 0) < at
-                and superseded_at.get(index.meta[j].get("record_id"), at) >= at]
+                and superseded_at.get(index.meta[j].get("record_id"), at) >= at
+                and not same_record_day(index.meta[j], index.meta[p])]
         rows[p] = heapq.nlargest(3, ((_dot(vecs[p], vecs[j]), j) for j in pool),
                                  key=lambda row: (row[0], -row[1]))
 
@@ -128,6 +132,13 @@ def main(argv=None):
             out["定线"] = {"T": t, "M": m, "提示率": rate, "提示次数": len(hinted),
                            "其中第一名与新记录同一天": same_day,
                            "接住率": f"{caught}/{len(pairs)}" if pairs else "未知，待正例"}
+    if args.line and rows:
+        t, m = args.line
+        rid = lambda i: index.meta[i].get("record_id")
+        hits = [{"新记录": rid(p), "提示": [{"recordId": rid(j), "相似度": round(s, 4)}
+                                         for s, j in pick_supersede_hint(top, t, m)]}
+                for p, top in rows.items() if pick_supersede_hint(top, t, m)]
+        out["按给定的线"] = {"T": t, "M": m, "提示次数": len(hits), "明细": hits}
     print(json.dumps(out, ensure_ascii=False, indent=1))
 
 

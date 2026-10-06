@@ -38,14 +38,21 @@ memory_retrieval.MemoryIndex.recall_recent 解决"没有 query 时召回什么"�
 """
 
 import argparse
+import json
+import os
 import re
+import sys
+import threading
+import time
 from datetime import datetime
+from pathlib import Path
 
 # 同目录模块，import 不触发各自的 CLI
 from memory_retrieval import MemoryIndex, _chunk_key  # noqa: F401
 from degradation_protocol import SessionStatus, degradation_signals  # noqa: F401
 from time_context import TimeContext  # noqa: F401
 from session_thread import ThreadStore, format_thread_block  # noqa: F401
+from notes_state import NoteStoreError, format_block as format_notes_block
 from unresolved_state import (UnresolvedStoreError, format_block as format_unresolved_block,
                               source_record_ids)
 
@@ -70,6 +77,38 @@ SELF_CHECK_FOOTER = (
 # 完整度更值钱；被截掉的全文让模型用 latent_search 再查一次，标注写在截断处。
 DEFAULT_MAX_ITEM_CHARS = 500
 TRUNCATION_NOTE = "…（片段已截断，要全文就用 latent_search 再查一次）"
+
+
+# 换窗召回记录（给 UI 的"每次换窗带回了什么"）：召回块原来只当场拼成文本注入，
+# 不留痕。现在每次递出时记一行，**只记 ID、分数与原因，不记正文**，展示时再按 ID 查。
+# 只留近七天：写的时候顺手把七天前的剪掉，文件永远只有几十行。
+RECALL_LOG_FILENAME = ".recall-log.jsonl"
+RECALL_LOG_DAYS = 7
+
+
+def read_recall_log(path, now=None, days=RECALL_LOG_DAYS):
+    """读近 `days` 天的换窗召回记录，旧的在前。文件不存在＝还没记过，返回空表；
+    坏行跳过（只是记录，不值得为一行坏数据让整页打不开）。"""
+    path = Path(path)
+    if not path.exists():
+        return []
+    cutoff = (time.time() if now is None else now) - days * 86400
+    rows = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(row, dict) and isinstance(row.get("at"), (int, float)) and row["at"] >= cutoff:
+            rows.append(row)
+    return rows
+
+
+def _recall_ref(row):
+    meta = row["meta"]
+    return {"recordId": meta.get("record_id") or _chunk_key(row["text"]),
+            "score": round(float(row["score"]), 4),
+            "date": meta.get("local_date")}
 
 
 def _clip(text, limit):
@@ -156,7 +195,7 @@ class SessionRecall:
     def __init__(self, index, topN=DEFAULT_TOPN, half_life=None,
                  compact_threshold_chars=DEFAULT_COMPACT_THRESHOLD_CHARS,
                  thread_store=None, time_context=None, unresolved_store=None,
-                 per_day_cap=None):
+                 per_day_cap=None, log_path=None):
         self.index = index
         self.topN = topN
         self.half_life = half_life  # None → recall_recent 用自己的默认半衰期
@@ -165,25 +204,51 @@ class SessionRecall:
         # “上次聊到哪”，没给就跳过 thread；其余层照常给——不断线（规格 §5 三层）
         self.thread_store = thread_store
         self.unresolved_store = unresolved_store
+        self.notes_store = None   # 开了页面口子由 MemoryServer.enable_notes() 接上
         self.per_day_cap = per_day_cap
         # 记忆所有者的时区（任务卡"写回时区与跨日归窗"）：只在 meta 没有 local_date
         # 的旧块上用得到——新块的日期在写入时就定死了，读的时候不再换算一次
         self.time_context = time_context
+        # 换窗召回记录落点；None＝不记（单测、没配 --corpus 的内存态）
+        self.log_path = Path(log_path) if log_path is not None else None
+        self._log_lock = threading.Lock()  # ponytail: 进程内锁；多进程共写一个库时换文件锁
         self._chars_since_recall = 0
 
-    def _recall(self, now=None, exclude_record_ids=()):
+    def _log(self, now, trigger, **fields):
+        """记一行换窗召回记录并剪掉七天前的。**记录失败绝不影响召回本身**：
+        召回是 TA 开场要用的，记录只是给人回看的。"""
+        if self.log_path is None:
+            return
+        at = time.time() if now is None else float(now)
+        row = {"at": at,
+               "time": (self.time_context or TimeContext.default()).isoformat(at),
+               "trigger": trigger, **fields}
+        try:
+            with self._log_lock:
+                rows = read_recall_log(self.log_path, now=at) + [row]
+                tmp = self.log_path.with_name(self.log_path.name + ".tmp")
+                tmp.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows),
+                               encoding="utf-8")
+                os.replace(tmp, self.log_path)
+        except OSError as exc:
+            print(f"换窗召回记录没写上（召回照常）：{type(exc).__name__}", file=sys.stderr)
+
+    def _recall_results(self, now=None, exclude_record_ids=()):
         if self.per_day_cap is not None:
-            results = self.index.recall_recent(
+            return self.index.recall_recent(
                 topN=self.topN, half_life=self.half_life, now=now,
                 per_day_cap=self.per_day_cap, exclude_record_ids=exclude_record_ids,
                 time_context=self.time_context)
-            return format_recall_block(results, time_context=self.time_context)
         results = self.index.recall_recent(
             topN=self.topN, half_life=self.half_life, now=now)
         if exclude_record_ids:
             results = [row for row in results if _chunk_key(row["text"])
                        not in exclude_record_ids]
-        return format_recall_block(results, time_context=self.time_context)
+        return results
+
+    def _recall(self, now=None, exclude_record_ids=()):
+        return format_recall_block(self._recall_results(now, exclude_record_ids),
+                                   time_context=self.time_context)
 
     def on_session_start(self, now=None, status=None):
         """触发点一·换窗：session 启动时调一次。
@@ -205,30 +270,49 @@ class SessionRecall:
         if status is not None:
             signals = degradation_signals(status)
             if signals:
+                self._log(now, "session_start", selfCheck="fail", signals=list(signals))
                 return ("【开场自查未通过】检测到" + "/".join(signals) +
                         "，本窗口可能在退化：先不接入召回记忆，请对方核实后再继续。")
-        blocks, unresolved_ids = [], set()
+        blocks, unresolved_ids, unresolved_items = [], set(), []
+        if self.notes_store is not None:
+            # 对方写给 TA 的便条最先给：“下次来先看它”。读不了就说读不了，不当成没有
+            try:
+                notes_block = format_notes_block(*self.notes_store.read())
+            except NoteStoreError as exc:
+                notes_block = f"【对方写给你的便条】⚠ 便条读取失败，未静默当成没有：{exc}"
+            if notes_block:
+                blocks.append(notes_block)
         if self.unresolved_store is not None:
             try:
                 unresolved, bad_lines = self.unresolved_store.read(allow_partial=True)
                 unresolved_block = format_unresolved_block(unresolved, bad_lines)
                 unresolved_ids = source_record_ids(unresolved)
+                unresolved_items = [item.id for item in unresolved]
             except UnresolvedStoreError as exc:
+                unresolved_items = None  # 读失败记 null，别跟"清单是空的"混成一个样
                 unresolved_block = ("【当前未解决】⚠ 清单读取失败，未静默当成空清单："
                                     f"{exc}。上次会话与最近记忆仍继续召回。")
             if unresolved_block:
                 blocks.append(unresolved_block)
+        thread = None
         if self.thread_store is not None:
+            thread = self.thread_store.latest()
             # 时区跟召回块传同一个：两块贴在一起注入，日期口径不许分家
-            thread_block = format_thread_block(self.thread_store.latest(), now=now,
+            thread_block = format_thread_block(thread, now=now,
                                                time_context=self.time_context)
             if thread_block:
                 blocks.append(thread_block)
-        recall_block = self._recall(now=now, exclude_record_ids=unresolved_ids)
+        results = self._recall_results(now=now, exclude_record_ids=unresolved_ids)
+        recall_block = format_recall_block(results, time_context=self.time_context)
         if recall_block:
             blocks.append(recall_block)
         if blocks:
             blocks.append(SELF_CHECK_FOOTER)
+        self._log(now, "session_start",
+                  selfCheck="pass" if status is not None else "unchecked",
+                  unresolved=unresolved_items,
+                  threadWindow=thread.window if thread is not None else None,
+                  recall=[_recall_ref(r) for r in results])
         return "\n\n".join(blocks) if blocks else None
 
     def on_turn(self, turn_text, now=None):
@@ -240,7 +324,9 @@ class SessionRecall:
         if self._chars_since_recall < self.compact_threshold_chars:
             return None
         self._chars_since_recall = 0
-        block = self._recall(now=now)
+        results = self._recall_results(now=now)
+        self._log(now, "compact", recall=[_recall_ref(r) for r in results])
+        block = format_recall_block(results, time_context=self.time_context)
         return block + "\n" + SELF_CHECK_FOOTER if block else None
 
 
@@ -411,8 +497,33 @@ def _selftest():
         assert "这块正文同时被标成未解决来源" not in b18, "同 recordId 的 recent 块应退出"
         assert "另一条最近记忆" in b18 and b18.index("【上次会话】") < b18.index("【最近记忆召回】")
 
-    print("selftest ok（18项断言：触发时机 / 时间标注防塌陷 / 跨时区标注 / 自查关卡 / "
-          "threads 历史快照 / 未解决优先与确定性去重 / 单条截断）")
+    # 19.【换窗召回记录】只记 ID 不记正文；七天前的剪掉；落盘失败不拦召回
+    with tempfile.TemporaryDirectory() as td:
+        log = Path(td) / RECALL_LOG_FILENAME
+        old = {"at": now - 8 * DAY, "trigger": "session_start", "recall": []}
+        log.write_text(json.dumps(old) + "\n坏行\n", encoding="utf-8")
+        sr19 = SessionRecall(idx, topN=2, thread_store=store, log_path=log,
+                             compact_threshold_chars=10)
+        sr19.on_session_start(now=now)
+        sr19.on_session_start(now=now, status=SessionStatus(time_check_ok=False))
+        sr19.on_turn("x" * 20, now=now)
+        rows = read_recall_log(log, now=now)
+        assert [r["trigger"] for r in rows] == ["session_start", "session_start", "compact"], \
+            "八天前那行和坏行该被剪掉，三次召回各记一行"
+        first = rows[0]
+        assert first["selfCheck"] == "unchecked" and first["threadWindow"] == 12
+        assert first["unresolved"] == [] and len(first["recall"]) == 2
+        assert re.fullmatch(r"[0-9a-f]{16}", first["recall"][0]["recordId"])
+        assert rows[1]["selfCheck"] == "fail" and "recall" not in rows[1], "自查没过就什么都没带"
+        raw = log.read_text(encoding="utf-8")
+        assert "咖啡机" not in raw and "花盆" not in raw, "记录里不许出现正文"
+        assert len(raw.splitlines()) == 3, "文件本身也剪过，不只是读的时候滤掉"
+        # 落点所在目录不存在（写不进去）→ 召回照常返回
+        broken = SessionRecall(idx, topN=1, log_path=Path(td) / "没有这层" / RECALL_LOG_FILENAME)
+        assert broken.on_session_start(now=now) is not None, "记录写不上不许拦召回"
+
+    print("selftest ok（19项断言：触发时机 / 时间标注防塌陷 / 跨时区标注 / 自查关卡 / "
+          "threads 历史快照 / 未解决优先与确定性去重 / 单条截断 / 换窗召回记录）")
 
 
 if __name__ == "__main__":

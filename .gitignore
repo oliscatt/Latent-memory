@@ -41,3 +41,6 @@ src/passive_userdict.txt
 src/passive_common_english.txt
 # 部署私有插件
 src/latent_plugin_*.py
+# 山屋：对方写给 TA 的便条与 TA 的回复；换窗召回记录（recordId 与分数）
+便条.jsonl
+.recall-log.jsonl

@@ -170,6 +170,7 @@ embedding 都是可选路线，没把语料去向念给用户听，就不出货�
 - **MCP 协议**：按官方规格 2025-06-18 实现；同时支持本地 stdio 与远程 Streamable HTTP（`--http`＋`--token`；开自动浮现时另配宿主专用的 `--hook-token`，不配则隐藏入口对所有凭证关闭）。`--http` 收的是 `[HOST:]PORT`，**省略 HOST 只绑回环、别的机器连不到**；绑非回环时起动横幅会多打一行提醒——那条链路是裸 HTTP，token 与检索回来的记忆内容都是明文，推荐绑回环、公网那一跳交给反代管 TLS（**只提醒，不拦你起动**）。
 - **按客户端的 `Accept` 给传输形态**：只认 SSE 响应体的客户端拿到单事件 SSE（`event: message` ＋ `data:`），其余拿 `application/json`（`Accept` 里两个都写、写 `*/*`、或没带这个头，都走 JSON）；**GET 会拿到一条只发心跳、永不发消息的空长流**——本服务没有服务器主动推送的场景，这条流存在的理由只有一个：有的客户端先发 GET 建长流，收到 405 之后不改用 POST，就一直等下去。不要它就加 `--no-sse-stream`（那样 GET 恒回 405）。长流同时最多 4 条。⚠ **这两条只有自检盖着、没有真机**：自检是真端口往返，量的是「服务端形态已具备」，**不是「哪个客户端因此接上了」**。
 - **工具名带 `latent_` 前缀**：`latent_search` / `latent_session_start` / `latent_append` / `latent_supersede` / `latent_correct` / `latent_cleanup` / `latent_unresolved` / `latent_thread_close`。真实事实后来变化时用 `latent_supersede` 写新事实并指向旧 `recordId`；旧记录只退出默认检索，历史意图会沿双向链返回。旧值从未真实过才用 `latent_correct`。`latent_append` 与 `latent_supersede` 均可 `mode=preflight`；`latent_append` 的可选 `passive` 会把经原文范围核验的触发词、短句许可、必要引用和确定性 revision 写进辅助账本，也可凭同一 `recordId` 分阶段补齐。显式开启的自动浮现入口会做输入预筛、范围／来源／冲突过滤、单事件线选择、候选级冷却与现场资料组装；配了事实库时改走事实模式，按向量递出与用户原句最像的两条事实，并带上同一条记忆拆出的几条。资料只在本轮交付，由宿主决定是否进入模型输入及历史。自动路径不改记忆正文、索引与账本，也不增加权重。开 `--passive-recall` 后，模型可见的工具表多一个建事实库用的 `latent_fact_backfill`，`latent_append` 可选的 `facts` 会把新事实追加进事实库。真实宿主兼容、自然效果和实际成本仍须逐项验证。老语料没有 `.supersessions.json` 或 `.passive.json` 时无需迁移正文。`latent_session_start` 是一场会话开始时的**换窗召回**，不是逐轮 Passive Recall。`latent_cleanup` 只按稳定 `recordId` 两阶段精准清理误写，链上节点为防断链会拒绝清理；`latent_unresolved` 维护 `<corpus>/未解决.md`。旧 append／thread_close 不带新字段仍继续写入并明确回 `not_reviewed`，需要严格复核时显式加 `--require-unresolved-review`。前缀不是装饰——**通用名（`memory_search` 这类）可能跟宿主自带的同名工具撞上**，撞上之后服务照常连着、工具列表照常看得见、模型照常回话，只是调的不是这一份，**全程零报错**。
+- **山屋：给人看的页面（默认关）**：`--http` 下加 `--admin-token <页面钥匙> --ui hut`，浏览器打开 `http://127.0.0.1:<端口>/hut/`，记忆住进一间巴塔哥尼亚山屋——磁带是每一天的正文，事实簿是拆出来的小事，浮冰是随机浮上来的事实，石堆是被想起最多的五段，拍立得是近七天每次换窗带回了什么，火漆信是上个窗口留下的话，地图是未解决清单，护照是人格文件里的里程碑（要 `--persona` 指向人格文件），窗外天气是 `--doctor` 体检。页面数据走 `/admin/api`：**单独一把钥匙**，不许跟 `--token`／`--hook-token` 相同、互不通用；只回同源请求；不进工具表，模型不知道有这个口子。页面第一次要钥匙时输一次，只存在这台设备上。**唯一能写的是小锁信**：对方在便利贴上写下哪条记错了、哪件事已经变了，存进 `<corpus>/便条.jsonl`；TA 下次开场 `latent_session_start` 最先看到，改不改由 TA 自己判断——认同就用 `latent_correct`／`latent_supersede` 改正文，再用 `latent_note_reply` 记一笔；不认同也用它回一句为什么，对方在页面上看得到。`latent_note_reply` 只在开了 `--admin-token` 时出现；记忆只有 TA 自己能改。
 - **被拒的请求在服务端留一行**：401／403／404／405／400／411／413／501 各说各的原因（含方法、路径、来源 IP），**排查不用猜是哪一种**；正常请求照旧不打日志。⚠ 405 有三种含义，那一行会说清是哪一种（客户端本来就只要 JSON／长流被 `--no-sse-stream` 关掉了／长流开满了）——**只有第一种不是故障**，另两种下不会回退的客户端会一直等。⚠ 那一行**不含 token、不含请求体**（那里面是你的问句和记忆正文），路径也剥掉了 query；被扫时有每分钟上限，**压掉多少条会明说**。
 
 ## 文档
@@ -244,3 +245,6 @@ embedding 都是可选路线，没把语料去向念给用户听，就不出货�
 ## License
 
 PolyForm Internal Use License 1.0.0，允许内部业务使用，不允许分发；完整条款见 [LICENSE](LICENSE)。
+
+个人在自己的设备或服务器上部署、非商业自用，也在允许范围内。
+使用时的界面截图、录屏可以分享到社交平台。

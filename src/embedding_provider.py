@@ -397,12 +397,22 @@ class VectorCache:
         self.dirty = True
 
     def save(self):
+        """逐条写进临时文件再原子替换（外部同步卡第七节）。不先拼出整份 JSON 字符串：3 万块、
+        1024 维时那份字符串约 320MB，增量写入每存一次峰值就多这么多。写出的字节与
+        `json.dumps({"provider": …, "vectors": …}, ensure_ascii=False)` 逐字节相同（自检第 13 项）；
+        写到一半崩溃也不会留下半截文件（坏缓存会让下次起服务整库重算向量）。"""
         if not self.path or not self.dirty:
             return False
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(
-            {"provider": self.provider_id, "vectors": self.vectors},
-            ensure_ascii=False, default=lambda a: [round(x, 6) for x in a]), encoding="utf-8")
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            f.write('{"provider": ' + json.dumps(self.provider_id, ensure_ascii=False)
+                    + ', "vectors": {')
+            for n, (key, vec) in enumerate(self.vectors.items()):
+                f.write((", " if n else "") + json.dumps(key, ensure_ascii=False) + ": "
+                        + json.dumps([round(x, 6) for x in vec]))
+            f.write("}}")
+        os.replace(tmp, self.path)
         self.dirty = False
         return True
 
@@ -449,14 +459,15 @@ def embed_with_cache(provider, texts, cache=None):
     这就是"建库时算一次、之后只补新块"的全部实现——**云端档的成本模型全靠它**。"""
     if cache is None:
         return [array("f", v) for v in provider.embed(texts)]
-    # 命中的直接用缓存里那份：缓存对象建完库就释放，_cvecs 是唯一持有者，不留副本
+    # 命中的直接用缓存里那份：建完库缓存只留现有块的条目，与 _cvecs 共用同一份数组，不留副本
     out = [cache.get(t) for t in texts]
     todo = [i for i, v in enumerate(out) if v is None]
     if todo:
         fresh = provider.embed([texts[i] for i in todo])
         for i, v in zip(todo, fresh):
-            out[i] = array("f", v)
             cache.put(texts[i], v)
+            # 取缓存里那份（舍到 6 位的 float32），重启后从缓存读回的是同一份，增量与全量才逐位一致
+            out[i] = cache.get(texts[i])
         cache.save()
     return out
 
@@ -669,10 +680,29 @@ def _selftest():
     assert get_hit_floor("BAAI/bge-m3", env={ENV_HIT_FLOOR: "0.55"}) == 0.55, \
         "自己量过的人给的覆盖值，在外部标定过的模型上同样该优先"
 
-    print("selftest ok（12 项：key 不外泄 / 缺 key 报错 / 分批不乱序 / 前缀按模型 / "
+    # 13.【刚算出来的块向量＝缓存里那份】增量写入当场算的向量，要和重启后从缓存读回的逐位
+    #     相同（外部同步卡）。变异：embed_with_cache 里 out[i] 换回 array("f", v) → 这条红
+    with tempfile.TemporaryDirectory() as td13:
+        p13 = HTTPCloudProvider("https://api.example.com/v1/embeddings", "m",
+                                transport=_fake_transport(), env={"MEMORY_EMBED_API_KEY": "k"})
+        cache13 = Path(td13) / "c.json"
+        fresh13 = embed_with_cache(p13, ["甲块", "乙块"], VectorCache(cache13, p13.id))
+        again13 = embed_with_cache(p13, ["甲块", "乙块"], VectorCache(cache13, p13.id))
+        assert p13.texts_embedded == 2, "第二次该全走缓存"
+        assert [v.tobytes() for v in fresh13] == [v.tobytes() for v in again13], \
+            "当场算的向量与缓存读回的不逐位相同：增量写入与重启会差最后几位"
+        #     逐条写出的缓存文件与整份 json.dumps 逐字节相同（格式不动，老版本照读）
+        c13 = VectorCache(cache13, p13.id)
+        ref = json.dumps({"provider": c13.provider_id, "vectors": c13.vectors}, ensure_ascii=False,
+                         default=lambda a: [round(x, 6) for x in a])
+        assert cache13.read_text(encoding="utf-8") == ref and not cache13.with_name("c.json.tmp").exists(), \
+            "逐条写出的缓存文件与 json.dumps 不逐字节相同"
+
+    print("selftest ok（13 项：key 不外泄 / 缺 key 报错 / 分批不乱序 / 前缀按模型 / "
           "未标定即 None / 缓存只算一次 / 坏缓存不致命 / 缓存内存存 float32、磁盘逐字节不变 / 未知档报错 / "
           "超长块截断（发出去的截、本地的不动）/ 门槛覆盖口（设歪了当没设）/ "
-          "第三类口径「外部标定」（数照用、出处进用户可见文本、返回值仍是纯 float））")
+          "第三类口径「外部标定」（数照用、出处进用户可见文本、返回值仍是纯 float）/ "
+          "当场算的向量＝缓存读回的那份）")
 
 
 if __name__ == "__main__":

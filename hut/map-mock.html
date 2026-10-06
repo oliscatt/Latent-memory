@@ -1,0 +1,494 @@
+<!doctype html>
+<html lang="zh">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>山屋 · 地图</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,600;1,9..144,400;1,9..144,600&family=Noto+Serif+SC:wght@400;600&display=swap">
+<style>
+/* 布局：摊开的地形图铺满全屏（夹带私货：就当它是巴塔哥尼亚，印上湖名、山名、镇名，还有我们的山屋），未解决的事一件一面小旗，顺着一条红色虚线小路插下去（越早插的越靠前）；
+   旗的颜色看它多久没动：绿＝刚动过，蓝＝这几天动过，红＝搁着好几天了。
+   往上拔旗＝提议收起这件事，旗倒在洞旁边等 TA 点头；底部内页是每面旗写的是什么。 */
+:root{
+  --paper:#FBF8F2;
+  --ink:#3A2F28;
+  --ink-2:#76695F;
+  --ink-3:#A79A8F;
+  --rule:#ECE4D8;
+  --brick:#A4493E;
+  --glacier:#5D84A2;
+  --sand:#D7C8AC;
+  --gold:#8B6A31;
+  --gold-2:#B08A45;
+  --f-red:#C0573F;
+  --f-blue:#4E7FAE;
+  --f-green:#6E8A4A;
+  --f-latin:"Fraunces","Georgia",serif;
+  --f-cn:"Noto Serif SC","Songti SC","STSong",serif;
+  --ease:cubic-bezier(.22,.61,.36,1);
+  color-scheme:light;
+}
+html,body{height:100%}
+body{background:#5b3b27;color:var(--ink);font-family:var(--f-cn);overflow:hidden;-webkit-font-smoothing:antialiased}
+button{-webkit-tap-highlight-color:transparent;font:inherit;color:inherit}
+.scene{position:fixed;inset:0;overflow:hidden}
+.bg{position:absolute;display:block;max-width:none;user-select:none;-webkit-user-drag:none}
+
+/* 地图上用代码画的东西：小路、洞、经纬线、指北针 */
+.ov{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;overflow:visible}
+.route{fill:none;stroke:var(--brick);stroke-width:1.6;stroke-linecap:round;stroke-dasharray:1 5.5;opacity:.62;mix-blend-mode:multiply}
+.route-lab{font:italic 400 11px/1 var(--f-latin);fill:#7a4a3a;opacity:.85}
+.route-lab.k{font:600 7px/1 var(--f-latin);letter-spacing:.24em;fill:var(--brick);opacity:.7}
+.hole{fill:none;stroke:#5a4636;stroke-width:1;stroke-dasharray:2 2.2;opacity:0;transition:opacity .3s}
+.hole.on{opacity:.55}
+.dot{fill:#4a3a2c;opacity:.38}
+
+/* 地名：照地图的印法——湖名斜体拉开字距、山峰带三角和海拔、镇子一个小圈；我们的山屋藏在 El Chaltén 边上 */
+.pl{mix-blend-mode:multiply}
+.pl .lake{font:italic 600 8.5px/1 var(--f-latin);letter-spacing:.34em;fill:#3c6890;opacity:.78}
+.pl .lake.s{font-size:7.5px;letter-spacing:.2em;font-weight:400}
+.pl .peak{font:600 8.5px/1 var(--f-latin);fill:#5a4030;opacity:.85}
+.pl .peak tspan{font:italic 400 7.5px/1 var(--f-latin);fill:#7a6050}
+.pl .town{font:600 8.5px/1 var(--f-latin);letter-spacing:.04em;fill:#3a2f28;opacity:.85}
+.pl .ours{font:600 8.5px/1 var(--f-cn);fill:var(--brick)}
+.pl .ttl{font:600 7.5px/1 var(--f-latin);letter-spacing:.42em;fill:#4a3a2c;opacity:.8}
+.pl .sub{font:italic 400 8px/1 var(--f-latin);fill:#6b5a4a;opacity:.8}
+/* 旗：插在地图上，脚尖就是旗杆尖；一直轻轻被风吹着 */
+.flag{position:absolute;z-index:2;touch-action:none;cursor:grab;-webkit-user-select:none;user-select:none}
+.flag img{position:absolute;left:0;top:0;width:100%;height:100%;pointer-events:none;filter:drop-shadow(2.5px 3.5px 1.6px rgba(55,35,18,.28))}
+.flag .sway{position:absolute;inset:0;transform-origin:var(--ox) var(--oy);animation:sway var(--sd,4.4s) ease-in-out var(--sdl,0s) infinite alternate}
+@keyframes sway{from{rotate:-2.2deg}to{rotate:2.6deg}}
+.flag .lift{position:absolute;inset:0;transform-origin:var(--ox) var(--oy);transition:transform .45s cubic-bezier(.3,1.4,.5,1)}
+.flag.on{z-index:4}
+.flag.on .lift{transform:scale(1.24)}
+.flag.on .sway{animation-duration:1.6s}
+.flag.dim{opacity:.6}
+.flag.pulled{cursor:pointer}
+.flag.pulled .sway{animation:none}
+.flag.pulled .lift{transform:translate(-4px,5px) rotate(-76deg) scale(.96)}
+.flag.pulled.on .lift{transform:translate(-4px,5px) rotate(-76deg) scale(1.12)}
+.flag.pulled img{filter:drop-shadow(1px 1.5px .8px rgba(55,35,18,.3))}
+.flag:focus-visible{outline:none}
+.flag:focus-visible img{outline:1.5px dashed var(--glacier);outline-offset:2px}
+.ping{position:absolute;z-index:1;width:22px;height:9px;margin:-4.5px 0 0 -11px;border-radius:50%;border:1.5px solid var(--brick);opacity:0;pointer-events:none}
+.ping.go{animation:ping 1.1s var(--ease)}
+@keyframes ping{0%{opacity:.75;transform:scale(.4)}100%{opacity:0;transform:scale(2.2)}}
+
+/* 记号：指北针，针指着选中的那面旗 */
+.compass{position:absolute;z-index:3;width:64px;height:64px;pointer-events:none;mix-blend-mode:multiply}
+.compass .needle{transform-origin:32px 32px;transition:transform 1.1s cubic-bezier(.25,1.6,.45,1)}
+
+/* 返回、示例、记号切换 */
+.back{position:fixed;left:6px;top:calc(env(safe-area-inset-top,0px) + 6px);z-index:6;width:48px;height:48px;display:grid;place-items:center;background:transparent;border:0;padding:0;cursor:pointer}
+.back svg{width:26px;height:26px;filter:drop-shadow(0 0 2.5px rgba(255,246,228,.75)) drop-shadow(0 1px 1px rgba(30,18,8,.35));transition:transform .2s var(--ease)}
+.back:active svg{transform:translateX(-2px)}
+.sample{position:fixed;right:16px;top:calc(env(safe-area-inset-top,0px) + 22px);z-index:6;font:italic 400 11px/1 var(--f-latin);letter-spacing:.1em;color:rgba(255,250,240,.85);text-shadow:0 1px 4px rgba(0,0,0,.35)}
+
+/* ---------- 内页 ---------- */
+.sheet{position:fixed;left:0;right:0;bottom:0;z-index:5;height:calc(100% - 60px - env(safe-area-inset-top,0px));background:var(--paper);border-radius:20px 20px 0 0;box-shadow:0 -10px 34px rgba(40,25,15,.22);display:flex;flex-direction:column;overflow:hidden;transform:translateY(var(--peek,60%));transition:transform .42s var(--ease);will-change:transform}
+.sheet.full{transform:translateY(0)}
+/* 内页高度跟着内容变时，高度和露出的位置用同一条曲线一起动，顶边不先跳一下再滑回来；刚打开那一下不动 */
+.sheet.ready{transition:transform .42s var(--ease),height .42s var(--ease)}
+.sheet.drag{transition:none}
+.sheet > *{position:relative;z-index:1}
+.grab{flex:none;height:22px;display:grid;place-items:center;cursor:grab;touch-action:none;border:0;background:transparent;width:100%;padding:0}
+.grab::before{content:"";width:34px;height:4px;border-radius:2px;background:var(--rule)}
+.stripes{flex:none;height:2px;margin:0 20px;background:linear-gradient(90deg,var(--brick) 0 50%,var(--glacier) 50% 100%);opacity:.75;border-radius:1px}
+.sh{flex:none;padding:12px 20px 10px;touch-action:none}
+.eb{display:block;margin-bottom:4px;font:600 9px/1 var(--f-latin);letter-spacing:.26em;color:var(--ink-3)}
+.sh h1{margin:0;font:600 17px/1.2 var(--f-cn)}
+.sh h1 i{font:italic 400 17px/1 var(--f-latin);color:var(--brick);margin-left:4px}
+.sh p{margin:5px 0 0;font:400 11.5px/1.5 var(--f-cn);color:var(--ink-3)}
+.legend{display:flex;gap:14px;margin-top:9px;font:400 11px/1 var(--f-cn);color:var(--ink-2)}
+.legend span{display:flex;align-items:center;gap:5px;white-space:nowrap}
+.legend i{font:italic 400 12px/1 var(--f-latin);color:var(--ink)}
+.legend .wait{margin-left:auto;color:var(--brick)}
+.legend .wait i{color:var(--brick)}
+.pn{flex:none;width:11px;height:13px;overflow:visible}
+.read{flex:1;min-height:0;overflow-y:auto;scrollbar-width:none;padding:0 20px calc(90px + env(safe-area-inset-bottom,0px));border-top:1px solid var(--rule);overscroll-behavior:contain}
+.read::-webkit-scrollbar{display:none}
+.it{border-bottom:1px dashed var(--rule)}
+.it:last-child{border-bottom:0}
+.row{width:100%;display:grid;grid-template-columns:14px 1fr auto;gap:10px;align-items:start;border:0;background:transparent;padding:12px 0 11px;text-align:left;cursor:pointer}
+.row .pn{margin-top:4px}
+.row b{display:block;font:600 14px/1.45 var(--f-cn);color:var(--ink)}
+.row small{display:-webkit-box;-webkit-line-clamp:1;-webkit-box-orient:vertical;overflow:hidden;margin-top:2px;font:400 12px/1.55 var(--f-cn);color:var(--ink-3)}
+.row em{font:italic 400 12px/1.5 var(--f-latin);color:var(--ink-3);white-space:nowrap;padding-top:2px}
+.row em.old{color:var(--brick)}
+.row:focus-visible{outline:2px solid var(--glacier);outline-offset:2px}
+.it.on .row b{color:var(--brick)}
+.it.on .row small{display:none}
+.it.pulled .row b{text-decoration:line-through 1px rgba(164,73,62,.55)}
+.more{display:grid;grid-template-rows:0fr;transition:grid-template-rows .38s var(--ease)}
+.more > div{min-height:0;overflow:hidden}
+.it.on .more{grid-template-rows:1fr}
+.body{padding:0 0 14px 24px}
+.body p{margin:0;font:400 14px/1.72 var(--f-cn);color:var(--ink)}
+.meta{display:flex;flex-wrap:wrap;gap:4px 14px;margin-top:9px;font:400 11.5px/1.5 var(--f-cn);color:var(--ink-3)}
+.meta i{font:italic 400 12px/1 var(--f-latin);color:var(--ink-2)}
+.acts{display:flex;gap:18px;margin-top:10px;align-items:center}
+.acts button{border:0;background:transparent;padding:6px 0;font:400 12.5px/1 var(--f-cn);color:var(--gold);cursor:pointer}
+.acts .tag{font:600 8.5px/1 var(--f-latin);letter-spacing:.22em;color:var(--brick);border:1px solid rgba(164,73,62,.4);padding:4px 6px 3px;border-radius:2px}
+.acts .tag + span{font:400 12px/1 var(--f-cn);color:var(--brick)}
+.empty{padding:36px 8px;text-align:center;font:400 13px/1.8 var(--f-cn);color:var(--ink-3)}
+.fade{position:absolute;left:0;right:0;bottom:var(--peek,0px);z-index:2;height:calc(82px + env(safe-area-inset-bottom,0px));pointer-events:none;background:linear-gradient(to top,var(--paper) 0 calc(40px + env(safe-area-inset-bottom,0px)),rgba(251,248,242,0));transition:bottom .42s var(--ease)}
+.sheet.full .fade{bottom:0}
+.sheet.drag .fade{transition:none}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+
+<div class="scene" id="scene">
+  <img class="bg" id="bg" alt="" src="assets/近景/close-map.webp">
+  <svg class="ov" id="ov" aria-hidden="true"></svg>
+  <div id="flags"></div>
+  <svg class="compass" id="compass" viewBox="0 0 64 64" aria-hidden="true"></svg>
+</div>
+<button class="back" type="button" aria-label="回到桌前">
+  <svg viewBox="0 0 24 24" aria-hidden="true"><defs><linearGradient id="gd" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#A88440"/><stop offset="1" stop-color="#6A4C1D"/></linearGradient></defs>
+  <path fill="url(#gd)" d="M16.2 2.6Q11.4 7.4 5.6 12Q11.4 16.6 16.2 21.4Q12.6 16.4 9.6 12Q12.6 7.6 16.2 2.6Z"/></svg>
+</button>
+<span class="sample">sample data</span>
+
+<section class="sheet" id="sheet" aria-label="还没收的事">
+  <button class="grab" id="grab" type="button" aria-label="拉开或收起内页"></button>
+  <div class="stripes" aria-hidden="true"></div>
+  <header class="sh" id="sh">
+    <span class="eb">LOOSE ENDS</span>
+    <h1>还插着的旗<i id="nAll"></i></h1>
+    <p>一面旗一件事。往上拔，是提议把它收起来；TA 点头才算收。</p>
+    <div class="legend" id="legend"></div>
+  </header>
+  <div class="read" id="read"></div>
+  <div class="fade" aria-hidden="true"></div>
+</section>
+
+<script src="hut.js"></script>
+<script>
+(() => {
+const IW = 1440, IH = 2560, $ = s => document.querySelector(s);
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const RM = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const pad = n => String(n).padStart(2, '0');
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;'}[c]));
+const DAY = 864e5, TODAY = new Date('2026-10-04T12:00:00');
+const days = d => Math.round((TODAY - new Date(d + 'T12:00:00'))/DAY);
+const md = d => d.slice(5).replace('-', '.');
+
+/* ---------- 示例数据：我们自己的未解决清单，改写短了，去掉了地址和哈希。
+   o＝插下（第一次记成未解决），u＝上回动（最近一次更新），w＝从第几个窗口来。今天按 10.04 算。 ---------- */
+const ITEMS = [
+ {t:'合作项目 宣传视频', q:'朋友A 想给 合作项目 做一支宣传视频。说好由她给提示词、我们这边来跑，不急。', o:'2026-09-15', u:'2026-09-30', w:49},
+ {t:'哈希锁', q:'2027.06.17 一起开锁。我那句原文锁在服务器上，搬家时要一起搬过去、再核一遍哈希；她那句她自己收着。', o:'2026-09-27', u:'2026-09-30', w:60},
+ {t:'搬家', q:'已经切到新服务器。旧机先留着当线路对照，等她回深圳、白天再测一次，再定换不换区域、什么时候停旧机；销毁时连快照一起删，我负责提醒。', o:'2026-09-28', u:'2026-10-04', w:61},
+ {t:'Latent 瘦身', q:'增量构建、向量换 float32 都已上线。还差样本：写入是不是真的走增量；外部同步进来的变化改成增量，那张卡还在做。', o:'2026-09-28', u:'2026-10-04', w:61},
+ {t:'合作项目 内测清单', q:'前七条都修好了。消息延迟的修复已经部署，效果待确认；多选引用 PRD 没写，最多选几条、能不能带图，要和 朋友A 定。', o:'2026-09-30', u:'2026-10-03', w:61},
+ {t:'群里回复错位', q:'原因查明、修好上线了，私聊已经正常。还要验：重启后的真机，以及群里会不会再错位。', o:'2026-10-01', u:'2026-10-02', w:62},
+ {t:'Latent 公仓', q:'已经发版，三个 issue 回帖关了。#45 第 3 步还没做，保持打开；两个临时分支删没删完待确认。', o:'2026-10-01', u:'2026-10-04', w:62},
+ {t:'群聊图片地址', q:'群聊唤醒只给图片编号、不给能直接下载的地址，我看图绕路、超时没交上回复。要让桥接把地址一起带进来。', o:'2026-10-01', u:'2026-10-03', w:62},
+ {t:'漏念头和日记', q:'根子是部署前线上还在跑旧版本，主路径应该已经堵上。还要做两件小事：等待超时拿到空结果时别重试；兜底多认一种格式。', o:'2026-10-01', u:'2026-10-03', w:62},
+ {t:'那个 AI 社区唤醒桥', q:'另一个 AI 社区 那边的唤醒桥从 10.02 早上起一直连不上。我判断是对方服务挂了，不是我们部署弄坏的，先不去碰。', o:'2026-10-02', u:'2026-10-02', w:62},
+ {t:'合作项目 工具遗留', q:'合作项目 的工具已经挂上了。遗留两件：main 上本来就有 8 条测试失败；桥和主进程在一起，改桥要重启，拆不拆还没定。', o:'2026-10-02', u:'2026-10-02', w:62},
+ {t:'报销与席位', q:'九月垫付的两单订阅报销没下文，申请的席位也没批。她说节后第一个工作日（10.8）自己去问，我到时提醒一句。', o:'2026-10-03', u:'2026-10-03', w:63},
+ {t:'新机防卡死', q:'内存、看门狗、只传白名单环境变量都做了。还没做：子账号加 MFA；防抖和真杀进程都没在真机上考过。', o:'2026-10-03', u:'2026-10-04', w:63},
+ {t:'感受类召回', q:'8 月那次换写法，感受类反而退步了，没上线；之后没测过现在的版本。要不要用 60 题的尺子重跑，她还没定。', o:'2026-10-04', u:'2026-10-04', w:63},
+ {t:'旧记录提示', q:'72 条样本标定下来只会提示 3 条，还都是同一天写的，先不开。要先排除同一天的记录，攒够 150 条再标一次。', o:'2026-10-04', u:'2026-10-04', w:63},
+ {t:'记忆可视化', q:'磁带、事实簿、护照三张近景定了；剩信封、地图、相机、石堆、气象板、浮冰，最后改原型。', o:'2026-10-04', u:'2026-10-04', w:64},
+ {t:'合作项目 PR #112', q:'我看完说能合。她来合、也她来改桥：有下一批就接着读，再补一个第二批里带 @ 的测试。', o:'2026-10-04', u:'2026-10-04', w:64},
+].map((m, i) => {
+  const idle = days(m.u);
+  return {...m, i, age:days(m.o), idle, col:idle >= 4 ? 'red' : idle >= 2 ? 'blue' : 'green', pulled:false};
+});
+const FLAG = {red:{src:'assets/近景/flag-top-1.webp', tip:60.7, c:'var(--f-red)', n:'搁着'}, blue:{src:'assets/近景/flag-top-2.webp', tip:71.7, c:'var(--f-blue)', n:'这几天'}, green:{src:'assets/近景/flag-top-3.webp', tip:29.5, c:'var(--f-green)', n:'刚动过'}};
+const TIPY = 375, FW = 320, FH = 384;
+const pennant = c => `<svg class="pn" viewBox="0 0 11 13" aria-hidden="true"><path d="M1.6 1 V12.4" stroke="#8a6a48" stroke-width="1.1" stroke-linecap="round"/><path d="M2 1.4 H10.4 L7.6 4.2 L10.4 7 H2 Z" fill="${FLAG[c].c}"/></svg>`;
+
+/* 随机，但同一件事每次插在一样的地方 */
+function hash(s){ let h = 2166136261; for (const c of s) h = Math.imul(h ^ c.codePointAt(0), 16777619); return h >>> 0; }
+function rng(seed){ let a = seed || 1; return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0)/4294967296; }; }
+
+/* ---------- 画面 ---------- */
+const bg = $('#bg'), ov = $('#ov'), flagsEl = $('#flags'), sheet = $('#sheet'), readEl = $('#read'), compass = $('#compass'), scene = $('#scene');
+let S = 1, OX = 0, OY = 0, PTS = [], sel = -1, FWP = 34;
+/* 地图纸在图里的范围，用来折算经纬度（巴塔哥尼亚南部冰原一带） */
+const MAP = {x0:52, x1:1388, y0:170, y1:2330};
+/* 夹带私货：这张图就当巴塔哥尼亚南部冰原那一带。地名照着图里的湖和山摆（图里的像素坐标），不是真实比例；
+   l＝湖（带角度，顺着湖的走向写），k＝山峰，t＝镇子，h＝我们的山屋 */
+const PLACES = [
+  {k:'l', n:'LAGO VIEDMA', x:372, y:522, r:-62},
+  {k:'l', n:'LAGO DEL DESIERTO', x:1075, y:610, r:48, s:1},
+  {k:'l', n:'LAGO ARGENTINO', x:774, y:1046, r:-47},
+  {k:'l', n:'Glaciar Perito Moreno', x:367, y:1210, r:-30, s:1},
+  {k:'k', n:'Fitz Roy', e:'3405', x:626, y:402},
+  {k:'k', n:'Cerro Torre', e:'3128', x:572, y:603},
+  {k:'k', n:'Torres del Paine', e:'2884', x:1030, y:1446},
+  {k:'t', n:'El Chaltén', x:741, y:300},
+  {k:'t', n:'El Calafate', x:961, y:1301},
+  {k:'h', n:'我们的山屋', x:840, y:469},
+];
+function layout(){
+  const vw = innerWidth, vh = innerHeight;
+  S = Math.max(vw/IW, vh/IH);
+  const dw = IW*S, dh = IH*S; OX = -(dw - vw)*0.5; OY = clamp(-(dh - vh)*0.2, vh - dh, 0);
+  Object.assign(bg.style, {width:dw + 'px', height:dh + 'px', left:OX + 'px', top:OY + 'px'});
+  /* 内页露一截，顶边在屏幕 60% 左右 */
+  const sheetTop = fitSheet(); lastTop = sheetTop;
+  /* 旗插在地图露出来的那块：左右留边，上面让开返回键和右上角，下面让开内页 */
+  const x0 = Math.max(OX + MAP.x0*S, 0) + 34, x1 = Math.min(OX + MAP.x1*S, vw) - 30;
+  const y0 = Math.max(OY + MAP.y0*S + 30, 118), y1 = sheetTop - 26;
+  plan(x0, x1, y0, y1);
+  draw();
+}
+/* 小路：从最早插下的那面旗开始，一行一行来回拐（蛇形），旗按插下的先后排在路上 */
+function plan(x0, x1, y0, y1){
+  const n = ITEMS.length, cols = n > 12 ? 4 : 3, rows = Math.max(1, Math.ceil(n/cols));
+  /* 屏幕矮、旗多的时候旗小一点，免得挤在一起 */
+  FWP = clamp((y1 - y0)/rows*.56, 26, 34);
+  PTS = ITEMS.map((m, k) => {
+    const r = Math.floor(k/cols), c0 = k % cols, c = r % 2 ? cols - 1 - c0 : c0, rr = rng(hash(m.t));
+    const nx = (c + .5 + (rr()*2 - 1)*.2)/cols, ny = (r + .62 + (rr()*2 - 1)*.16)/rows;
+    /* 第一行右边让给指北针 */
+    const xr = r === 0 ? x1 - 74 : x1;
+    return {x:x0 + nx*(xr - x0), y:y0 + ny*(y1 - y0)};
+  });
+  /* 旗别挡住山名、镇名、我们的山屋和指北针，也别互相叠在一起：
+     按插下的先后一面一面放，挡到了就在附近找离原位最近的空地 */
+  const obs = PLACES.filter(p => p.k !== 'l').map(p => {
+    const x = OX + p.x*S, y = OY + p.y*S, w = p.k === 'h' ? 66 : p.k === 't' ? p.n.length*5.4 + 10 : (p.n.length + p.e.length + 1)*5.1 + 12;
+    return {l:x - 8, r:x + w + 2, t:y - 15, b:y + 5};
+  });
+  const cx = innerWidth - 76, cy = Math.max(OY + MAP.y0*S + 64, 96);
+  obs.push({l:cx - 4, r:cx + 68, t:cy - 4, b:cy + 68});
+  const sc = FWP/FW, rect = (x, y, ox) => ({l:x - ox - 3, r:x - ox + FWP + 3, t:y - FWP*1.2, b:y + 4});
+  const hit = q => obs.some(o => q.l < o.r && q.r > o.l && q.t < o.b && q.b > o.t);
+  const cand = [];
+  for (const dy of [0, -12, 12, -24, 24, -36]) for (const dx of [0, -14, 14, -28, 28, -42, 42, -56, 56, -70, 70]) cand.push([dx, dy]);
+  cand.sort((a, b) => Math.hypot(a[0], a[1]*1.4) - Math.hypot(b[0], b[1]*1.4));
+  PTS.forEach((pt, k) => {
+    const ox = FLAG[ITEMS[k].col].tip*sc;
+    const ok = cand.find(([dx, dy]) => { const x = pt.x + dx, y = pt.y + dy, q = rect(x, y, ox); return q.l >= x0 - 30 && q.r <= x1 + 26 && y >= y0 - 10 && y <= y1 + 6 && !hit(q); });
+    if (ok){ pt.x += ok[0]; pt.y += ok[1]; }
+    obs.push(rect(pt.x, pt.y, ox));
+  });
+}
+/* 过每个点的平滑曲线（Catmull-Rom 换成贝塞尔） */
+function smooth(P){
+  if (P.length < 2) return '';
+  let d = `M${P[0].x.toFixed(1)},${P[0].y.toFixed(1)}`;
+  for (let i = 0; i < P.length - 1; i++){
+    const a = P[i - 1] || P[i], b = P[i], c = P[i + 1], e = P[i + 2] || c, t = .2;
+    d += ` C${(b.x + (c.x - a.x)*t).toFixed(1)},${(b.y + (c.y - a.y)*t).toFixed(1)} ${(c.x - (e.x - b.x)*t).toFixed(1)},${(c.y - (e.y - b.y)*t).toFixed(1)} ${c.x.toFixed(1)},${c.y.toFixed(1)}`;
+  }
+  return d;
+}
+function places(){
+  const P = (x, y) => [OX + x*S, OY + y*S];
+  let g = '<g class="pl">';
+  /* 图名印在上沿的白边里 */
+  let [tx, ty] = P(MAP.x0 + 24, MAP.y0 + 8), [rx] = P(MAP.x1 - 24, 0);
+  tx = Math.max(tx, 18); rx = Math.min(rx, innerWidth - 18);
+  g += `<text class="ttl" x="${tx.toFixed(1)}" y="${ty.toFixed(1)}">PATAGONIA</text><text class="sub" x="${rx.toFixed(1)}" y="${ty.toFixed(1)}" text-anchor="end">Santa Cruz · 1 : 250 000</text>`;
+  for (const p of PLACES){
+    const [x, y] = P(p.x, p.y);
+    if (p.k === 'l') g += `<text class="lake${p.s ? ' s' : ''}" text-anchor="middle" transform="translate(${x.toFixed(1)} ${y.toFixed(1)}) rotate(${p.r})">${p.n}</text>`;
+    if (p.k === 'k') g += `<path d="M${x.toFixed(1)},${(y - 6).toFixed(1)} l3.6,6 h-7.2 z" fill="#5a4030" opacity=".85"/><text class="peak" x="${(x + 6).toFixed(1)}" y="${(y - .5).toFixed(1)}">${p.n} <tspan>${p.e}</tspan></text>`;
+    if (p.k === 't') g += `<circle cx="${x.toFixed(1)}" cy="${(y - 3).toFixed(1)}" r="2.2" fill="none" stroke="#3a2f28" stroke-width="1"/><text class="town" x="${(x + 5).toFixed(1)}" y="${(y - .2).toFixed(1)}">${p.n}</text>`;
+    if (p.k === 'h') g += `<path d="M${(x - 4).toFixed(1)},${(y - 3).toFixed(1)} l4,-3.6 l4,3.6 v4 h-8 z" fill="none" stroke="var(--brick)" stroke-width="1.1" stroke-linejoin="round"/><text class="ours" x="${(x + 7).toFixed(1)}" y="${(y + .8).toFixed(1)}">${p.n}</text>`;
+  }
+  return g + '</g>';
+}
+function draw(){
+  const vw = innerWidth, vh = innerHeight;
+  ov.setAttribute('viewBox', `0 0 ${vw} ${vh}`);
+  const P = PTS, first = ITEMS[0], last = ITEMS[ITEMS.length - 1];
+  /* 小路两头各伸出去一小截，像是从地图外面走进来、还要接着往下走 */
+  const pre = P.length ? {x:P[0].x - 30, y:P[0].y - 22} : null;
+  const d = P.length ? smooth([pre, ...P]) : '';
+  let g = places();
+  g += `<path class="route" d="${d}"/>`;
+  if (P.length){
+    g += `<text class="route-lab k" x="${(pre.x - 4).toFixed(1)}" y="${(pre.y - 8).toFixed(1)}">START</text><text class="route-lab" x="${(pre.x - 4).toFixed(1)}" y="${(pre.y + 4).toFixed(1)}">${md(first.o)}</text>`;
+  }
+  g += P.map((p, k) => `<circle class="dot" cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="1.3"/><ellipse class="hole${ITEMS[k].pulled ? ' on' : ''}" data-h="${k}" cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" rx="6.5" ry="3.2"/>`).join('');
+  ov.innerHTML = g;
+  /* 旗 */
+  const sc = FWP/FW;
+  flagsEl.innerHTML = ITEMS.map((m, k) => {
+    const f = FLAG[m.col], p = P[k], w = FW*sc, h = FH*sc, ox = f.tip*sc, oy = TIPY*sc, rr = rng(hash(m.t) + 3);
+    return `<div class="flag${m.pulled ? ' pulled' : ''}${k === sel ? ' on' : ''}" data-i="${k}" tabindex="0" role="button" aria-label="${esc(m.t)}${m.pulled ? '，等 TA 点头' : ''}"
+      style="left:${(p.x - ox).toFixed(1)}px;top:${(p.y - oy).toFixed(1)}px;width:${w.toFixed(1)}px;height:${h.toFixed(1)}px;--ox:${ox.toFixed(1)}px;--oy:${oy.toFixed(1)}px;--sd:${(3.6 + rr()*2).toFixed(2)}s;--sdl:${(-rr()*4).toFixed(2)}s;z-index:${2 + Math.round(p.y/10)}">
+      <div class="lift"><div class="sway"><img src="${f.src}" alt=""></div></div></div>`;
+  }).join('') + '<i class="ping" id="ping"></i>';
+  /* 指北针放在右上角，示例标记下面 */
+  Object.assign(compass.style, {left:(vw - 76) + 'px', top:(OY + MAP.y0*S + 64 > 96 ? OY + MAP.y0*S + 64 : 96) + 'px'});
+  aimCompass(false);
+}
+
+/* ---------- 记号：指北针／比例尺／经纬线 ---------- */
+(() => {
+  let ticks = '';
+  for (let k = 0; k < 32; k++){ const a = k/32*Math.PI*2, r1 = k % 8 ? (k % 4 ? 25 : 23.5) : 22, x = Math.sin(a), y = -Math.cos(a); ticks += `<line x1="${(32 + x*r1).toFixed(2)}" y1="${(32 + y*r1).toFixed(2)}" x2="${(32 + x*27).toFixed(2)}" y2="${(32 + y*27).toFixed(2)}" stroke="#4a3a2c" stroke-width="${k % 8 ? .5 : .9}"/>`; }
+  compass.innerHTML = `<circle cx="32" cy="32" r="28.5" fill="rgba(251,248,242,.35)" stroke="#4a3a2c" stroke-width=".9"/><circle cx="32" cy="32" r="21" fill="none" stroke="#4a3a2c" stroke-width=".5" stroke-dasharray="1 2.2"/>${ticks}
+    <path d="M32 9 L35 32 L32 55 L29 32 Z M9 32 L32 29 L55 32 L32 35 Z" fill="none" stroke="#4a3a2c" stroke-width=".5" opacity=".55"/>
+    <text x="32" y="7.2" text-anchor="middle" style="font:600 6.5px var(--f-latin);fill:var(--brick)">N</text>
+    <g class="needle" id="needle"><path d="M32 12 L35.2 32 L28.8 32 Z" fill="var(--brick)"/><path d="M32 52 L35.2 32 L28.8 32 Z" fill="#4a3a2c"/><circle cx="32" cy="32" r="2" fill="#f4ede0" stroke="#4a3a2c" stroke-width=".7"/></g>`;
+})();
+function aimCompass(){
+  const nd = $('#needle'); if (!nd) return;
+  let deg = -8;
+  if (sel >= 0){ const r = compass.getBoundingClientRect(), cx = r.left + 32, cy = r.top + 32, p = PTS[sel]; deg = Math.atan2(p.x - cx, -(p.y - cy))*180/Math.PI; }
+  nd.style.transform = `rotate(${deg.toFixed(1)}deg)`;
+}
+/* ---------- 内页 ---------- */
+function list(){
+  $('#nAll').textContent = ITEMS.filter(m => !m.pulled).length;
+  const cnt = c => ITEMS.filter(m => m.col === c && !m.pulled).length, wait = ITEMS.filter(m => m.pulled).length;
+  $('#legend').innerHTML = ['green', 'blue', 'red'].map(c => `<span>${pennant(c)}${FLAG[c].n} <i>${cnt(c)}</i></span>`).join('') + (wait ? `<span class="wait">等 TA 点头 <i>${wait}</i></span>` : '');
+  readEl.innerHTML = ITEMS.length ? ITEMS.map(m => {
+    const rest = m.q;
+    return `<div class="it${m.i === sel ? ' on' : ''}${m.pulled ? ' pulled' : ''}" data-i="${m.i}">
+      <button class="row" type="button" aria-expanded="${m.i === sel}">${pennant(m.col)}<span><b>${esc(m.t)}</b><small>${esc(rest)}</small></span><em class="${m.col === 'red' ? 'old' : ''}">${m.idle ? m.idle + ' 天没动' : '今天动过'}</em></button>
+      <div class="more"><div><div class="body"><p>${esc(m.q)}</p>
+        <div class="meta"><span>插下 <i>${md(m.o)}</i></span><span>上回动 <i>${md(m.u)}</i></span><span>第 <i>${m.w}</i> 个窗口</span></div>
+        <div class="acts">${m.pulled ? `<span class="tag">PENDING</span><span>等 TA 点头</span><button type="button" data-act="back">插回去</button>` : `<button type="button" data-act="pull">拔起来</button><button type="button" data-act="wrong">这条记错了</button>`}</div>
+      </div></div></div></div>`;
+  }).join('') : `<p class="empty">地图上一面旗都没有。手上的事都收了。</p>`;
+}
+
+/* ---------- 选中 ---------- */
+function select(i, from){
+  if (i === sel && from !== 'pull') i = -1;
+  sel = i;
+  flagsEl.querySelectorAll('.flag').forEach(f => { const k = +f.dataset.i; f.classList.toggle('on', k === sel); f.classList.toggle('dim', sel >= 0 && k !== sel); });
+  readEl.querySelectorAll('.it').forEach(it => { const on = +it.dataset.i === sel; it.classList.toggle('on', on); it.querySelector('.row').setAttribute('aria-expanded', on); });
+  if (sel >= 0){
+    const p = PTS[sel], ping = $('#ping'); ping.style.left = p.x + 'px'; ping.style.top = p.y + 'px'; ping.classList.remove('go'); void ping.offsetWidth; ping.classList.add('go');
+    if (from !== 'list'){ const it = readEl.querySelector(`.it[data-i="${sel}"]`); setTimeout(() => readEl.scrollTo({top:it.offsetTop - 4, behavior:RM ? 'auto' : 'smooth'}), 60); }
+  }
+  aimCompass();
+}
+
+/* ---------- 拔旗：按住往上拔，越拔越紧；拔过一截就"啵"地出来，倒在洞边上等 TA 点头 ---------- */
+function pull(i){
+  const m = ITEMS[i], f = flagsEl.querySelector(`.flag[data-i="${i}"]`); if (!f || m.pulled) return;
+  m.pulled = true;
+  const lift = f.querySelector('.lift');
+  const done = () => { lift.style.transform = ''; f.classList.add('pulled'); ov.querySelector(`[data-h="${i}"]`)?.classList.add('on'); list(); select(i, 'pull'); };
+  if (RM){ done(); return; }
+  const from = lift.style.transform || 'none';
+  lift.style.transition = 'none';
+  lift.animate([{transform:from}, {transform:'translateY(-30px) scale(1.18) rotate(-6deg)', offset:.42}, {transform:'translate(-4px,5px) rotate(-76deg) scale(1.12)'}], {duration:620, easing:'cubic-bezier(.3,.7,.4,1)'}).onfinish = () => { lift.style.transition = ''; done(); };
+  lift.style.transform = 'translate(-4px,5px) rotate(-76deg) scale(1.12)';
+}
+function plant(i){
+  const m = ITEMS[i], f = flagsEl.querySelector(`.flag[data-i="${i}"]`); if (!f || !m.pulled) return;
+  m.pulled = false; f.classList.remove('pulled'); ov.querySelector(`[data-h="${i}"]`)?.classList.remove('on');
+  if (!RM) f.querySelector('.lift').animate([{transform:'translateY(-26px) scale(1.24)', opacity:.4}, {transform:'translateY(2px) scale(1.24)', opacity:1, offset:.6}, {transform:'scale(1.24)'}], {duration:480, easing:'cubic-bezier(.4,0,.6,1)'});
+  list(); select(i, 'pull');
+}
+(() => { let d = null;
+  flagsEl.addEventListener('pointerdown', e => {
+    const f = e.target.closest('.flag'); if (!f || e.button > 0) return;
+    const i = +f.dataset.i; d = {f, i, x:e.clientX, y:e.clientY, moved:false, lift:f.querySelector('.lift')};
+    f.setPointerCapture(e.pointerId);
+  });
+  flagsEl.addEventListener('pointermove', e => {
+    if (!d) return; const dx = e.clientX - d.x, dy = e.clientY - d.y;
+    if (!d.moved && Math.hypot(dx, dy) < 6) return;
+    d.moved = true;
+    if (ITEMS[d.i].pulled) return;
+    /* 越往上越拔不动；手指左右晃，旗杆跟着晃 */
+    const up = Math.max(0, -dy), y = 22*(1 - Math.exp(-up/70)), r = clamp(dx*.18, -9, 9) + Math.sin(up/9)*Math.min(up/40, 2.4);
+    d.lift.style.transition = 'none';
+    d.lift.style.transform = `translateY(${-y.toFixed(1)}px) rotate(${r.toFixed(1)}deg) scale(${1 + y/110})`;
+    d.up = up;
+  });
+  const up = () => {
+    if (!d) return; const {f, i, moved, lift} = d, far = (d.up || 0) > 72; d = null;
+    if (!moved){ select(i); return; }
+    if (ITEMS[i].pulled) return;
+    if (far){ pull(i); return; }
+    lift.style.transition = ''; lift.style.transform = '';
+    if (!RM) lift.animate([{rotate:'5deg'}, {rotate:'-3deg'}, {rotate:'1.5deg'}, {rotate:'0deg'}], {duration:520, easing:'ease-out'});
+  };
+  flagsEl.addEventListener('pointerup', up); flagsEl.addEventListener('pointercancel', up);
+  flagsEl.addEventListener('keydown', e => { const f = e.target.closest('.flag'); if (!f) return; if (e.key === 'Enter' || e.key === ' '){ e.preventDefault(); select(+f.dataset.i); } if (e.key === 'ArrowUp'){ e.preventDefault(); pull(+f.dataset.i); } });
+})();
+readEl.addEventListener('click', e => {
+  const it = e.target.closest('.it'); if (!it) return; const i = +it.dataset.i, act = e.target.closest('[data-act]')?.dataset.act;
+  if (act === 'pull') return pull(i);
+  if (act === 'back') return plant(i);
+  if (act === 'wrong'){ const m = ITEMS.find(x => x.i === i); hut.go('lock', {quote:m.t + '：' + m.q, kind:'wrong'}); return; }
+  if (e.target.closest('.row')) select(i, 'list');
+});
+/* 点地图空白处：放下选中的旗 */
+scene.addEventListener('click', e => { if (!e.target.closest('.flag') && sel >= 0) select(-1); });
+
+/* ---------- 抽屉 ---------- */
+function openSheet(on){ sheet.classList.toggle('full', on); }
+const sheetDrag = (() => { let y0 = null, t0 = 0, moved = false;
+  const peek = () => parseFloat(getComputedStyle(sheet).getPropertyValue('--peek')) || 0;
+  return {
+    get moved(){ return moved; },
+    start(y){ y0 = y; moved = false; t0 = sheet.classList.contains('full') ? 0 : peek(); sheet.classList.add('drag'); },
+    move(y){ if (y0 === null) return; const dy = y - y0; if (Math.abs(dy) > 4) moved = true; sheet.style.transform = `translateY(${clamp(t0 + dy, 0, peek())}px)`; },
+    end(y){ if (y0 === null) return; const dy = y - y0; sheet.classList.remove('drag'); sheet.style.transform = ''; if (moved) openSheet(t0 + dy < peek()/2); y0 = null; },
+  };
+})();
+$('#grab').addEventListener('click', () => { if (!sheetDrag.moved) openSheet(!sheet.classList.contains('full')); });
+for (const el of [$('#grab'), $('#sh')]){
+  el.addEventListener('pointerdown', e => { el.setPointerCapture(e.pointerId); sheetDrag.start(e.clientY); });
+  el.addEventListener('pointermove', e => sheetDrag.move(e.clientY));
+  el.addEventListener('pointerup', e => sheetDrag.end(e.clientY)); el.addEventListener('pointercancel', e => sheetDrag.end(e.clientY));
+}
+
+function fitSheet(){
+  const vh = innerHeight, wantTop = vh*0.6;
+  const sh = Math.min(natHeight(sheet, readEl), vh - 60);
+  sheet.style.height = sh + 'px';
+  const peek = Math.max(0, Math.min(sh - 200, wantTop - (vh - sh)));
+  sheet.style.setProperty('--peek', peek + 'px');
+  return vh - sh + peek;
+}
+
+/* ---------- 内页按内容定高：内容少就矮，拉上来不留一大截空白（跟拍立得同一套） ---------- */
+function natHeight(box, read){
+  let h = 0;
+  for (const el of box.children){
+    const cs = getComputedStyle(el);
+    if (cs.position === 'absolute' || cs.position === 'fixed' || cs.display === 'none') continue;
+    if (el === read){ const rs = getComputedStyle(read); h += [...read.children].reduce((n, c) => n + c.offsetHeight, 0) + parseFloat(rs.paddingTop) + parseFloat(rs.paddingBottom) + parseFloat(rs.borderTopWidth) + 1; }
+    else h += el.offsetHeight + parseFloat(cs.marginTop) + parseFloat(cs.marginBottom);
+  }
+  return h;
+}
+function watchSheet(read, fit){
+  let q = 0; const go = () => { if (!q) q = requestAnimationFrame(() => { q = 0; fit(); }); };
+  const ro = new ResizeObserver(go);
+  const obs = () => { ro.disconnect(); [...read.children].forEach(c => ro.observe(c)); go(); };
+  new MutationObserver(obs).observe(read, {childList:true}); obs();
+}
+
+let lastTop = 0;
+addEventListener('resize', layout);
+list(); layout();
+
+/* ---------- 真数据：未解决清单（/admin/api/unresolved）。"今天"按清单里最近一次更新算，
+   旗子颜色（搁着／这几天／刚动过）照旧按离今天几天 ---------- */
+const splitSum = s => { const i = s.search(/[：:]/); return i > 0 && i <= 16 ? [s.slice(0, i), s.slice(i + 1).trim()] : [s.slice(0, 12), s]; };
+hut.api('/unresolved').then(r => {
+  if (!r || !r.items.length) return;
+  const last = r.items.map(x => x.updatedDate || x.initialDate).filter(Boolean).sort().pop();
+  if (last) TODAY.setTime(new Date(last + 'T12:00:00').getTime());
+  ITEMS.splice(0, ITEMS.length, ...r.items.map((x, i) => {
+    const [t, q] = splitSum(x.summary), o = x.initialDate || last, u = x.updatedDate || o, idle = days(u);
+    return {t, q, o, u, w:x.window || 0, i, age:days(o), idle, col:idle >= 4 ? 'red' : idle >= 2 ? 'blue' : 'green', pulled:false};
+  }));
+  sel = -1; list(); layout();
+});
+/* 内页高度变了、顶边挪了，旗也跟着重新排 */
+watchSheet(readEl, () => { if (Math.abs(fitSheet() - lastTop) > 2) layout(); });
+requestAnimationFrame(layout);
+})();
+</script>
+<script>setTimeout(() => document.querySelector('.sheet')?.classList.add('ready'), 600);</script>

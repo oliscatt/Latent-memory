@@ -67,7 +67,7 @@ from time_context import (TimeContext, record_time_marker, parse_record_time_mar
                           tzdb_available)
 # 真 embedding 走可插拔提供方层：本地 fastembed／云端 HTTP 都从这里进来，
 # 检索层不认识任何一家（同 draft_extraction.llm_call 的口子）
-from embedding_provider import (VectorCache, embed_with_cache, resolve_provider,
+from embedding_provider import (VectorCache, embed_with_cache, resolve_provider, text_key,
                                 DEFAULT_LOCAL_MODEL, get_hit_floor)
 
 # `latent_append` 的摘要格式会同时出现在工具描述、格式错误与直接接入人格里。
@@ -282,9 +282,12 @@ def rrf_fuse(rank_lists, k=60, ks=None):
 # 提供 register(api)，通过 api 登记两类钩子：
 #   register_add_hook(fn(index, i, text, meta))   块入库前调用，可往 meta 里补字段；
 #   register_hidden_hook(fn(index, now) -> 下标)  当下要对所有检索路径隐藏的块。
+#   register_remap_hook(fn(index, remap))       块退场重排下标后调用，remap 是 旧下标 → 新下标
+#                                               （退场的块不在里面）；插件按下标存的状态在这里跟着挪。
 # 插件只做判定；排除由 MemoryIndex.hidden_indices() 统一施加在每条检索路径上。
 _ADD_HOOKS = []
 _HIDDEN_HOOKS = []
+_REMAP_HOOKS = []
 
 
 def register_add_hook(fn):
@@ -293,6 +296,10 @@ def register_add_hook(fn):
 
 def register_hidden_hook(fn):
     _HIDDEN_HOOKS.append(fn)
+
+
+def register_remap_hook(fn):
+    _REMAP_HOOKS.append(fn)
 
 
 def _load_plugins():
@@ -352,6 +359,10 @@ class MemoryIndex:
         self.graph_topK = graph_topK
         self.graph_seeds = graph_seeds
         self.chunks, self.meta, self.weights = [], [], []
+        # 每块来自哪个文件（绝对路径，load_corpus 填；别的入库路径为 None）。meta["source"]
+        # 只有文件名，不同目录下同名的文件（vps/timeline 与 vps/index 下的同一天）分不开，
+        # 外部同步按文件换块要靠它对号（外部同步卡第三节）
+        self.paths = []
         self._release_structures()
         # 撤回集（2026.07.31 验收反馈"记错以后怎么办"闭环）：被撤回的块不再被
         # retrieve/recall 返回，但原文件与 chunks 本体都不动——时间线是档案，
@@ -376,7 +387,7 @@ class MemoryIndex:
         # 可注入的时钟只给自检用，不做配置项。
         self.fixed_now = None
 
-    def add(self, text, meta=None):
+    def add(self, text, meta=None, path=None):
         meta = dict(meta or {})
         meta.setdefault("record_id", _chunk_key(text))
         meta.setdefault("record_id_aliases", _record_id_aliases(text))
@@ -388,6 +399,7 @@ class MemoryIndex:
         self.chunks.append(text)
         self.meta.append(meta)
         self.weights.append(1.0)
+        self.paths.append(path)
 
     def hidden_indices(self, now=None):
         """当下对所有检索路径隐藏的块下标集合（撤回与变迁另有账本，不在这里）。
@@ -416,7 +428,7 @@ class MemoryIndex:
             raise
 
     def _release_structures(self):
-        self._bm25 = self._cvecs = self._ccounts = None
+        self._bm25 = self._cvecs = self._ccounts = self._vec_cache = None
         self._df_cache = {}
         self._neighbors = {}
         self.pending_new = 0
@@ -429,6 +441,13 @@ class MemoryIndex:
             cache = (VectorCache(self.cache_path, self.provider.id)
                      if self.cache_path else None)
             self._cvecs = embed_with_cache(self.provider, self.chunks, cache)
+            if cache is not None:
+                # 缓存对象留在库上给增量写入用（外部同步卡第七节）：每次增量都重读一遍缓存文件，
+                # 3 万块、1024 维时是 320MB 文本再解析出第二份向量，峰值比整库重读还高。
+                # 只留现有块的条目，向量与 _cvecs 共用同一份数组，多占的只是字典本身；
+                # 下一次增量存盘时，文件里已不在库中的旧条目随之去掉
+                cache.vectors = {text_key(c): v for c, v in zip(self.chunks, self._cvecs)}
+                self._vec_cache = cache
         else:
             # 余弦路的词频表与 BM25 词频只差大小写（tokenize 先 lower，bigram_counts
             # 不 lower）。整份另存一遍在 5039 块语料上约 188 MiB，所以只存差异项：
@@ -446,42 +465,109 @@ class MemoryIndex:
         return (self.pending_new >= CALIBRATE_MIN_NEW
                 or self.pending_new >= CALIBRATE_RATIO * len(self.chunks))
 
-    def add_incremental(self, text, meta):
-        """增量写入一块（增量构建卡第三之二节）：只碰新块，不整库 build。
+    def add_incremental(self, text, meta, path=None):
+        """增量写入一块（增量构建卡第三之二节）：只碰新块，不整库 build。见 replace_chunks。"""
+        self.replace_chunks((), [(text, meta, path)])
 
-        即时更新：BM25 词频、df、N、avgdl（idf 每次检索按它们现算，所以不陈旧），余弦条目
+    def replace_chunks(self, retire, items):
+        """增量换块，不整库 build：retire 里的块退场，items [(正文, meta, 路径)] 按顺序进来。
+
+        新块即时更新：BM25 词频、df、N、avgdl（idf 每次检索按它们现算，所以不陈旧），余弦条目
         或块向量，以及**新块自己**的邻居（按写入这一刻的 df 与显著词上限）。旧块的邻居表
-        不动，等校准。漂移只来自这一处，B 步量过；到阈值由调用方整库校准。
+        不动，等校准。漂移只来自这一处，增量构建卡 B 步量过；到阈值由调用方整库校准。
         邻居要扫一遍全库词频表找共享显著词，代价随块数线性，但远小于整库 build；
-        不常驻倒排表，换的是不多占内存。"""
-        self.add(text, meta)
-        i, bm = len(self.chunks) - 1, self._bm25
-        tf = Counter(tokenize(text))
-        bm.tf.append(tf)
-        bm.doc_lengths.append(sum(tf.values()))
-        bm.df.update(tf.keys())
-        bm.N = len(bm.tf)
-        bm.avgdl = sum(bm.doc_lengths) / bm.N        # 与整库 build 同一个整数和、同一次除法
-        if self.embed:
-            cache = (VectorCache(self.cache_path, self.provider.id)
-                     if self.cache_path else None)
-            self._cvecs.append(embed_with_cache(self.provider, [text], cache)[0])
-        else:
-            self._ccounts.append(_ccount_entry(text, tf))
-        cap = self._graph_df_cap()
-        shared = [(t, bm.idf(t)) for t in tf if 2 <= bm.df[t] <= cap]
-        acc = {}
-        for j in range(i):
-            tf_j, s = bm.tf[j], 0.0
-            for t, w in shared:
-                if t in tf_j:
-                    s += w
-            if s:
-                acc[j] = s
-        if acc:
-            self._neighbors[i] = [j for _, j in heapq.nsmallest(
-                self.graph_topK, ((-s, j) for j, s in acc.items()))]
-        self.pending_new += 1
+        不常驻倒排表，换的是不多占内存。
+
+        退场（外部同步卡第三节）：所有按块下标存的结构一起拿掉并重排下标，df 减掉退场块的词；
+        撤回集合按内存里的撤回账本重新对号（同 load_retractions），取代集合、实体标注按新下标
+        挪，部署插件的状态交给 remap 钩子。进来的块与某个退场块正文相同的算“搬家”：沿用原来的
+        词频、权重、向量（或余弦条目）和邻居表，别的块指向它的邻居跟过去，不计入校准计数。
+        返回新进的块数（不含搬家）。"""
+        retire = set(retire)
+        if retire and len(_REMAP_HOOKS) < len(_HIDDEN_HOOKS):
+            # 隐藏插件按下标记状态却没登记 remap（旧插件配新内核）：挪不动它的状态，
+            # 退场会让锁错位到别的块上。抛错让调用方整库重读
+            raise RuntimeError("部署插件没有登记 remap 钩子，不能退场换块")
+        bm = self._bm25
+        old_chunks, old_tf, old_w = self.chunks, bm.tf, self.weights
+        old_vec = self._cvecs if self.embed else self._ccounts
+        old_nb = self._neighbors
+        moved = defaultdict(list)                    # 正文哈希 → 退场块旧下标
+        for j in sorted(retire):
+            moved[_chunk_key(old_chunks[j])].append(j)
+            for t in old_tf[j]:
+                bm.df[t] -= 1
+                if not bm.df[t]:
+                    del bm.df[t]
+        keep = [j for j in range(len(old_chunks)) if j not in retire]
+        translate = {j: n for n, j in enumerate(keep)}
+        if retire:
+            pick = lambda seq: [seq[j] for j in keep]
+            self.chunks, self.meta, self.weights, self.paths = (
+                pick(old_chunks), pick(self.meta), pick(old_w), pick(self.paths))
+            bm.tf, bm.doc_lengths = pick(old_tf), pick(bm.doc_lengths)
+            if self.embed:
+                self._cvecs = pick(old_vec)
+            else:
+                self._ccounts = pick(old_vec)
+            # 插件状态要在新块的入库钩子跑之前挪好，否则钩子按新下标写进去的会和旧键撞上
+            for hook in _REMAP_HOOKS:
+                hook(self, translate)
+            self._neighbors = {}                     # 旧邻居表最后按 translate 整份挪回来
+        # 先分出搬家与新块，新块的向量一次算完（云端档一次往返、缓存文件只读写一遍）
+        plan = [(text, meta, path, moved[_chunk_key(text)].pop(0)
+                 if moved.get(_chunk_key(text)) else None) for text, meta, path in items]
+        fresh = [text for text, _, _, j in plan if j is None]
+        if self.embed and fresh:
+            cache = self._vec_cache
+            if cache is None and self.cache_path:
+                cache = VectorCache(self.cache_path, self.provider.id)
+            fresh_vecs = iter(embed_with_cache(self.provider, fresh, cache))
+        added = 0
+        for text, meta, path, j in plan:
+            self.add(text, meta, path)
+            i = len(self.chunks) - 1
+            tf = old_tf[j] if j is not None else Counter(tokenize(text))
+            bm.tf.append(tf)
+            bm.doc_lengths.append(sum(tf.values()))
+            bm.df.update(tf.keys())
+            bm.N = len(bm.tf)
+            bm.avgdl = sum(bm.doc_lengths) / bm.N    # 与整库 build 同一个整数和、同一次除法
+            vecs = self._cvecs if self.embed else self._ccounts
+            if j is not None:                        # 搬家：正文没变，原样带过来
+                translate[j] = i
+                self.weights[i] = old_w[j]
+                vecs.append(old_vec[j])
+                continue
+            vecs.append(next(fresh_vecs) if self.embed else _ccount_entry(text, tf))
+            cap = self._graph_df_cap()
+            shared = [(t, bm.idf(t)) for t in tf if 2 <= bm.df[t] <= cap]
+            acc = {}
+            for k in range(i):
+                tf_k, s = bm.tf[k], 0.0
+                for t, w in shared:
+                    if t in tf_k:
+                        s += w
+                if s:
+                    acc[k] = s
+            if acc:
+                self._neighbors[i] = [k for _, k in heapq.nsmallest(
+                    self.graph_topK, ((-s, k) for k, s in acc.items()))]
+            self.pending_new += 1
+            added += 1
+        if retire:                                   # 搬家的块此时也在 translate 里
+            for j, nb in old_nb.items():
+                if j in translate:
+                    kept = [translate[k] for k in nb if k in translate]
+                    if kept:
+                        self._neighbors[translate[j]] = kept
+            self.superseded = {translate[j] for j in self.superseded if j in translate}
+            self._entities = {translate[j]: e for j, e in self._entities.items() if j in translate}
+        if retire or self.retraction_log:
+            # 与重启同一套对号：新块正文命中账本的要撤，新进的索引摘要要跟着已撤的正文退出
+            self.retracted = set()
+            self._apply_retraction_log()
+        return added
 
     def _build_graph(self):
         """第三层·关系图谱（零依赖词面代理版）：共享"显著词"的块相连。
@@ -1193,6 +1279,10 @@ class MemoryIndex:
         if not p.exists():
             return 0
         self.retraction_log = json.loads(p.read_text(encoding="utf-8"))
+        return self._apply_retraction_log()
+
+    def _apply_retraction_log(self):
+        """按内存里的撤回账本对号入座，加进撤回集合（load_retractions 与增量换块共用）。"""
         n = 0
         for i, c in enumerate(self.chunks):
             if _chunk_key(c) in self.retraction_log:
@@ -1354,12 +1444,12 @@ class MemoryIndex:
         return self._vector_scores(self.chunks[idx])
 
     def supersede_pool(self, idx):
-        """写入端提示的比较对象：现行的 timeline 记录，去掉 idx 自己和与它同文的块。"""
+        """写入端提示的比较对象：现行的 timeline 记录，去掉 idx 自己、与它同文的块和与它同一天的记录。"""
         rid = self.meta[idx].get("record_id")
         skip = self.retracted | self.superseded | set(self.hidden_indices())
         return [i for i, meta in enumerate(self.meta)
                 if i != idx and i not in skip and meta.get("layer", "timeline") == "timeline"
-                and meta.get("record_id") != rid]
+                and meta.get("record_id") != rid and not same_record_day(meta, self.meta[idx])]
 
     def chain_record_ids(self, record_id):
         """从链中任一 recordId 返回 root→current 的完整有序 ID。"""
@@ -1535,6 +1625,14 @@ def annotate_block(block, rate, threshold=None):
 def _chunk_key(text):
     """权重持久化的键：chunk 文本的内容哈希（md5 前 16 位，非安全用途）。"""
     return hashlib.md5(text.encode("utf-8")).hexdigest()[:16]
+
+
+def same_record_day(a, b):
+    """两块 meta 是不是同一天的记录：比 local_date（记录自己的日期，记忆所有者时区里的自然日，不按 UTC 换算）。
+    写入端提示不拿同一天的记录当候选——实测标定里分数最高的候选多是同一天写的，多半是同一件事接着写，
+    不是旧状态被取代（#45）。日期不明的不算同一天。"""
+    day = a.get("local_date")
+    return day is not None and day == b.get("local_date")
 
 
 def pick_supersede_hint(scored, min_score, lead):
@@ -1901,8 +1999,9 @@ def load_corpus(corpus_dir, embed=False, recursive=True, provider=None, cache_pa
     for info in file_info.values():
         _note_window(info, window_ts, window_date)
     for p in files:
+        path = str(p.resolve())
         for chunk, meta in _file_chunks(p, file_info[p], date_order, window_ts, window_date):
-            index.add(chunk, meta)
+            index.add(chunk, meta, path)
     # 增量写入要复用同一份“窗口号 → 时间戳／自然日”借用表与日期顺序结论，挂在库上
     index._window_ts, index._window_date = window_ts, window_date
     # 推断结论挂在库上，**让它可见**：出了问题能一眼看出"这份语料被按哪种顺序解的"，

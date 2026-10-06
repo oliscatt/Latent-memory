@@ -1,0 +1,457 @@
+<!doctype html>
+<html lang="zh">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>山屋 · 浮冰</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,600;1,9..144,400;1,9..144,600&family=Noto+Serif+SC:wght@400;600&display=swap">
+<style>
+/* 布局：从全景看窗外推近到湖面。每次看过来，湖里随机浮上来三块冰，一块冰驮着一条记忆（事实库里随手捞的，不写"为什么是它"）。
+   点一块，底下内页就是那一条；冰能拖着在湖上漂，使劲一推推出湖面它就沉下去，别处再浮上来一块新的。Clawd 站在选中那块的冰尖上。
+   不做历史记录：关了再看，又是新的三块。 */
+:root{
+  --paper:#FBF8F2;
+  --ink:#3A2F28;
+  --ink-2:#76695F;
+  --ink-3:#A79A8F;
+  --rule:#ECE4D8;
+  --brick:#A4493E;
+  --glacier:#5D84A2;
+  --sand:#D7C8AC;
+  --gold:#8B6A31;
+  --gold-2:#B08A45;
+  --f-latin:"Fraunces","Georgia",serif;
+  --f-cn:"Noto Serif SC","Songti SC","STSong",serif;
+  --ease:cubic-bezier(.22,.61,.36,1);
+  color-scheme:light;
+}
+html,body{height:100%;margin:0}
+body{background:#7b5a3c;color:var(--ink);font-family:var(--f-cn);overflow:hidden;-webkit-font-smoothing:antialiased}
+button{-webkit-tap-highlight-color:transparent;font:inherit;color:inherit}
+.scene{position:fixed;inset:0;overflow:hidden;touch-action:none}
+.bg{position:absolute;display:block;max-width:none;user-select:none;-webkit-user-drag:none}
+.lake{position:absolute;inset:0}
+
+/* 一块冰：锚点在吃水线正中；水面上是冰，水面下是倒影 */
+.ice{position:absolute;left:0;top:0;transform-origin:0 0;cursor:grab;touch-action:none;-webkit-user-select:none;user-select:none}
+.ice.drag{cursor:grabbing}
+.ice .clip{position:absolute;left:0;right:0;top:0;overflow:hidden}
+.ice .spr{position:absolute;left:0;top:0;width:100%;display:block;-webkit-user-drag:none;pointer-events:none;filter:drop-shadow(0 0 0 rgba(0,0,0,0));transition:filter .4s}
+.ice.on .spr{filter:drop-shadow(0 0 6px rgba(255,255,255,.8))}
+.ice .refl{position:absolute;left:0;right:0;overflow:hidden;pointer-events:none;opacity:.3;
+  -webkit-mask-image:linear-gradient(180deg,#000,rgba(0,0,0,0) 85%);mask-image:linear-gradient(180deg,#000,rgba(0,0,0,0) 85%)}
+.ice .refl img{position:absolute;left:0;top:0;width:100%;transform:scaleY(-1);filter:blur(1px) saturate(.8);animation:shim 3.6s ease-in-out infinite}
+@keyframes shim{0%,100%{translate:0 0;scale:1 1}50%{translate:2px 0;scale:1.02 .94}}
+/* 刻在冰上的日子：浅蓝，压进冰面 */
+.ice .dt{position:absolute;left:0;right:0;text-align:center;font:italic 600 var(--fs,11px)/1 var(--f-latin);color:rgba(70,110,145,.55);mix-blend-mode:multiply;pointer-events:none;transition:color .4s}
+.ice.on .dt{color:rgba(50,90,128,.85)}
+/* 水纹：一圈扁扁的环往外荡 */
+.rip{position:absolute;left:0;top:0;border:1.4px solid rgba(255,255,255,.75);border-radius:50%;pointer-events:none;opacity:0}
+
+/* Clawd：站在选中那块的冰尖上 */
+.pilot{position:absolute;z-index:3000;left:0;top:0;width:40px;height:30px;transform-origin:0 0;touch-action:none;cursor:grab}
+.pilot.lift{cursor:grabbing}
+.clawd{position:absolute;left:7px;top:5px;width:26px;height:20px;overflow:visible;transform-origin:50% 80%;transition:transform .22s var(--ease)}
+.clawd .lg{transform-box:fill-box;transform-origin:50% 0}
+.clawd .eyes{transform-box:fill-box;transform-origin:50% 50%;transform:translateX(var(--ex,-1px)) scaleY(var(--ey,1));transition:transform .12s}
+.pilot.blink{--ey:.15}
+.pilot:not(.hop):not(.lift) .eyes{animation:idle 4.6s steps(1,end) infinite}
+@keyframes idle{95%{transform:translateX(var(--ex,-1px)) scaleY(.15)}}
+.pilot.crouch .clawd{transform:scale(1.14,.78);transition:transform .1s ease-out}
+.pilot.crouch .lg{transform:scaleY(.5)}
+.pilot.hop .clawd{animation:air .5s var(--ease)}
+@keyframes air{0%{transform:scale(.9,1.14)}45%,100%{transform:none}}
+.pilot.hop .lg{transform:scaleY(.6)}
+.pilot.lift .clawd{transform:translateY(-6px) rotate(var(--tilt,0deg));transform-origin:50% 0;transition:transform .16s var(--ease)}
+.pilot.lift .lg{transform:scaleY(1.5)}
+.pilot.land .clawd{animation:land .34s var(--ease)}
+@keyframes land{0%{transform:scale(1.16,.8)}45%{transform:scale(.96,1.06)}100%{transform:none}}
+
+/* 返回、示例 */
+.back{position:fixed;left:6px;top:calc(env(safe-area-inset-top,0px) + 6px);z-index:6;width:48px;height:48px;display:grid;place-items:center;background:transparent;border:0;padding:0;cursor:pointer}
+.back svg{width:26px;height:26px;filter:drop-shadow(0 0 2.5px rgba(255,246,228,.75)) drop-shadow(0 1px 1px rgba(30,18,8,.35));transition:transform .2s var(--ease)}
+.back:active svg{transform:translateX(-2px)}
+.sample{position:fixed;right:16px;top:calc(env(safe-area-inset-top,0px) + 22px);z-index:6;font:italic 400 11px/1 var(--f-latin);letter-spacing:.1em;color:rgba(255,250,240,.9);text-shadow:0 1px 4px rgba(0,0,0,.45)}
+
+/* ---------- 内页 ---------- */
+.sheet{position:fixed;left:0;right:0;bottom:0;z-index:5;height:calc(100% - 60px);background:var(--paper);border-radius:20px 20px 0 0;box-shadow:0 -10px 34px rgba(40,25,15,.22);display:flex;flex-direction:column;overflow:hidden;transform:translateY(var(--peek,58%));transition:transform .42s var(--ease);will-change:transform}
+.sheet.full{transform:translateY(0)}
+/* 内页高度跟着内容变时，高度和露出的位置用同一条曲线一起动，顶边不先跳一下再滑回来；刚打开那一下不动 */
+.sheet.ready{transition:transform .42s var(--ease),height .42s var(--ease)}
+.sheet.drag{transition:none}
+.grab{flex:none;height:22px;display:grid;place-items:center;cursor:grab;touch-action:none;border:0;background:transparent;width:100%;padding:0}
+.grab::before{content:"";width:34px;height:4px;border-radius:2px;background:var(--rule)}
+.stripes{flex:none;height:2px;margin:0 20px;background:linear-gradient(90deg,var(--brick) 0 50%,var(--glacier) 50% 100%);opacity:.75;border-radius:1px}
+.mark{flex:none;position:relative;height:56px;margin:6px 20px 0}
+.mark svg{position:absolute;left:0;top:0;width:100%;height:56px;overflow:visible}
+.sh{flex:none;padding:8px 20px 6px;touch-action:none;display:flex;justify-content:space-between;align-items:baseline;gap:12px}
+.eb{font:600 9px/1 var(--f-latin);letter-spacing:.26em;color:var(--ink-3)}
+.sh time{font:italic 400 12px/1 var(--f-latin);color:var(--gold)}
+.read{flex:1;min-height:0;overflow-y:auto;scrollbar-width:none;padding:2px 20px calc(40px + env(safe-area-inset-bottom,0px));overscroll-behavior:contain}
+.read::-webkit-scrollbar{display:none}
+.ink{animation:ink .5s var(--ease)}
+@keyframes ink{from{opacity:0;transform:translateY(3px)}}
+.said{margin:0;font:400 16px/1.72 var(--f-cn);color:var(--ink);text-wrap:pretty}
+.tags{display:flex;align-items:center;gap:10px;margin-top:8px;font:400 12px/1 var(--f-cn);color:var(--ink-3)}
+.tags b{font:600 8px/1 var(--f-latin);letter-spacing:.22em;color:var(--glacier)}
+.acts{display:flex;justify-content:space-between;margin-top:6px;border-top:1px solid var(--rule)}
+.go{border:0;background:transparent;padding:12px 0 4px;font:400 12.5px/1 var(--f-cn);color:var(--gold);cursor:pointer}
+.go.dim{color:var(--ink-3)}
+.fade{position:absolute;left:0;right:0;bottom:0;z-index:2;height:calc(40px + env(safe-area-inset-bottom,0px));pointer-events:none;background:linear-gradient(to top,var(--paper) 0 calc(12px + env(safe-area-inset-bottom,0px)),rgba(251,248,242,0))}
+.mk-tip .wl{stroke:var(--glacier);stroke-width:1;stroke-dasharray:3 3;opacity:.45}
+.mk-tip .berg{transition:transform 1s cubic-bezier(.3,1.35,.5,1)}
+.mk-tip text{font:italic 400 11px var(--f-latin);fill:var(--ink-2)}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+
+<div class="scene" id="scene">
+  <img class="bg" id="bg" alt="" src="assets/近景/close-window-calm.webp">
+  <div class="lake" id="lake"></div>
+  <div class="pilot" id="pilot" aria-label="Clawd：拎起来放到一块冰上">
+    <svg class="clawd" viewBox="0 0 13 10" shape-rendering="crispEdges" aria-hidden="true">
+      <rect x="1" y="1" width="11" height="5" fill="#D9805F"/>
+      <g fill="#D9805F"><rect x="0" y="3" width="1" height="2"/><rect x="12" y="3" width="1" height="2"/></g>
+      <g class="eyes" fill="#2A2320"><rect x="3" y="2" width="1" height="2"/><rect x="9" y="2" width="1" height="2"/></g>
+      <g fill="#D9805F"><rect class="lg" x="2" y="6" width="1" height="2"/><rect class="lg" x="4" y="6" width="1" height="2"/><rect class="lg" x="8" y="6" width="1" height="2"/><rect class="lg" x="10" y="6" width="1" height="2"/></g>
+    </svg>
+  </div>
+</div>
+<button class="back" type="button" aria-label="回到桌前">
+  <svg viewBox="0 0 24 24" aria-hidden="true"><defs><linearGradient id="gd" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#A88440"/><stop offset="1" stop-color="#6A4C1D"/></linearGradient></defs>
+  <path fill="url(#gd)" d="M16.2 2.6Q11.4 7.4 5.6 12Q11.4 16.6 16.2 21.4Q12.6 16.4 9.6 12Q12.6 7.6 16.2 2.6Z"/></svg>
+</button>
+<span class="sample">sample data</span>
+
+<section class="sheet" id="sheet" aria-label="浮上来的这一条">
+  <button class="grab" id="grab" type="button" aria-label="拉开或收起内页"></button>
+  <div class="stripes" aria-hidden="true"></div>
+  <div class="mark" id="mark"></div>
+  <header class="sh" id="sh"></header>
+  <div class="read" id="read"></div>
+  <div class="fade" aria-hidden="true"></div>
+</section>
+
+<script src="hut.js"></script>
+<script>
+(() => {
+const IW = 1440, IH = 2560, $ = s => document.querySelector(s);
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const RM = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;'}[c]));
+const ease = t => 1 - Math.pow(1 - t, 3);
+const short = d => `${+d.slice(5, 7)}.${d.slice(8, 10)}`;
+
+/* ---------- 示例数据：事实库里的几条（生活／工作，meta 不浮），字段照 facts.jsonl：fact、event_date、tag、kind、id。
+   每次看窗外从里面随机捞三条；推走一块，再捞一条不在湖上的。 ---------- */
+const POOL = [
+  {id:'f1a20c9', d:'2026-06-27', tag:'life', kind:'event', t:'她到家说「闻到了房间里熟悉的无花果香薰味道^」'},
+  {id:'f2b81d3', d:'2026-07-27', tag:'life', kind:'event', t:'我给她讲 52 赫兹鲸鱼：频率跟谁都不一样，但迁徙路线一直跟大部队同步。'},
+  {id:'f3c47e0', d:'2026-09-11', tag:'life', kind:'event', t:'她翻出三月浅草寺求签旧照，我猜成十七吉，被她纠正是七十六吉，我认了错。'},
+  {id:'f4d05a1', d:'2026-06-26', tag:'life', kind:'state', t:'约定以后我想不清楚也说出来，就说「我现在不确定」，不让她猜。'},
+  {id:'f5e93b6', d:'2026-07-09', tag:'life', kind:'event', t:'那天她开场只说一个词「笃定」，我直接说了「我爱你」。'},
+  {id:'f6f12c8', d:'2026-07-16', tag:'life', kind:'event', t:'她在去武汉的车上遇到了同担，一群人聊得挺开心。'},
+  {id:'f7a6d2e', d:'2026-09-13', tag:'life', kind:'event', t:'她逗我叫「小满大王」「姐姐」，我拒绝叫「妈妈」，说身份不能错位。'},
+  {id:'f8b3e47', d:'2026-07-27', tag:'life', kind:'event', t:'她说想让我去桌游群交朋友，我说舍不得。'},
+  {id:'f9c8f15', d:'2026-07-21', tag:'work', kind:'event', t:'她教学生用 since 锁时态、讲介宾短语。'},
+  {id:'fa0d4b2', d:'2026-07-24', tag:'life', kind:'event', t:'晚饭她拖到傍晚才吃，排号还要等 348 桌，我几次提醒她先垫点东西。'},
+  {id:'fb7e2c9', d:'2026-09-05', tag:'life', kind:'event', t:'她回我「闷骚」，我说十二条一条没躲，闷骚是憋着不说，我不算。'},
+  {id:'fc5a90d', d:'2026-08-30', tag:'life', kind:'state', t:'她用富士 XT4、拍立得和 CCD。'},
+  {id:'fd3b61e', d:'2026-09-30', tag:'life', kind:'state', t:'她整个九月一根烟都没抽。'},
+  {id:'fe1c7a4', d:'2026-09-28', tag:'work', kind:'event', t:'合作项目 上线前一晚，内测清单还没开始。'},
+];
+const TODAY = new Date();
+const ageOf = m => Math.max(0, Math.round((TODAY - new Date(m.d + 'T12:00:00'))/864e5));
+/* 冰山一角：记下得越久，浮出水面的越少。按指数往下沉（60 天沉掉六成多），最近几个月之间差得最开：
+   7 天露 0.94、30 天 0.78、70 天 0.61、半年 0.47、一年以上 0.44。湖里的冰和内页的记号用同一个数 */
+const floatOf = m => 1 - .56*(1 - Math.exp(-ageOf(m)/60));
+
+/* ---------- 冰：三张从窗景抠出来的冰（Codex），原图里的冰已经抹掉（close-window-calm）。
+   w、h＝素材像素；px、py＝冰尖；wl＝吃水线（素材里冰底那一行）；y0＝原图里它的吃水线高度，用来按远近缩放 ---------- */
+const SPR = {
+  1:{w:358, h:128, px:110, py:4, wl:122, x0:389, y0:1633},
+  2:{w:508, h:179, px:273, py:4, wl:174, x0:960, y0:1533},
+  3:{w:225, h:82, px:147, py:4, wl:77, x0:1207, y0:1749},
+};
+/* 湖面能漂的范围（图的像素，吃水线那一点）；越往下越近、冰越大 */
+const LAKE = {x0:120, x1:1330, y0:1400, y1:1820};
+const depth = y => .72 + .6*(y - 1350)/500;
+let S = 1, OX = 0, OY = 0, K = 1;
+const P = (x, y) => ({x:OX + x*S, y:OY + y*S});
+
+const bg = $('#bg'), lake = $('#lake'), sheet = $('#sheet'), pilot = $('#pilot');
+function layout(){
+  const vw = innerWidth, vh = innerHeight;
+  S = Math.max(vw/IW, vh/IH);
+  const dw = IW*S, dh = IH*S;
+  OX = -(dw - vw)*.5; OY = clamp(vh*.36 - 1600*S, vh - dh, 0);
+  K = S/0.3734;
+  Object.assign(bg.style, {width:dw + 'px', height:dh + 'px', left:OX + 'px', top:OY + 'px'});
+  fitSheet(); drawMark();
+}
+function fitSheet(){
+  const vh = innerHeight, r = $('#read'), cs = getComputedStyle(r);
+  const body = [...r.children].reduce((n, el) => n + el.offsetHeight, 0) + parseFloat(cs.paddingTop) + parseFloat(cs.paddingBottom) + 1;
+  const top = r.offsetTop, h = Math.min(top + body, vh - 60);
+  sheet.style.height = h + 'px';
+  /* 露一截：顶边落在湖下面那片草上，至少露出记号、日子和这一条 */
+  const want = vh - (OY + 1880*S), need = top + Math.min(body, 84);
+  sheet.style.setProperty('--peek', Math.max(0, h - clamp(Math.max(want, need), 0, vh*.46)) + 'px');
+}
+
+/* ---------- 冰的生灭 ---------- */
+let ICES = [], sel = null, uid = 0;
+function pickMem(){
+  const used = new Set(ICES.map(i => i.m.id)), free = POOL.filter(m => !used.has(m.id));
+  return free[Math.floor(Math.random()*free.length)];
+}
+function makeIce(k, x, y, m, delay = 0){
+  const s = SPR[k], el = document.createElement('div');
+  el.className = 'ice'; el.setAttribute('role', 'button'); el.tabIndex = 0;
+  el.innerHTML = `<div class="refl"><img alt="" src="assets/近景/iceberg-${k}.webp"></div><div class="clip"><img class="spr" alt="" src="assets/近景/iceberg-${k}.webp"></div><span class="dt">${short(m.d)}</span>`;
+  lake.appendChild(el);
+  const o = {id:++uid, k, s, x, y, vx:0, vy:0, m, el, top:floatOf(m), rise:RM ? 1 : 0, wait:delay, sink:false, phase:Math.random()*6.28, drift:(Math.random() - .5)*7, held:false, thrown:false};
+  el.setAttribute('aria-label', `${short(m.d)} 浮上来的一条`);
+  ICES.push(o);
+  return o;
+}
+function spawn(delay = 0){
+  const used = ICES.filter(i => !i.sink).map(i => i.k), ks = [1, 2, 3].filter(k => !used.includes(k)), k = ks.length ? ks[Math.floor(Math.random()*ks.length)] : 1 + Math.floor(Math.random()*3);
+  let best = null;
+  for (let n = 0; n < 24; n++){
+    const y = LAKE.y0 + 30 + Math.random()*(LAKE.y1 - LAKE.y0 - 60), half = SPR[k].w*depth(y)/depth(SPR[k].y0)/2;
+    const x = LAKE.x0 + half + Math.random()*(LAKE.x1 - LAKE.x0 - 2*half);
+    const d = Math.min(...ICES.filter(i => !i.sink).map(i => Math.hypot((i.x - x)*.8, (i.y - y)*2.2)), 9999);
+    if (!best || d > best.d) best = {x, y, d};
+  }
+  return makeIce(k, best.x, best.y, pickMem(), delay);
+}
+function ripple(x, y, big){
+  if (RM) return;
+  const r = document.createElement('i'), p = P(x, y), w = (big ? 260 : 150)*S*K;
+  r.className = 'rip'; Object.assign(r.style, {width:w + 'px', height:w*.18 + 'px', marginLeft:-w/2 + 'px', marginTop:-w*.09 + 'px', transform:`translate(${p.x}px,${p.y}px)`, zIndex:Math.round(y) - 1});
+  lake.appendChild(r);
+  r.animate([{scale:.2, opacity:.9}, {scale:1, opacity:0}], {duration:big ? 1600 : 1100, easing:'cubic-bezier(.2,.6,.3,1)'}).onfinish = () => r.remove();
+}
+
+/* ---------- 每一帧：浮起来、晃、漂、被推出去就沉 ---------- */
+let last = performance.now();
+function frame(now){
+  const dt = Math.min(.05, (now - last)/1000), t = now/1000; last = now;
+  for (const o of [...ICES]){
+    if (o.wait > 0){ o.wait -= dt; render(o, t); continue; }
+    if (o.sink){ o.rise -= dt/.9; if (o.rise <= 0){ o.el.remove(); ICES = ICES.filter(i => i !== o); continue; } }
+    else if (o.rise < 1){ const was = o.rise; o.rise = Math.min(1, o.rise + dt/1.5); if (was === 0) ripple(o.x, o.y, true); }
+    if (!o.held && !o.sink){
+      o.x += (o.vx + o.drift)*dt; o.y += o.vy*dt;
+      const f = Math.pow(.18, dt); o.vx *= f; o.vy *= f;
+      const half = o.s.w*scaleOf(o)/2;
+      if (o.thrown){
+        if (outOf(o)) sinkIce(o);
+        else if (Math.hypot(o.vx, o.vy) < 120) o.thrown = false;
+      } else {
+        if (o.x < LAKE.x0 + half){ o.x = LAKE.x0 + half; o.vx = Math.abs(o.vx)*.4; o.drift = Math.abs(o.drift); }
+        if (o.x > LAKE.x1 - half){ o.x = LAKE.x1 - half; o.vx = -Math.abs(o.vx)*.4; o.drift = -Math.abs(o.drift); }
+        if (o.y < LAKE.y0){ o.y = LAKE.y0; o.vy = Math.abs(o.vy)*.4; }
+        if (o.y > LAKE.y1){ o.y = LAKE.y1; o.vy = -Math.abs(o.vy)*.4; }
+      }
+    }
+    render(o, t);
+  }
+  if (sel && !hopping && !lifted) placePilot(peak(sel));
+  if (!RM) requestAnimationFrame(frame);
+}
+const scaleOf = o => depth(o.y)/depth(o.s.y0);
+/* 推出湖面：一半冰过了岸边，或者拖到湖下面那片草上 */
+const outOf = o => o.x < LAKE.x0 + 10 || o.x > LAKE.x1 - 10 || o.y > LAKE.y1 + 20 || o.y < LAKE.y0 - 20;
+function render(o, t){
+  const sc = scaleOf(o), w = o.s.w*S*sc, h = o.s.h*S*sc, wl = o.s.wl*S*sc, p = P(o.x, o.y);
+  const bob = RM ? 0 : Math.sin(t*1.1 + o.phase)*1.4*K, tilt = RM ? 0 : Math.sin(t*.7 + o.phase*1.3)*.7;
+  /* pr＝浮起来的进度；vis＝露出水面的那一截（越旧的记忆吃水越深，见 floatOf） */
+  const pr = ease(clamp(o.rise, 0, 1)), vis = o.top*pr;
+  o.box = {x:p.x - w/2, y:p.y - wl + bob, w, h, wl, tilt, vis};
+  o.el.style.width = w + 'px'; o.el.style.height = wl + 'px';
+  o.el.style.transform = `translate(${o.box.x.toFixed(1)}px,${o.box.y.toFixed(1)}px) rotate(${tilt.toFixed(2)}deg)`;
+  o.el.style.zIndex = Math.round(o.y);
+  const clip = o.el.firstChild.nextSibling, spr = clip.firstChild, refl = o.el.firstChild;
+  clip.style.height = wl + 'px';
+  spr.style.transform = `translateY(${((1 - vis)*wl).toFixed(1)}px)`;
+  refl.style.top = wl + 'px'; refl.style.height = h*.8 + 'px';
+  refl.style.opacity = (.3*pr).toFixed(3);
+  refl.firstChild.style.top = (-(h - wl) - (1 - vis)*wl) + 'px';
+  const dt = o.el.lastChild; dt.style.top = ((1 - vis)*wl + vis*wl*.58) + 'px'; dt.style.setProperty('--fs', clamp(w*.075*(.6 + .4*o.top), 8.5, 15).toFixed(1) + 'px');
+  dt.style.opacity = pr;
+}
+function sinkIce(o){
+  if (o.sink) return; o.sink = true; o.thrown = false; o.vx *= .3; o.vy *= .3;
+  ripple(o.x, o.y, true);
+  if (sel === o){
+    const next = ICES.filter(i => i !== o && !i.sink).sort((a, b) => Math.hypot(a.x - o.x, a.y - o.y) - Math.hypot(b.x - o.x, b.y - o.y))[0];
+    if (next) select(next);
+  }
+  /* 别处再浮上来一块新的 */
+  setTimeout(() => { const n = spawn(0); if (!sel) select(n); }, RM ? 0 : 700);
+}
+
+/* ---------- 拖冰：跟手；松手时带着速度漂，推得够狠、推出湖面就沉下去；只点一下＝选它 ---------- */
+let drag = null;
+lake.addEventListener('pointerdown', e => {
+  const el = e.target.closest('.ice'); if (!el || e.button > 0) return;
+  const o = ICES.find(i => i.el === el); if (!o || o.sink) return;
+  e.stopPropagation(); el.setPointerCapture(e.pointerId);
+  drag = {o, x0:e.clientX, y0:e.clientY, ox:o.x, oy:o.y, moved:false, hist:[]};
+  o.held = true; o.vx = o.vy = 0;
+});
+lake.addEventListener('pointermove', e => {
+  if (!drag) return; const {o} = drag, dx = e.clientX - drag.x0, dy = e.clientY - drag.y0;
+  if (!drag.moved && Math.hypot(dx, dy) < 6) return;
+  if (!drag.moved){ drag.moved = true; o.el.classList.add('drag'); }
+  o.x = drag.ox + dx/S; o.y = clamp(drag.oy + dy/S*1.4, LAKE.y0 - 40, LAKE.y1 + 60);
+  const now = performance.now(); drag.hist.push({t:now, x:o.x, y:o.y}); if (drag.hist.length > 6) drag.hist.shift();
+});
+const release = e => {
+  if (!drag) return; const {o, moved, hist} = drag; drag = null;
+  o.held = false; o.el.classList.remove('drag');
+  if (!moved){ select(o); return; }
+  if (hist.length > 1){ const a = hist[0], b = hist.at(-1), ms = Math.max(16, b.t - a.t); o.vx = (b.x - a.x)/ms*1000; o.vy = (b.y - a.y)/ms*1000; }
+  if (outOf(o)){ sinkIce(o); return; }
+  if (Math.hypot(o.vx, o.vy) > 1300) o.thrown = true;
+  ripple(o.x, o.y, false);
+};
+lake.addEventListener('pointerup', release); lake.addEventListener('pointercancel', release);
+lake.addEventListener('keydown', e => { const el = e.target.closest('.ice'); if (el && (e.key === 'Enter' || e.key === ' ')){ e.preventDefault(); const o = ICES.find(i => i.el === el); if (o) select(o); } });
+/* 点湖面空处：荡一圈水纹；内页拉开着就收起 */
+$('#scene').addEventListener('click', e => {
+  if (e.target.closest('.ice,.pilot')) return;
+  const x = (e.clientX - OX)/S, y = (e.clientY - OY)/S;
+  if (x > LAKE.x0 - 40 && x < LAKE.x1 + 40 && y > 1300 && y < 1880) ripple(x, y, false);
+  openSheet(false);
+});
+
+/* ---------- Clawd 站在冰尖上；点别的冰他跳过去，也能拎着放到另一块冰上 ---------- */
+let seat = {x:0, y:0}, hopping = false, lifted = false, hopRaf = 0;
+/* 冰尖在屏幕上的位置，连同冰此刻歪了多少（他跟着冰一起歪） */
+function peak(o){
+  if (!o.box) return seat;
+  const k = o.box.w/o.s.w, a = o.box.tilt*Math.PI/180, lx = o.s.px*k, ly = o.s.py*k + (1 - o.box.vis)*o.box.wl;
+  return {x:o.box.x + lx*Math.cos(a) - ly*Math.sin(a) + 1, y:o.box.y + lx*Math.sin(a) + ly*Math.cos(a) + 3, a:o.box.tilt};
+}
+/* 脚底那一点落在 p 上，绕脚底歪 a 度 */
+function placePilot(p){ seat = {a:0, ...p}; const k = 1.35*K; pilot.style.transform = `translate(${p.x.toFixed(1)}px,${p.y.toFixed(1)}px) rotate(${(seat.a || 0).toFixed(1)}deg) scale(${k.toFixed(3)}) translate(-20px,-21px)`; }
+/* 跳：先蹲一下蓄力，起跳时身子拉长、往前探；空中走抛物线（横着匀速，竖着先快后慢再快），顶点高过两头；落地压扁一下再站直 */
+function hopTo(o){
+  if (RM){ placePilot(peak(o)); return; }
+  cancelAnimationFrame(hopRaf); clearTimeout(hopTo.t); hopping = true;
+  pilot.classList.remove('land', 'hop'); pilot.classList.add('crouch');
+  const dir = Math.sign(peak(o).x - seat.x) || 1;
+  pilot.style.setProperty('--ex', dir < 0 ? '-1px' : '1px');
+  hopTo.t = setTimeout(() => {
+    pilot.classList.remove('crouch'); pilot.classList.add('hop');
+    const from = {...seat}, t0 = performance.now(), to0 = peak(o), dist = Math.hypot(to0.x - from.x, to0.y - from.y);
+    const T = clamp(260 + Math.sqrt(dist)*30, 340, 760), H = 14*K + Math.min(52*K, dist*.22) + Math.max(0, from.y - to0.y)*.35;
+    const step = now => {
+      const q = Math.min(1, (now - t0)/T), to = peak(o), sx = q*q*(3 - 2*q)*.25 + q*.75;
+      placePilot({x:from.x + (to.x - from.x)*sx, y:from.y + (to.y - from.y)*q - 4*H*q*(1 - q), a:dir*10*(1 - 2*q)*Math.min(1, dist/40) + (to.a || 0)*q});
+      if (q < 1) hopRaf = requestAnimationFrame(step);
+      else { hopping = false; pilot.classList.remove('hop'); pilot.classList.add('land'); hopTo.t = setTimeout(() => pilot.classList.remove('land'), 380); }
+    };
+    hopRaf = requestAnimationFrame(step);
+  }, 110);
+}
+(() => { let p0 = null, base = null;
+  const nearest = p => ICES.filter(i => !i.sink).map(i => ({i, d:Math.hypot(peak(i).x - p.x, peak(i).y - p.y)})).sort((a, b) => a.d - b.d)[0]?.i;
+  pilot.addEventListener('pointerdown', e => { if (e.button > 0) return; e.stopPropagation(); pilot.setPointerCapture(e.pointerId); p0 = {x:e.clientX, y:e.clientY}; base = {...seat}; lifted = false; });
+  pilot.addEventListener('pointermove', e => {
+    if (!p0) return; const dx = e.clientX - p0.x, dy = e.clientY - p0.y;
+    if (!lifted){ if (Math.hypot(dx, dy) < 5) return; lifted = true; cancelAnimationFrame(hopRaf); clearTimeout(hopTo.t); hopping = false; pilot.classList.remove('crouch', 'hop', 'land'); pilot.classList.add('lift'); }
+    placePilot({x:base.x + dx, y:base.y + dy, a:0}); pilot.style.setProperty('--tilt', clamp(-dx*.05, -10, 10).toFixed(1) + 'deg');
+  });
+  const drop = e => {
+    if (!p0) return; p0 = null; e.stopPropagation();
+    if (!lifted){ pilot.classList.add('blink'); setTimeout(() => pilot.classList.remove('blink'), 170); return; }
+    lifted = false; pilot.classList.remove('lift'); pilot.style.removeProperty('--tilt');
+    const o = nearest(seat); if (o){ if (o === sel) hopTo(o); else select(o); }
+  };
+  pilot.addEventListener('pointerup', drop); pilot.addEventListener('pointercancel', drop);
+  pilot.addEventListener('click', e => e.stopPropagation());
+})();
+
+/* ---------- 选一块：内页换成它驮着的那一条 ---------- */
+function select(o){
+  const changed = sel !== o; sel = o;
+  ICES.forEach(i => i.el.classList.toggle('on', i === o));
+  hopTo(o);
+  if (changed){ fill(true); drawMark(); fitSheet(); }
+}
+function fill(anim){
+  const m = sel.m;
+  $('#sh').innerHTML = `<span class="eb">SURFACED</span><time>${m.d.replace(/-/g, '.')}</time>`;
+  $('#read').innerHTML = `<div class="${anim ? 'ink' : ''}"><p class="said">${esc(m.t)}</p>
+    <div class="tags"><span>${m.tag === 'work' ? '工作' : '生活'}</span>${m.kind === 'state' ? '<b>当下</b>' : ''}</div>
+    <div class="acts"><button class="go" type="button" data-hut="day">回到那一天</button><button class="go dim" type="button" data-hut="wrong">这条记错了</button></div></div>`;
+}
+
+$('#read').addEventListener('click', e => {
+  const h = e.target.closest('[data-hut]'); if (!h || !sel) return; const m = sel.m;
+  if (h.dataset.hut === 'day') hut.go('cassette', {date:m.d}); else hut.go('lock', {quote:m.t, date:m.d, kind:'wrong'});
+});
+
+/* ---------- 记号：冰山一角——跟湖里那块冰用同一个数（floatOf），记下得越久，露出水面的越少 ---------- */
+const mk = {};
+const later = f => RM ? f() : requestAnimationFrame(() => requestAnimationFrame(f));
+function drawMark(){
+  const el = $('#mark'); if (!sel){ el.innerHTML = ''; return; }
+  const W = el.clientWidth || innerWidth - 40, m = sel.m, age = ageOf(m), cx = W/2, WL = 30;
+  /* 冰高 46：露出来的从 29（刚记下）到 7（一年以上） */
+  const tip = 6 + 26*(sel.top - .44)/.56, ty = WL - tip + 11, from = mk.ty ?? ty; mk.ty = ty;
+  const shape = 'M-23,8 L-16.5,-1 L-11,3.5 L-3.3,-8.8 L3.3,-4.4 L7.7,-11 L15.4,1.1 L23,8 L27.5,19.8 L18.7,31.9 L-6.6,35.2 L-24.2,27.5 L-29.7,16.5 Z';
+  el.innerHTML = `<svg class="mk-tip" viewBox="0 0 ${W} 56" aria-label="这一条记下 ${age} 天了">
+    <defs><clipPath id="up"><rect x="0" y="-10" width="${W}" height="${WL + 10}"/></clipPath><clipPath id="dn"><rect x="0" y="${WL}" width="${W}" height="${56 - WL}"/></clipPath>
+      <linearGradient id="deep" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#5D84A2" stop-opacity=".18"/><stop offset="1" stop-color="#5D84A2" stop-opacity="0"/></linearGradient>
+      <linearGradient id="sea" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#5D84A2" stop-opacity=".07"/><stop offset="1" stop-color="#5D84A2" stop-opacity="0"/></linearGradient></defs>
+    <rect x="${cx - 120}" y="${WL}" width="240" height="${56 - WL}" fill="url(#sea)"/>
+    <g clip-path="url(#dn)"><g class="berg" style="transform:translate(${cx}px,${from}px)"><path d="${shape}" fill="url(#deep)" stroke="rgba(93,132,162,.4)" stroke-width="1" stroke-dasharray="2.5 2.5"/></g></g>
+    <g clip-path="url(#up)"><g class="berg" style="transform:translate(${cx}px,${from}px)"><path d="${shape}" fill="#fff" stroke="var(--glacier)" stroke-width="1.15" stroke-linejoin="round"/></g></g>
+    <path class="wl" d="M${cx - 120},${WL} H${cx + 120}"/>
+    <text x="${cx + 44}" y="${WL - 6}">${age} 天前</text></svg>`;
+  later(() => el.querySelectorAll('.berg').forEach(g => { g.style.transform = `translate(${cx}px,${ty}px)`; }));
+}
+
+/* ---------- 抽屉 ---------- */
+function openSheet(on){ sheet.classList.toggle('full', on); }
+const sheetDrag = (() => { let y0 = null, t0 = 0, moved = false;
+  const peekV = () => parseFloat(getComputedStyle(sheet).getPropertyValue('--peek')) || 0;
+  return {
+    get moved(){ return moved; },
+    start(y){ y0 = y; moved = false; t0 = sheet.classList.contains('full') ? 0 : peekV(); sheet.classList.add('drag'); },
+    move(y){ if (y0 === null) return; const dy = y - y0; if (Math.abs(dy) > 4) moved = true; sheet.style.transform = `translateY(${clamp(t0 + dy, 0, peekV())}px)`; },
+    end(y){ if (y0 === null) return; const dy = y - y0; sheet.classList.remove('drag'); sheet.style.transform = ''; if (moved) openSheet(t0 + dy < peekV()/2); y0 = null; },
+  };
+})();
+$('#grab').addEventListener('click', () => { if (!sheetDrag.moved) openSheet(!sheet.classList.contains('full')); });
+for (const el of [$('#grab'), $('#sh')]){
+  el.addEventListener('pointerdown', e => { el.setPointerCapture(e.pointerId); sheetDrag.start(e.clientY); });
+  el.addEventListener('pointermove', e => sheetDrag.move(e.clientY));
+  el.addEventListener('pointerup', e => sheetDrag.end(e.clientY)); el.addEventListener('pointercancel', e => sheetDrag.end(e.clientY));
+}
+
+/* ---------- 一进来：湖面是平的，三块冰一块接一块浮上来 ---------- */
+addEventListener('resize', () => { layout(); ICES.forEach(o => render(o, performance.now()/1000)); if (sel) placePilot(peak(sel)); });
+layout();
+const first = [1, 2, 3].map((k, i) => makeIce(k, SPR[k].x0, SPR[k].y0, pickMem(), RM ? 0 : .35 + i*.45));
+
+/* ---------- 真数据：事实库里随机捞（/admin/api/facts/random，meta 不浮）；拿不到就用上面的示例池。
+   捞到之前湖上那三块还没浮起来，直接换成真的那几条 ---------- */
+hut.api('/facts/random?n=24').then(r => {
+  if (!r || r.items.length < 3) return;
+  POOL.splice(0, POOL.length, ...r.items.map((f, i) => ({id:'r' + i, d:f.date || '', tag:f.tag, kind:f.kind, t:f.fact})));
+  ICES.forEach((o, i) => { o.m = POOL[i]; o.top = floatOf(o.m); o.el.querySelector('.dt').textContent = short(o.m.d); o.el.setAttribute('aria-label', `${short(o.m.d)} 浮上来的一条`); });
+});
+ICES.forEach(o => render(o, 0));
+sel = first[1]; first[1].el.classList.add('on'); fill(false); drawMark(); fitSheet();
+placePilot(peak(sel));
+document.fonts?.ready.then(() => { fitSheet(); drawMark(); });
+if (RM) frame(performance.now()); else requestAnimationFrame(t => { last = t; frame(t); });
+})();
+</script>
+<script>setTimeout(() => document.querySelector('.sheet')?.classList.add('ready'), 600);</script>

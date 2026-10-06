@@ -64,6 +64,7 @@ import http.server
 import io
 import ipaddress
 import json
+import mimetypes
 import os
 import re
 import select
@@ -89,11 +90,14 @@ from memory_retrieval import (MemoryIndex, load_corpus, append_record, corpus_fi
 from embedding_provider import resolve_provider
 # 切块下界与体检的切块成色检查**共用同一个判据**，不各抄一份
 from chunking_experiment import chunk_body as _chunk_body, chunk_heading
-from session_recall import SessionRecall, format_recall_block, SELF_CHECK_FOOTER  # noqa: F401
+from session_recall import (SessionRecall, format_recall_block, SELF_CHECK_FOOTER,  # noqa: F401
+                            RECALL_LOG_FILENAME)
 from session_thread import ThreadStore, close_thread
 from unresolved_state import (FILENAME as UNRESOLVED_FILENAME, UnresolvedRequestError,
                               UnresolvedStore, UnresolvedStoreError, source_record_ids,
                               validate_ops)
+from notes_state import (FILENAME as NOTES_FILENAME, NoteStore, NoteRequestError,
+                         NoteStoreError)
 # 记忆所有者的时区（任务卡"写回时区与跨日归窗"）：一个进程一份，stdio 与 HTTP
 # 两种起动形态共用同一个，不各自造一份换算逻辑
 from time_context import (TimeContext, detect_local_timezone, parse_record_time_marker,
@@ -574,6 +578,30 @@ def _utf8_text_stream(binary, write=False):
     return io.TextIOWrapper(binary, encoding="utf-8", newline="", write_through=write)
 
 
+# 回便条：只在开了页面口子（--admin-token）时出现——便条只能从页面写进来，没开口子就不会有便条
+NOTE_REPLY_TOOL = "latent_note_reply"
+NOTE_REPLY_TOOL_SCHEMA = {
+    "name": NOTE_REPLY_TOOL,
+    "title": "回便条",
+    "description": (
+        "回对方在页面上写给你的便条（开场【对方写给你的便条】里那些）。改不改由你判断，不要因为是对方写的就照改："
+        "认同就先用 latent_correct（从来不对）或 latent_supersede（后来变了）改好正文，再记 changed；"
+        "不认同就记 declined，reply 写一两句为什么——对方会在页面上看到。一张便条只回一次。"),
+    "annotations": {"readOnlyHint": False, "destructiveHint": False,
+                    "idempotentHint": False, "openWorldHint": False},
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "id": {"type": "string", "description": "便条开头那个 N-…"},
+            "decision": {"type": "string", "enum": ["changed", "declined"],
+                         "description": "changed＝认同、正文已经改好；declined＝不改"},
+            "reply": {"type": "string", "description": "declined 必填：一两句为什么；changed 可选"},
+        },
+        "required": ["id", "decision"],
+    },
+}
+
+
 class ToolError(Exception):
     """工具执行失败（业务层），按规格回 isError:true 的正常结果，不是协议错误。"""
 
@@ -974,6 +1002,10 @@ class MemoryServer:
             Path(corpus_dir) / PASSIVE_METADATA_FILENAME if corpus_dir is not None else None)
         self.unresolved_store = UnresolvedStore(
             Path(corpus_dir) / UNRESOLVED_FILENAME if corpus_dir is not None else None)
+        # 便条：页面写、TA 回。默认关，开了页面口子才 enable_notes()（工具表与开场那一段都跟着它）
+        self.notes_store = NoteStore(
+            Path(corpus_dir) / NOTES_FILENAME if corpus_dir is not None else None)
+        self.notes_enabled = False
         self.require_unresolved_review = bool(require_unresolved_review)
         self.search_topN = search_topN
         # 时区：没传就退固定东八区默认值（不会跟着宿主迁移），但 --doctor 会报 WARN。
@@ -991,7 +1023,9 @@ class MemoryServer:
         self.recall = SessionRecall(self.index, topN=recall_topN, thread_store=self.thread_store,
                                     time_context=self.time_context,
                                     unresolved_store=self.unresolved_store,
-                                    per_day_cap=recall_per_day_cap)
+                                    per_day_cap=recall_per_day_cap,
+                                    log_path=(Path(corpus_dir) / RECALL_LOG_FILENAME
+                                              if corpus_dir is not None else None))
         fact_index = fact_cooldown = None
         if enable_passive_recall:
             # 事实模式：显式配了 LATENT_PASSIVE_FACTS，或语料旁的「事实库/」里已有全量回填就启用；
@@ -1074,7 +1108,7 @@ class MemoryServer:
             self.passive.set_index(self.index)
 
     def _reload_from_disk(self):
-        """语料目录有文件级变化时从盘上重建索引（常驻 HTTP 形态专用）。
+        """从盘上整库重建索引：校准、cleanup、增量出错的兜底，以及常驻 HTTP 外部变化走不了增量时。
 
         治的是 supergateway 时代那条实测过的静默坑：常驻 server 只在启动时读一次
         语料，手动上传进目录的 md 一条都看不到、不报错，直到重启。能这么重建的
@@ -1114,43 +1148,75 @@ class MemoryServer:
         整库重建。增量途中出错，内存结构可能半新半旧，同样整库重建兜底。"""
         if paths is not None and self.index is not None:
             try:
-                added = self._index_new_chunks(paths)
+                added = self._index_changed_files(paths)
             except Exception:
                 added = None
             if added is not None and not self.index.needs_calibration():
                 return
         self._reload_from_disk()
 
-    def _index_new_chunks(self, paths):
-        """把这次写进来的 md 里、索引中还没有的块，按全量加载同一套逐文件解析增量挂上。
+    def _sync_external(self, paths):
+        """常驻 HTTP 发现外部改了语料文件（推送器、云端经 git 同步落盘）：按文件增量换块，
+        撤回账本、变迁账本、权重照整库重读那样从盘上接回（外部同步也可能改了它们）。
+        出错、有实体标注文件（实体边只在整库 build 时算）或到校准阈值，整库重读（外部同步卡第三节）。
+        ⚠ 看的是文件在不在，不是配没配：命令行入口总会把 entities_path 指到 `<语料>/.entities.json`。"""
+        if self.index is not None and not (self.entities_path and Path(self.entities_path).exists()):
+            try:
+                ok = self._index_changed_files(paths) is not None
+                if ok:
+                    index = self.index
+                    if self.retractions_path is not None:
+                        index.retracted, index.retraction_log = set(), {}
+                        index.load_retractions(self.retractions_path)
+                    if self.supersessions_path is not None:
+                        index.load_supersessions(self.supersessions_path)
+                    if self.weights_path is not None:
+                        index.weights = [1.0] * len(index.chunks)
+                        index.load_weights(self.weights_path)
+            except Exception:
+                ok = False
+            if ok and not self.index.needs_calibration():
+                return
+        self._reload_from_disk()
 
-        新块的 meta 来自 load_corpus 抽出来的同一段代码，才与重启后给的一致。文件里
-        原有的块若不只是被追加（有旧块对不上），返回 None，交给整库校准。"""
+    def _index_changed_files(self, paths):
+        """按文件比对切块结果，把索引里这些文件的块换成盘上现在的（外部同步卡第三节）。
+
+        每个文件按全量加载同一段代码（_file_info／_file_chunks）重新切块，新块的 meta 才与
+        重启后给的一致，再与索引里这个文件现有的块比：原有块按顺序原样都在、只多出新块，只挂
+        新块（C 步写法）；否则旧块整份退场、新块整份按文件顺序进来（正文没变的算搬家，见
+        MemoryIndex.replace_chunks）；文件没了就只退场。返回新进的块数（不含搬家）。"""
         index = self.index
         roots = [Path(d).resolve() for d in self.source_dirs]
         window_ts = index.__dict__.setdefault("_window_ts", {})
         window_date = index.__dict__.setdefault("_window_date", {})
-        added = 0
-        for path in paths:
-            p = Path(path).resolve()
+        retire, items = [], []
+        for p in dict.fromkeys(Path(path).resolve() for path in paths):
             if p.suffix != ".md" or p.name in _MARKDOWN_SIDECARS \
                     or not any(root == p.parent or root in p.parents for root in roots):
                 continue        # 关系账本等 sidecar、或读取根之外的文件：重启也不会进库
-            existing = {_chunk_key(c) for c, m in zip(index.chunks, index.meta)
-                        if m.get("source") == p.name}
-            info = _file_info(p, p.read_text(encoding="utf-8"), p.stat().st_mtime,
-                              index.date_order)
-            _note_window(info, window_ts, window_date)
-            chunks = list(_file_chunks(p, info, index.date_order, window_ts, window_date))
-            if not existing <= {_chunk_key(c) for c, _ in chunks}:
-                return None
-            for chunk, meta in chunks:
-                if _chunk_key(chunk) not in existing:
-                    index.add_incremental(chunk, meta)
-                    existing.add(_chunk_key(chunk))
-                    added += 1
-        if added and self.supersessions_path is not None:
-            # 变迁账本按 meta 重算 superseded 集合与 status；新块要一起对号
+            key = str(p)
+            # 没有块路径的块（不是 load_corpus 建的）退回按文件名认，同 C 步
+            old = [i for i, (q, m) in enumerate(zip(index.paths, index.meta))
+                   if q == key or (q is None and m.get("source") == p.name)]
+            chunks = []
+            if p.exists():
+                info = _file_info(p, p.read_text(encoding="utf-8"), p.stat().st_mtime,
+                                  index.date_order)
+                _note_window(info, window_ts, window_date)
+                chunks = [(c, m, key) for c, m in
+                          _file_chunks(p, info, index.date_order, window_ts, window_date)]
+            if [_chunk_key(c) for c, _, _ in chunks[:len(old)]] == \
+                    [_chunk_key(index.chunks[i]) for i in old]:
+                items += chunks[len(old):]
+            else:
+                retire += old
+                items += chunks
+        if not retire and not items:
+            return 0
+        added = index.replace_chunks(retire, items)
+        if self.supersessions_path is not None:
+            # 变迁账本按 meta 重算 superseded 集合与 status；新块、搬家的块都要对号
             index.load_supersessions(self.supersessions_path)
         return added
 
@@ -1551,7 +1617,7 @@ class MemoryServer:
         return result + f" factsStatus=saved（{n} 条进事实库）。" + hint
 
     def _supersede_hint(self, record_id, now=None):
-        """写入端旧记录提示（#45 第 2 步）：拿新记录现成的向量和现行 timeline 记录比，分得开才提。
+        """写入端旧记录提示（#45 第 2 步）：拿新记录现成的向量和现行、不是同一天的 timeline 记录比，分得开才提。
 
         零额外请求、只读索引；正文已经写成功，这里出任何错都只是不提示。提示记进账本（只记时间和 recordId）。"""
         if self.hint_min is None or self.hint_lead is None or self.index is None:
@@ -2244,6 +2310,22 @@ class MemoryServer:
                     "（原因码 fact_index_warming），算完自动开始浮现。")
         raise ToolError("action 只能是 status／next／submit／finish")
 
+    def enable_notes(self):
+        """开了页面口子才调：工具表多一个 latent_note_reply，开场最先给还在等的便条。"""
+        if not self.notes_enabled:
+            self.notes_enabled = True
+            self.tools.append(NOTE_REPLY_TOOL_SCHEMA)
+            self.recall.notes_store = self.notes_store
+
+    def _tool_note_reply(self, args, now=None):
+        at = self.time_context.isoformat(now if now is not None else time.time())
+        try:
+            note = self.notes_store.reply(args.get("id"), args.get("decision"), at, args.get("reply"))
+        except (NoteRequestError, NoteStoreError) as exc:
+            raise ToolError(str(exc)) from None
+        return (f"已记下：{note['id']} → {'改好了' if note['state'] == 'done' else '回了话'}。"
+                "对方在页面上会看到。")
+
     def _handlers(self):
         return {
             "latent_search": self._tool_memory_search,
@@ -2254,6 +2336,7 @@ class MemoryServer:
             "latent_cleanup": self._tool_memory_cleanup,
             "latent_unresolved": self._tool_unresolved,
             "latent_thread_close": self._tool_thread_close,
+            **({NOTE_REPLY_TOOL: self._tool_note_reply} if self.notes_enabled else {}),
             **({FACT_BACKFILL_TOOL: self._tool_fact_backfill} if self.fact_backfill_enabled else {}),
             **({PASSIVE_RECALL_TOOL: self._tool_passive_recall} if self.passive else {}),
         }
@@ -2399,7 +2482,7 @@ class MemoryServer:
 # ③ 进程僵死（在但端口不通）要 pkill 重启；
 # ④ 常驻只在启动时读一次语料，手动加的 md 静默看不到。
 # 原生实现把四个一起治：鉴权内置且非回环裸跑直接拒绝起动、只说 Streamable HTTP、
-# 少一个常驻进程、语料变化自动重读（_reload_from_disk）。
+# 少一个常驻进程、语料变化自动同步（_sync_external，走不了增量时 _reload_from_disk）。
 # 零依赖不破：http.server 是标准库。TLS 不在这做——这类前端不认自签证书
 # （两家独立实测），公网仍然要域名 + 反代（Caddy）那条路，反代顺手把 TLS 管了。
 #
@@ -2652,13 +2735,24 @@ def _corpus_signature(source_dirs):
     return tuple(out)
 
 
+# 外部语料变化的防抖（外部同步卡第三节第 5 条）：发现后先用当前索引照常回答，语料安静满
+# 这么多秒再在下一个请求处理一次；从第一次发现算起最多压 3 倍这么久。60 秒取自一个自用部署
+# 14 天的提交间隔（≤60 秒的 20 个间隔都能合并）
+EXTERNAL_DEBOUNCE_SECONDS = 60
+
+
 def make_http_server(server, host="127.0.0.1", port=8765, token=None,
-                     sse_stream=True, hook_token=None):
+                     sse_stream=True, hook_token=None,
+                     external_debounce=EXTERNAL_DEBOUNCE_SECONDS, clock=time.monotonic,
+                     admin=None, admin_token=None, ui_dir=None):
     """MemoryServer → 绑好端口的 ThreadingHTTPServer（不启动；.serve_forever() 是
     调用方的事——selftest 要拿着实例开线程、取真端口、shutdown）。
 
     `sse_stream`：GET 要不要给一条空长流（默认给，理由见上面那段注释）。
     关掉就退回「GET 恒 405」的旧行为，留给「长流反而碍事」的部署。
+
+    `external_debounce`／`clock`：外部语料变化的防抖秒数与计时用的钟（自检注入假钟），
+    见 EXTERNAL_DEBOUNCE_SECONDS。传 0 就是发现即处理。
 
     `hook_token`：只发给宿主 hook 的第二条凭证。配了它之后两条凭证都能过闸，
     但**只有它**看得见、调得动自动浮现宿主入口；`token` 与任何别的调用方拿到的
@@ -2669,10 +2763,17 @@ def make_http_server(server, host="127.0.0.1", port=8765, token=None,
     -32601、立刻发现」。因此它跟「部署必须配 --hook-token」是一套：要恢复得把
     凭证补上，不是把凭证拿掉。"""
     http_bind_guard(host, token or hook_token)
+    if admin_token:
+        http_bind_guard("127.0.0.1", admin_token)   # 只借它那道"钥匙必须 ASCII"的检查
     lock = threading.Lock()                  # index 的增删改建都不是线程安全的：串行化
+    if admin is not None:
+        admin.lock = lock                    # 页面口子读索引，跟工具调用排同一个队
+    mimetypes.add_type("image/webp", ".webp")
+    mimetypes.add_type("text/javascript", ".js")
     deny_log = _make_deny_logger()           # 被拒请求留痕（带刷屏上限，见那个函数）
     state = {"sig": _corpus_signature(server.source_dirs)
-             if (server.source_dirs and server.loader) else None}
+             if (server.source_dirs and server.loader) else None,
+             "pending": None, "first": 0.0, "quiet_since": 0.0}
     # 开着的 GET 空长流：计数（配上限用）与「服务端要停了」的信号。
     # ⚠ **`closing` 不能省**：长流线程平时蹲在 `wait(心跳间隔)` 上，没有这个信号
     # 就得等一个心跳周期才发现服务停了——selftest 里 `shutdown()` 会跟着变慢，
@@ -2885,7 +2986,63 @@ def make_http_server(server, host="127.0.0.1", port=8765, token=None,
             except OSError:
                 pass          # 对端走了：正常收场，不是异常（同 handle_error 的理由）
 
+        def _admin(self, path, post=False):
+            """给人看的口子（记忆可视化）。单独一把钥匙；没配 --admin-token 就跟别的
+            未知路径一样 404——不配的部署跟以前一模一样。GET 只读；POST 只有贴便条一条路
+            （admin.handle_post 别的路径一律 404），改不了记忆本身。DELETE 等走 _gate。"""
+            if admin is None or not admin_token:
+                return self._deny(404, f"没有这个端点：{path}——本 server 只在 /mcp 上收")
+            got = (self.headers.get("Authorization") or "").encode("latin-1", "replace")
+            if not hmac.compare_digest(got, f"Bearer {admin_token}".encode("ascii")):
+                return self._deny(401, "缺少或错误的 Bearer token",
+                                  extra=[("WWW-Authenticate", "Bearer")])
+            # 同源才回：页面跟接口是同一个 server 挂的（--ui），Origin 就是 Host；本机也放行
+            origin = self.headers.get("Origin")
+            if origin:
+                o = urllib.parse.urlsplit(origin)
+                local = (o.hostname or "").lower() in ("localhost", "127.0.0.1", "::1")
+                if not (local or o.netloc == (self.headers.get("Host") or "")):
+                    return self._deny(403, f"Origin 不被信任：{origin}")
+            if post:
+                try:
+                    length = int(self.headers.get("Content-Length") or -1)
+                except ValueError:
+                    length = -1
+                if length < 0:
+                    return self._deny(411, "缺 Content-Length")
+                if length > 16 * 1024:                 # 一张便条 500 字，16KB 绰绰有余
+                    return self._deny(413, "请求体超限")
+                try:
+                    data = json.loads(self.rfile.read(length).decode("utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    return self._deny(400, "请求体不是合法的 UTF-8 JSON")
+                code, body = admin.handle_post(path[len("/admin/api"):], data)
+                return self._send(code, json.dumps(body, ensure_ascii=False).encode("utf-8"),
+                                  extra=[("Cache-Control", "no-store")])
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            code, body = admin.handle(path[len("/admin/api"):], query)
+            self._send(code, json.dumps(body, ensure_ascii=False).encode("utf-8"),
+                       extra=[("Cache-Control", "no-store")])
+
+        def _static(self, path):
+            """--ui 目录挂在 /hut/：页面里没有记忆，打开不用钥匙（数据走 /admin/api 要钥匙）。
+            ⚠ 不许 ../ 走出目录。"""
+            base = Path(ui_dir).resolve()
+            rel = urllib.parse.unquote(path[len("/hut"):].lstrip("/")) or "prototype.html"
+            f = (base / rel).resolve()
+            if base not in f.parents or not f.is_file():
+                return self._deny(404, f"没有这个文件：{path}")
+            ctype = mimetypes.guess_type(f.name)[0] or "application/octet-stream"
+            if ctype.startswith("text/") or ctype.endswith(("javascript", "json")):
+                ctype += "; charset=utf-8"
+            self._send(200, f.read_bytes(), ctype=ctype)
+
         def do_GET(self):
+            path = urllib.parse.urlsplit(self.path).path
+            if path.startswith("/admin/api/"):
+                return self._admin(path)
+            if ui_dir and (path == "/hut" or path.startswith("/hut/")):
+                return self._static(path)
             if not self._gate():
                 return
             deny = ("本 server 不提供 SSE 长流，请用 POST（Streamable HTTP）",
@@ -2915,6 +3072,9 @@ def make_http_server(server, host="127.0.0.1", port=8765, token=None,
             self._send(200)                  # 无会话态，终止是空操作
 
         def do_POST(self):
+            path = urllib.parse.urlsplit(self.path).path
+            if path.startswith("/admin/api/"):
+                return self._admin(path, post=True)    # 页面口子唯一能写的：贴便条
             if not self._gate():
                 return
             # chunked 明确不支持，**且报错要指对方向**（2026.08.03 外部实测）：
@@ -2949,7 +3109,7 @@ def make_http_server(server, host="127.0.0.1", port=8765, token=None,
             if not isinstance(msg, dict):
                 return self._deny(400, "请求体要是一条 JSON-RPC 消息对象")
             with lock:
-                # 常驻形态的重读：语料目录文件级变化（手动上传/删除 md）→ 从盘重建。
+                # 常驻形态：语料目录文件级变化（手动上传/删除 md、git 同步）→ _sync_external。
                 # ⚠ **指纹要在 handle 之后重算、而且只认自己写的那次变化**
                 # （2026.08.03 外部评审指出的竞态）：原先 handle 后无条件刷新指纹，
                 # 于是「一次 latent_append 与用户手动上传落在同一个请求窗口」时，
@@ -2959,16 +3119,30 @@ def make_http_server(server, host="127.0.0.1", port=8765, token=None,
                 # 无从区分，所以退一步取更安全的一侧：若 handle 期间指纹又变了，
                 # 保留 before，让下一个请求去发现并重读——宁可多重读一次，
                 # 不可漏掉一次）。
+                # 外部变化（推送器、云端经 git 同步落盘）先防抖、再按文件增量换块（外部同步卡）：
+                # 窗口里照常用当前索引回答；索引是空的（#36 重建失败后）不防抖，立刻重建。
                 if state["sig"] is not None:
                     sig = _corpus_signature(server.source_dirs)
-                    if sig != state["sig"] or server.index is None:
+                    changed = frozenset(sig) ^ frozenset(state["sig"])
+                    now = clock()
+                    if changed != state["pending"]:
+                        # 又来了新的变化：安静计时从头算；第一次发现的时刻留着封顶用
+                        if not state["pending"]:
+                            state["first"] = now
+                        state["pending"], state["quiet_since"] = changed, now
+                    due = changed and (now - state["quiet_since"] >= external_debounce
+                                       or now - state["first"] >= 3 * external_debounce)
+                    if due or server.index is None:
                         try:
-                            server._reload_from_disk()
+                            if server.index is None:
+                                server._reload_from_disk()
+                            else:
+                                server._sync_external({p for p, _, _ in changed})
                         except ToolError as exc:
                             body = json.dumps(server._err(msg.get("id"), -32603, str(exc)),
                                               ensure_ascii=False).encode("utf-8")
                             return self._send(503, body)
-                        state["sig"] = sig
+                        state["sig"], state["pending"] = sig, None
                 resp = server.handle(msg, hidden_ok=getattr(self, "hidden_ok", False))
                 if state["sig"] is not None and server.written_paths:
                     # **只折进 server 自己写的那几个文件**，其余差异留着让下一个
@@ -2982,7 +3156,7 @@ def make_http_server(server, host="127.0.0.1", port=8765, token=None,
                             base[path] = current[path]
                         else:
                             # latent_cleanup 会删除活动文件；旧基线也得去掉该路径，
-                            # 否则下一次请求会把自己的删除误判成外部变化、多重读一遍。
+                            # 否则之后的请求会把自己的删除误判成外部变化、多处理一遍。
                             base.pop(path, None)
                     state["sig"] = tuple(sorted((p, m, s) for p, (m, s) in base.items()))
                     server.written_paths = set()
@@ -3077,8 +3251,9 @@ def diagnose(corpus_dir, threads_path=None, embed=False, time_context=None,
     mtime、sidecar 哈希对不上、写回落点只读、thread 没落点。这些的共同点是
     服务照常起、握手照常成功、模型照常回话，只是回得不对。"""
     out = []
-    def add(level, title, detail):
-        out.append({"level": level, "title": title, "detail": detail})
+    def add(level, title, detail, **data):
+        # data：给 --json 的数（UI 的状态页要四个大数），人读的报告只看 detail
+        out.append({"level": level, "title": title, "detail": detail, **({"data": data} if data else {})})
 
     # **相对路径必须解析成绝对路径**（判据 1，也是这一单的来源）：`.mcp.json` 里写的
     # 是 `--corpus corpus` 这种相对值，跑体检的人心里的问题正是"它到底去哪儿读了"。
@@ -3100,7 +3275,8 @@ def diagnose(corpus_dir, threads_path=None, embed=False, time_context=None,
     unresolved_path = root / UNRESOLVED_FILENAME
     unresolved_for_doctor = []
     if not unresolved_path.exists():
-        add(OK, "未解决清单", f"{unresolved_path} 尚未生成（正常：第一次 open 时创建）")
+        add(OK, "未解决清单", f"{unresolved_path} 尚未生成（正常：第一次 open 时创建）",
+            unresolved=0)
     else:
         try:
             unresolved, bad_lines = UnresolvedStore(unresolved_path).read(allow_partial=True)
@@ -3114,9 +3290,9 @@ def diagnose(corpus_dir, threads_path=None, embed=False, time_context=None,
                       f"最长 {longest} 字")
             if bad_lines:
                 add(FAIL, "未解决清单", detail + "；格式错误或重复 ID 行："
-                    + "、".join(map(str, bad_lines)))
+                    + "、".join(map(str, bad_lines)), unresolved=len(unresolved))
             else:
-                add(OK, "未解决清单", detail)
+                add(OK, "未解决清单", detail, unresolved=len(unresolved))
 
     corpus_only_files = corpus_files(root)  # 递归，子目录里的 md 也算
     if not corpus_only_files:
@@ -3135,7 +3311,22 @@ def diagnose(corpus_dir, threads_path=None, embed=False, time_context=None,
                 else "它的同级目录里也没有——确认一下记忆库到底建在哪儿。")
         add(FAIL, "语料文件", f"{root} 下（含子目录）没找到任何 .md 语料。{hint}")
         return out
-    add(OK, "语料目录", f"{root}（{len(corpus_only_files)} 个 md 文件）")
+    add(OK, "语料目录", f"{root}（{len(corpus_only_files)} 个 md 文件）",
+        files=len(corpus_only_files))
+
+    # 事实库：跟服务端认的是同一处（LATENT_PASSIVE_FACTS，没配就语料旁的「事实库/」）。
+    # 只读一遍行数，不算向量、不建冷却目录。meta 不算——它不浮，也不进事实库检索。
+    from passive_facts import FactIndex
+    fact_path = Path(os.environ.get("LATENT_PASSIVE_FACTS") or root.parent / "事实库")
+    if not fact_path.exists():
+        add(OK, "事实库", f"{fact_path} 没有（正常：没开自动浮现的事实模式）", facts=0)
+    else:
+        try:
+            n_facts = len(FactIndex(fact_path).rows)
+        except (OSError, ValueError) as e:
+            add(WARN, "事实库", f"{fact_path} 读不出来：{e}。自动浮现的事实模式会起不来。")
+        else:
+            add(OK, "事实库", f"{fact_path}：{n_facts} 条（不含 meta）", facts=n_facts)
 
     try:
         roots = retrieval_dirs(root, index_dir)
@@ -3184,7 +3375,8 @@ def diagnose(corpus_dir, threads_path=None, embed=False, time_context=None,
     lens = sorted(len(c) for c in index.chunks)
     median_len = lens[len(lens) // 2]
     add(OK, "建库", f"{len(index.chunks)} 块（索引层 {n_index} / 叙事层 "
-                    f"{len(index.chunks) - n_index}），中位块长 {median_len} 字")
+                    f"{len(index.chunks) - n_index}），中位块长 {median_len} 字",
+        chunks=len(index.chunks))
 
     # 切块成色：块数漂亮、分层漂亮，但每个块只有一句话——体检以前只报块数，
     # 报告里那个虚高一个数量级的数字**没有任何一行说它不正常**（首发用户就是这么
@@ -3482,24 +3674,40 @@ def _doctor_probe_outcome(probe, weak_probe, result):
     return FAIL, f"拿语料自己的标题“{probe}”去查，反而查不到：{error}"
 
 
+def doctor_conclusion(checks):
+    """结论一句话（不带"结论："）：人读报告的最后一行，也是 --json 的 conclusion。"""
+    n_fail = sum(1 for c in checks if c["level"] == FAIL)
+    n_warn = sum(1 for c in checks if c["level"] == WARN)
+    if n_fail:
+        return (f"{n_fail} 项过不去" + (f"、{n_warn} 项要注意" if n_warn else "")
+                + "。上面标 ✗ 的先修，修完再起服务。")
+    if n_warn:
+        return (f"能用，{n_warn} 项要注意——标 ⚠ 的都是"
+                "“不报错但会悄悄变差”的那类，值得看一眼。")
+    return "全部通过。"
+
+
 def format_doctor_report(checks):
     """体检结果 → 给人看的报告。结论一句话放最后，别让人自己数图标。"""
     lines = ["记忆库部署体检", ""]
     for c in checks:
         lines.append(f"{_DOCTOR_ICON[c['level']]} {c['title']}：{c['detail']}")
-    n_fail = sum(1 for c in checks if c["level"] == FAIL)
-    n_warn = sum(1 for c in checks if c["level"] == WARN)
-    lines.append("")
-    if n_fail:
-        lines.append(f"结论：{n_fail} 项过不去" + (f"、{n_warn} 项要注意" if n_warn else "")
-                     + "。上面标 ✗ 的先修，修完再起服务。")
-    elif n_warn:
-        lines.append(f"结论：能用，{n_warn} 项要注意——标 ⚠ 的都是"
-                     "“不报错但会悄悄变差”的那类，值得看一眼。")
-    else:
-        lines.append("结论：全部通过。")
-    lines.append("（体检只读，没有向语料目录写入任何文件。）")
+    lines += ["", "结论：" + doctor_conclusion(checks), "（体检只读，没有向语料目录写入任何文件。）"]
     return "\n".join(lines)
+
+
+def doctor_json(checks):
+    """体检结果 → 给程序读的形状（UI 状态页用）。status 取最重的一级；
+    stats 是各项带的数（正文文件、块、事实、未解决），哪项没跑到就没有那个键。"""
+    counts = {lv: sum(1 for c in checks if c["level"] == lv) for lv in (OK, WARN, FAIL)}
+    stats = {}
+    for c in checks:
+        stats.update(c.get("data", {}))
+    return {"schemaVersion": 1,
+            "status": FAIL if counts[FAIL] else WARN if counts[WARN] else OK,
+            "counts": counts, "stats": stats,
+            "conclusion": doctor_conclusion(checks),
+            "readOnly": True, "checks": checks}
 
 
 # ---------- 启动失败：给人话、给出口、让用户真的看得见（任务卡"服务端起不来时全是裸堆栈"） ----------
@@ -4083,7 +4291,7 @@ def _selftest_status_ops_no_rebuild(now=1_800_000_000.0):
             sig0 = _corpus_signature(srv.source_dirs)
             r = call(srv, "latent_unresolved", {"action": "open", "summary": "猫下个月复查"}, now + 6)
             assert r["isError"] is False and _corpus_signature(srv.source_dirs) == sig0, \
-                "latent_unresolved 不能改语料指纹，否则常驻 HTTP 下一次请求会整库重读"
+                "latent_unresolved 不能改语料指纹，否则常驻 HTTP 会把它当成外部语料变化去处理"
             r = call(srv, "latent_correct", {"quote": "验证用帐篷是蓝色的。",
                                              "reason": "虚构验证：颜色记错了"}, now + 7)
             assert r["isError"] is False and "1 条索引摘要也一并退出检索" in r["content"][0]["text"], r
@@ -4145,7 +4353,7 @@ def _selftest_incremental_writes(now=1_800_000_000.0):
     逐位一致；增量途中出错退回整库校准；cleanup 一律当场校准。
     夹具 120 块，比例线 2.5% 约 3 块，三次增量写入（append、supersede、correct 带更正）
     之后第四次到阈值。变异：_refresh_after_write 里去掉阈值判断（永不校准）→ 第四次那条红；
-    _index_new_chunks 不调 load_supersessions → supersede 那条红。"""
+    _index_changed_files 不调 load_supersessions → supersede 那条红。"""
     import tempfile
     from memory_retrieval import CALIBRATE_RATIO
     counts = {"build": 0, "reload": 0}
@@ -4233,16 +4441,17 @@ def _selftest_incremental_writes(now=1_800_000_000.0):
                 assert live[key] == fresh[key], f"校准后 {key} 与重启不一致"
 
             # 判据 7：增量途中抛错，退回整库校准，结果与重启一致
-            real_add = MemoryIndex.add_incremental
-            def broken_add(self, text, meta):
+            # 拦生产代码实际调用的那个方法（外部改动的增量写入也走 replace_chunks）
+            real_replace = MemoryIndex.replace_chunks
+            def broken_replace(self, retire, items):
                 raise RuntimeError("模拟增量写入中途出错")
-            MemoryIndex.add_incremental = broken_add
+            MemoryIndex.replace_chunks = broken_replace
             counts.update(build=0, reload=0)
             try:
                 r = call(srv, "latent_append", {"text": "台灯的灯泡换成了暖光。",
                                                 "current_state": "虚构验证数据"}, now + 30)
             finally:
-                MemoryIndex.add_incremental = real_add
+                MemoryIndex.replace_chunks = real_replace
             assert r["isError"] is False and counts == {"build": 1, "reload": 1}, \
                 f"增量出错要退回整库校准：{counts}"
             # 先比再查：主动检索会给命中块加权，查在前面两边就不是同一状态了
@@ -4271,12 +4480,308 @@ def _selftest_incremental_writes(now=1_800_000_000.0):
           "四个入口与重启逐位一致；增量出错退回校准；cleanup 当场校准）")
 
 
+def _memory_retrieval_hidden_hooks():
+    import memory_retrieval
+    return memory_retrieval._HIDDEN_HOOKS
+
+
+def _selftest_external_changes(now=1_800_000_000.0):
+    """外部同步卡（判据见卡第四节）：常驻 HTTP 发现外部改了语料（推送器、云端经 git 同步），
+    按文件比对切块结果增量换块，不整库重读。
+    判据 1：五类外部变化各改一次，与重启逐位一致（块与 meta、每块 BM25 与余弦分数、全库换窗召回
+    分数、撤回／取代／隐藏、权重），只有图谱邻居表允许不同；判据 2：搬家的块不计、新块计，到阈值
+    恰好一次整库重读，之后四个入口与重启逐位一致；判据 3：防抖（假钟，不真等）；判据 4：增量出错
+    退回整库重读，重读也失败回 503、下一个请求不防抖立刻重建。
+    变异：replace_chunks 退场不减 df → 判据 1 红；搬家也计入 pending_new → 判据 2 红；
+    make_http_server 里 due 恒真（去掉防抖）→ 判据 3 红。"""
+    import shutil
+    import tempfile
+    import urllib.error
+    import urllib.request
+    from collections import Counter
+    from memory_retrieval import tokenize
+    counts = {"sync": 0, "reload": 0}
+    real_sync, real_reload = MemoryServer._sync_external, MemoryServer._reload_from_disk
+    def counting_sync(self, paths):
+        counts["sync"] += 1
+        return real_sync(self, paths)
+    def counting_reload(self):
+        counts["reload"] += 1
+        return real_reload(self)
+    verbs = ("修", "买", "洗", "擦", "种", "煮", "读", "写", "补", "晒", "叠", "刷")
+    objs = ("单车", "窗户", "绿豆", "灯泡", "小说", "衣裳", "花草", "袜子", "被褥", "院落",
+            "蛋糕", "油漆", "风筝", "茶壶", "围巾", "相框", "台灯", "雨伞", "钥匙", "鞋柜",
+            "米缸", "砧板", "扫帚", "挂钟", "书架", "镜子", "抽屉", "毯子", "水壶", "花盆",
+            "竹席", "门帘", "瓷碗", "铁锅")
+    sec = lambda title, body: f"## {title}\n{body}\n"
+    base = {
+        "timeline/window_01_2026-06-01.md": "\n".join(
+            sec(f"杂记{n:03d}", f"今天{verbs[n % 12]}了{objs[n // 12]}，顺手记一笔。")
+            for n in range(400)),
+        "cloud/index/window_05.md": "窗口五的摘要：阳台的茉莉开了第一朵，浇水改成隔天。\n",
+        "cloud/timeline/window_05_2026-09-20.md": "# 第5个窗口 · 2026-09-20\n\n" + "\n".join((
+            sec("2026-09-20 阳台", "茉莉冒出三个花苞。"), sec("浇水", "浇水改成隔天一次。"),
+            sec("换盆", "旧盆裂了，换成陶土盆。"), sec("收尾", "当下状态：茉莉长势好。"))),
+        "diary/2026-10-01.md": sec("2026-10-01 日记", "去河边看了白鹭。") + "\n"
+                               + sec("晚上", "煮了一锅绿豆汤。"),
+        "vps/index/2026-10-01.md": "十月一日摘要：修好了阁楼的天文镜。\n",
+        "vps/timeline/2026-10-01.md": "\n".join((
+            sec("2026-10-01 上午", "阁楼的天文镜修好了。"), sec("中午", "楼下面包店周三休息。"),
+            sec("下午", "单车的链条掉了，自己装回去。"), sec("傍晚", "记错的一条：说过要搬家。"),
+            sec("晚上", "当下状态：天文镜能用。"))),
+        "vps/timeline/2026-10-02.md": sec("2026-10-02 给你的信",
+                                          "<!-- sealed_until: 2099-01-01 -->\n这封信等那天再拆。")
+                                      + "\n" + sec("白天", "整理了旧照片。"),
+    }
+    def write(root, rel, text):
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        return path
+    def mk(root):
+        corpus, index_dir = root / "timeline", root / "index"
+        source_dirs, loader = make_corpus_loader(corpus, index_dir)
+        return MemoryServer(index=loader(), thread_store=ThreadStore(), corpus_dir=corpus,
+                            index_dir=index_dir, source_dirs=source_dirs, loader=loader,
+                            retractions_path=corpus / ".retractions.json",
+                            supersessions_path=corpus / ".supersessions.json",
+                            weights_path=corpus / ".weights.json",
+                            entities_path=corpus / ".entities.json",   # 同命令行入口：配了、文件不在
+                            enable_passive_recall=True)
+    def call(server, name, args, at):
+        return server.handle({"jsonrpc": "2.0", "id": 41, "method": "tools/call",
+                              "params": {"name": name, "arguments": args}},
+                             now=at, hidden_ok=True)["result"]
+    queries = ("阳台茉莉", "天文镜", "单车链条", "信", "今天洗了窗户", "绿豆汤", "陶土盆", "白鹭")
+    at = now + 100
+    def exact(server):
+        ix = server.index
+        keys = [_chunk_key(c) for c in ix.chunks]
+        out = {"chunks": sorted((k, json.dumps(m, ensure_ascii=False, sort_keys=True, default=str))
+                                for k, m in zip(keys, ix.meta)),
+               "weights": sorted(zip(keys, map(repr, ix.weights))),
+               # 全库都排进来再比，免得 topN 截在同分处、按下标挑人（增量块下标在末尾）
+               "recall": sorted((_chunk_key(r["text"]), repr(r["score"]))
+                                for r in ix.recall_recent(topN=len(keys), now=at))}
+        for q in queries:
+            out["bm25", q] = sorted(zip(keys, map(repr, ix._bm25.scores(tokenize(q)))))
+            out["cos", q] = sorted(zip(keys, map(repr, ix._vector_scores(q))))
+        for name, idx in (("retracted", ix.retracted), ("superseded", ix.superseded),
+                          ("hidden", ix.hidden_indices(at))):
+            out[name] = sorted(keys[i] for i in idx)
+        if ix.embed:                    # 向量档（外部同步卡第七节重跑）：块向量逐字节比
+            out["vec"] = sorted((k, v.tobytes()) for k, v in zip(keys, ix._cvecs))
+        return out
+    def graph_drift(a, b):
+        def table(ix):
+            keys = [_chunk_key(c) for c in ix.chunks]
+            return Counter((keys[i], tuple(keys[j] for j in ix.graph_neighbors(i)))
+                           for i in range(len(keys)))
+        return sum((table(a.index) - table(b.index)).values())
+
+    MemoryServer._sync_external, MemoryServer._reload_from_disk = counting_sync, counting_reload
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            seed = Path(td) / "seed"
+            for rel, text in base.items():
+                write(seed / "timeline", rel, text)
+            (seed / "index").mkdir()
+            # 账本先落盘：纯撤回一条、取代一条、检索加一次权重（都在会被外部改动的文件里）
+            srv = mk(seed)
+            assert call(srv, "latent_correct", {"quote": "说过要搬家", "reason": "虚构验证：记错了"},
+                        now)["isError"] is False
+            old_rid = next(m["record_id"] for c, m in zip(srv.index.chunks, srv.index.meta)
+                           if "周三休息" in c)
+            assert call(srv, "latent_supersede", {"supersedes": old_rid,
+                        "text": "面包店改成周一休息了。", "current_state": "虚构验证数据"},
+                        now + 1)["isError"] is False
+            assert "天文镜" in call(srv, "latent_search", {"query": "天文镜", "topN": 3},
+                                    now + 2)["content"][0]["text"]
+            assert srv.index.retracted and srv.index.superseded, "夹具：撤回、取代账本都在"
+            seed_keys = [_chunk_key(c) for c in srv.index.chunks]
+
+            # 判据 1：五类外部变化，各在一份新副本上改一次
+            vps1 = "vps/timeline/2026-10-01.md"
+            win5 = "cloud/timeline/window_05_2026-09-20.md"
+            def drop_diary(r):
+                (r / "diary/2026-10-01.md").unlink()
+                return r / "diary/2026-10-01.md"
+            cases = {
+                "新增文件": (2, lambda r: [write(r, "cloud/timeline/window_07_2026-10-03.md",
+                    sec("2026-10-03 新窗口", "茉莉谢了两朵。") + "\n" + sec("收尾", "当下状态：在等新花苞。"))]),
+                "只新增块": (1, lambda r: [write(r, vps1, (r / vps1).read_text(encoding="utf-8")
+                                                 + "\n" + sec("深夜", "又调了一次天文镜的焦距。"))]),
+                "索引摘要覆盖": (1, lambda r: [write(r, "cloud/index/window_05.md",
+                    "窗口五的摘要：茉莉开了三朵，换了陶土盆。\n")]),
+                "末块重写＋追加": (2, lambda r: [write(r, win5, (r / win5).read_text(encoding="utf-8")
+                    .replace("当下状态：茉莉长势好。", "茉莉开了。") + "\n"
+                    + sec("补记", "当下状态：茉莉开了三朵。"))]),
+                "中间块改／删＋删文件": (1, lambda r: [
+                    write(r, vps1, (r / vps1).read_text(encoding="utf-8")
+                          .replace("单车的链条掉了，自己装回去。", "单车链条掉了，送去车行。")
+                          .replace("## 晚上\n当下状态：天文镜能用。\n", "")),
+                    drop_diary(r)]),
+            }
+            for n, (name, (new_blocks, change)) in enumerate(cases.items()):
+                root = Path(td) / f"case{n}"
+                shutil.copytree(seed, root)
+                srv = mk(root)
+                before = srv.index.pending_new
+                paths = change(root / "timeline")
+                counts.update(sync=0, reload=0)
+                srv._sync_external({str(p) for p in paths})
+                assert counts == {"sync": 1, "reload": 0}, f"{name}：要走增量、不整库重读：{counts}"
+                assert srv.index.pending_new - before == new_blocks, \
+                    f"{name}：校准计数只加新块 {new_blocks}，实际 {srv.index.pending_new - before}"
+                live, fresh = exact(srv), exact(mk(root))
+                for key in fresh:
+                    assert live[key] == fresh[key], f"{name}：{key} 与重启不一致"
+                assert live["retracted"] and live["superseded"], f"{name}：不是两份空集合在比"
+                if srv.index.embed:
+                    # 新块的向量就是缓存里存的那份（舍到 6 位的 float32），重启读回的也是它
+                    from embedding_provider import VectorCache
+                    cache = VectorCache(srv.index.cache_path, srv.index.provider.id)
+                    fresh_keys = set(seed_keys)
+                    new_vecs = [(c, v) for c, v in zip(srv.index.chunks, srv.index._cvecs)
+                                if _chunk_key(c) not in fresh_keys]
+                    assert len(new_vecs) >= new_blocks and all(
+                        v.tobytes() == cache.get(c).tobytes() for c, v in new_vecs), \
+                        f"{name}：新块向量不是缓存里那份"
+                # 装了时间锁插件时，那封信在被退场挪动下标的块之后，锁要跟着挪
+                assert live["hidden"] or not _memory_retrieval_hidden_hooks(), f"{name}：隐藏集合是空的"
+                print(f"  外部变化「{name}」：与重启逐位一致，图谱邻居表不同 {graph_drift(srv, mk(root))} 块")
+
+            # 判据 2：大文件中间改一块，400 块搬家只计 1；再加一个文件到阈值，恰好一次整库重读
+            root = Path(td) / "calibrate"
+            shutil.copytree(seed, root)
+            srv = mk(root)
+            big = root / "timeline" / "timeline/window_01_2026-06-01.md"
+            big.write_text(big.read_text(encoding="utf-8").replace("今天读了窗户", "今天读了窗户上的字"),
+                           encoding="utf-8")
+            counts.update(sync=0, reload=0)
+            srv._sync_external({str(big)})
+            assert counts["reload"] == 0 and srv.index.pending_new == 1, \
+                f"搬家的块不计数：{counts}，pending_new={srv.index.pending_new}"
+            assert not srv.index.needs_calibration()
+            extra = write(root / "timeline", "cloud/timeline/window_08_2026-10-04.md", "\n".join(
+                sec(f"2026-10-04 清单{n}", f"第{n}件：{objs[n]}要{verbs[n]}一下。") for n in range(12)))
+            counts.update(sync=0, reload=0)
+            srv._sync_external({str(extra)})
+            assert counts == {"sync": 1, "reload": 1} and srv.index.pending_new == 0, \
+                f"到阈值恰好一次整库重读、计数清零：{counts}"
+            snap_queries = ("天文镜", "茉莉", "单车", "清单", "今天洗了窗户")
+            def snapshot(server):
+                row = lambda r: (_chunk_key(r["text"]), repr(r.get("score")),
+                                 repr(r.get("relevance")), repr(r.get("weight")))
+                return {"candidates": [[row(r) for r in server.index.retrieve_candidates(
+                            q, topN=8, with_relevance=True)] for q in snap_queries],
+                        "recall": [row(r) for r in server.index.recall_recent(topN=20, now=at)],
+                        "session_start": call(server, "latent_session_start", {}, at),
+                        "search": [call(server, "latent_search", {"query": q, "topN": 8}, at)
+                                   for q in snap_queries]}
+            # 重启那份先建好再比：主动检索会加权并落盘，后建就接到了这边刚加的权重
+            restarted = mk(root)
+            live, fresh = snapshot(srv), snapshot(restarted)
+            for key in live:
+                assert live[key] == fresh[key], f"校准后 {key} 与重启不一致"
+
+            # 判据 4（前半）：增量途中出错，退回整库重读，结果与重启一致
+            real_replace = MemoryIndex.replace_chunks
+            def broken_replace(self, retire, items):
+                raise RuntimeError("模拟增量换块中途出错")
+            path = write(root / "timeline", "diary/2026-10-05.md", sec("2026-10-05", "风筝挂在树上了。"))
+            MemoryIndex.replace_chunks = broken_replace
+            counts.update(sync=0, reload=0)
+            try:
+                srv._sync_external({str(path)})
+            finally:
+                MemoryIndex.replace_chunks = real_replace
+            assert counts == {"sync": 1, "reload": 1}, f"增量出错要退回整库重读：{counts}"
+            live, fresh = exact(srv), exact(mk(root))
+            for key in fresh:
+                assert live[key] == fresh[key], f"退回整库重读后 {key} 与重启不一致"
+
+            # 判据 3：防抖。真端口、假钟：60 秒内三次外部变化合成一次处理
+            root = Path(td) / "debounce"
+            shutil.copytree(seed, root)
+            srv = mk(root)
+            clock = [0.0]
+            httpd = make_http_server(srv, host="127.0.0.1", port=0, clock=lambda: clock[0])
+            threading.Thread(target=httpd.serve_forever, daemon=True).start()
+            url = f"http://127.0.0.1:{httpd.server_address[1]}/mcp"
+            def post(name, args, t):
+                clock[0] = t
+                body = json.dumps({"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                                   "params": {"name": name, "arguments": args}},
+                                  ensure_ascii=False).encode("utf-8")
+                rq = urllib.request.Request(url, data=body, headers={
+                    "Content-Type": "application/json", "Accept": "application/json"})
+                try:
+                    with urllib.request.urlopen(rq, timeout=30) as r:
+                        return r.status, json.loads(r.read().decode("utf-8"))
+                except urllib.error.HTTPError as e:
+                    return e.code, None
+            def found(word, t):
+                code, resp = post("latent_search", {"query": word, "topN": 5}, t)
+                assert code == 200, code
+                return word in resp["result"]["content"][0]["text"]
+            try:
+                assert not found("风筝线", 0)
+                tl = root / "timeline"
+                counts.update(sync=0, reload=0)
+                write(tl, "diary/2026-10-06.md", sec("2026-10-06", "买了新的风筝线。"))
+                assert not found("风筝线", 1), "窗口里照常用当前索引回答，不处理"
+                write(tl, "diary/2026-10-07.md", sec("2026-10-07", "竹蜻蜓飞上了屋顶。"))
+                assert not found("竹蜻蜓", 21)
+                write(tl, "diary/2026-10-08.md", sec("2026-10-08", "纸飞机落进了邻居院子。"))
+                assert not found("纸飞机", 50) and counts == {"sync": 0, "reload": 0}, counts
+                # latent 自己的写入不受防抖影响：写后立即可查
+                code, resp = post("latent_append", {"text": "防抖窗口里写的：茶壶盖子磕了个口。",
+                                                    "current_state": "虚构验证数据"}, 55)
+                assert code == 200 and resp["result"]["isError"] is False, resp
+                assert found("茶壶盖子", 56) and counts == {"sync": 0, "reload": 0}, counts
+                assert not found("纸飞机", 109), "最后一次外部变化 50 秒时才被发现，安静不到 60 秒"
+                assert found("纸飞机", 110) and counts == {"sync": 1, "reload": 0}, \
+                    f"安静满 60 秒后的请求恰好处理一次：{counts}"
+                assert found("风筝线", 111) and found("竹蜻蜓", 112) and counts["sync"] == 1, counts
+                # 一直有变化：从第一次发现起满 180 秒照样处理
+                for n, t in enumerate((200, 250, 300, 350)):
+                    write(tl, f"diary/2026-10-1{n}.md", sec(f"2026-10-1{n}", f"连续提交第{n}次：{objs[n]}。"))
+                    assert not found(f"连续提交第{n}次", t)
+                assert counts["sync"] == 1, counts
+                assert not found("连续提交第3次", 379) and found("连续提交第3次", 380), \
+                    "从第一次发现（200 秒）满 180 秒要处理"
+                assert counts["sync"] == 2, counts
+                # 判据 4（后半）：整库重读也失败 → 503、索引置空；下一个请求不防抖、立刻重建
+                real_loader = srv.loader
+                def broken_loader():
+                    raise OSError("模拟盘读失败")
+                srv.loader = broken_loader
+                MemoryIndex.replace_chunks = broken_replace
+                try:
+                    write(tl, "diary/2026-10-20.md", sec("2026-10-20", "晾衣架被风吹歪了。"))
+                    assert not found("晾衣架", 400)
+                    code, _ = post("latent_search", {"query": "晾衣架"}, 461)
+                    assert code == 503 and srv.index is None, f"重读失败要回 503、索引置空：{code}"
+                finally:
+                    MemoryIndex.replace_chunks = real_replace
+                    srv.loader = real_loader
+                assert found("晾衣架", 461.5), "索引是空的不防抖，下一个请求立刻从盘上重建"
+            finally:
+                httpd.shutdown()
+    finally:
+        MemoryServer._sync_external, MemoryServer._reload_from_disk = real_sync, real_reload
+    print("selftest 外部同步增量：通过（五类外部变化与重启逐位一致、漂移只在图谱；搬家不计数、到阈值恰好"
+          "重读一次；60 秒防抖合并三次变化、180 秒封顶、自己写入不受影响；出错退回重读，重读失败 503 后立刻重建）")
+
+
 def _selftest():
     _selftest_search_visible_body()
     _selftest_structured_text_every_tool()
     _selftest_retract_index_followers()
     _selftest_status_ops_no_rebuild()
     _selftest_incremental_writes()
+    _selftest_external_changes()
     now = 1_800_000_000.0
     srv = _build_server(now)
 
@@ -6033,6 +6538,29 @@ def _selftest():
             _snapshot(independent_index) == before_independent, \
             "真 CLI doctor 必须同时只读主语料与独立索引目录"
 
+        #    --json：同一份体检给程序读（UI 状态页）——状态、四个大数、结论与人读报告同源；
+        #    语料旁的事实库也要数进来，meta 不算，而且同样只读
+        facts_dir = _P(td) / "事实库" / "增量"
+        facts_dir.mkdir(parents=True)
+        (facts_dir / "2026-06-17.jsonl").write_text(
+            '{"fact": "咖啡机的保险丝熔断了。", "tag": "life"}\n'
+            '{"fact": "保险丝换好了。", "tag": "life"}\n'
+            '{"fact": "这一条是 meta，不浮也不算。", "tag": "meta"}\n', encoding="utf-8")
+        before_facts = _snapshot(facts_dir.parent)
+        env_json = {k: v for k, v in os.environ.items() if k != "LATENT_PASSIVE_FACTS"}
+        pj = subprocess.run([sys.executable, str(here / "mcp_server.py"), "--doctor", "--json",
+                             "--corpus", "corpus"], cwd=td, capture_output=True, text=True,
+                            encoding="utf-8", env=env_json)
+        rep_json = json.loads(pj.stdout)
+        assert pj.returncode == 0 and rep_json["status"] in (OK, WARN) and rep_json["readOnly"], pj.stdout
+        assert set(rep_json["stats"]) == {"files", "chunks", "facts", "unresolved"}, rep_json["stats"]
+        assert rep_json["stats"]["files"] == 2 and rep_json["stats"]["facts"] == 2 \
+            and rep_json["stats"]["unresolved"] == 0 and rep_json["stats"]["chunks"] >= 2, rep_json["stats"]
+        assert sum(rep_json["counts"].values()) == len(rep_json["checks"])
+        assert "结论：" + rep_json["conclusion"] in format_doctor_report(rep_json["checks"])
+        assert _snapshot(corpus) == before_main and _snapshot(facts_dir.parent) == before_facts, \
+            "--json 体检同样只读，事实库也不许被动"
+
         #    空目录：显著提示 + 退出码非零（自动化靠它，人靠那句话）
         empty = _P(td) / "空目录"
         empty.mkdir()
@@ -6133,7 +6661,9 @@ def _selftest():
                              retractions_path=_P(td) / ".retractions.json",
                              loader=loader18, index_dir=index18,
                              source_dirs=(td, index18))
-        httpd = make_http_server(srv18, host="127.0.0.1", port=0, token="s3cret")
+        # 防抖设 0：18 系列测的是“发现外部变化”，防抖另见 _selftest_external_changes
+        httpd = make_http_server(srv18, host="127.0.0.1", port=0, token="s3cret",
+                                external_debounce=0)
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
         base18 = f"http://127.0.0.1:{httpd.server_address[1]}/mcp"
 
@@ -6386,7 +6916,8 @@ def _selftest():
         srv18i = MemoryServer(index=loader18i(), thread_store=ThreadStore(),
                               corpus_dir=corpus18i, source_dirs=source18i,
                               loader=loader18i)
-        httpd18i = make_http_server(srv18i, host="127.0.0.1", port=0)
+        httpd18i = make_http_server(srv18i, host="127.0.0.1", port=0,
+                                external_debounce=0)
         threading.Thread(target=httpd18i.serve_forever, daemon=True).start()
 
         def call18i(query):
@@ -6424,7 +6955,8 @@ def _selftest():
         loader18e = lambda: load_corpus(td)
         srv18e = MemoryServer(index=loader18e(), thread_store=ThreadStore(),
                               corpus_dir=td, loader=loader18e)
-        httpd18e = make_http_server(srv18e, host="127.0.0.1", port=0, token="s3cret")
+        httpd18e = make_http_server(srv18e, host="127.0.0.1", port=0, token="s3cret",
+                                external_debounce=0)
         threading.Thread(target=httpd18e.serve_forever, daemon=True).start()
         b18e = f"http://127.0.0.1:{httpd18e.server_address[1]}/mcp"
 
@@ -6487,7 +7019,8 @@ def _selftest():
                               corpus_dir=td,
                               retractions_path=_P(td) / ".retractions.json",
                               loader=loader18g)
-        httpd18g = make_http_server(srv18g, host="127.0.0.1", port=0, token="s3cret")
+        httpd18g = make_http_server(srv18g, host="127.0.0.1", port=0, token="s3cret",
+                                external_debounce=0)
         threading.Thread(target=httpd18g.serve_forever, daemon=True).start()
         port18g = httpd18g.server_address[1]
         b18g = f"http://127.0.0.1:{port18g}"
@@ -7294,7 +7827,93 @@ def _selftest():
             f"fail-closed：没配 --hook-token 时盲调也要当未知工具挡掉：{blind25b}"
         httpd25b.shutdown()
 
-    print("selftest ok（26项断言：握手 / 工具表 / 调用往返 / 薄适配层 / 错误分层（含 "
+    # 27.【页面读数据的口子·真端口】默认关；三把钥匙互不通用；只收 GET；外来 Origin 403；
+    #     no-store；参数超限 400；静态页不用钥匙、也不许 ../ 走出目录
+    from admin_api import AdminAPI
+    from pathlib import Path as _P27
+    with tempfile.TemporaryDirectory() as td27:
+        ui27 = _P27(td27) / "ui"
+        ui27.mkdir()
+        (ui27 / "prototype.html").write_text("<p>hut</p>", encoding="utf-8")
+        (_P27(td27) / "secret.txt").write_text("不许读到", encoding="utf-8")
+        idx27 = MemoryIndex()
+        idx27.add("## 修咖啡机\n保险丝熔断。", {"heading": "修咖啡机", "local_date": "2026-08-29"})
+        srv27 = MemoryServer(index=idx27, thread_store=ThreadStore(), corpus_dir=td27)
+
+        def serve27(**kw):
+            h = make_http_server(srv27, host="127.0.0.1", port=0, token="mcp-27", **kw)
+            threading.Thread(target=h.serve_forever, daemon=True).start()
+            return h, f"http://127.0.0.1:{h.server_address[1]}"
+
+        def get27(url, tok=None, origin=None, method="GET"):
+            rq = urllib.request.Request(url, method=method,
+                                        data=b"{}" if method == "POST" else None)
+            if tok:
+                rq.add_header("Authorization", f"Bearer {tok}")
+            if origin:
+                rq.add_header("Origin", origin)
+            try:
+                with urllib.request.urlopen(rq, timeout=10) as r:
+                    return r.status, r.headers, r.read().decode("utf-8")
+            except urllib.error.HTTPError as e:
+                return e.code, e.headers, e.read().decode("utf-8")
+
+        h27, b27 = serve27()
+        assert get27(b27 + "/admin/api/top", tok="mcp-27")[0] == 404, "没配 --admin-token，口子就不存在"
+        h27.shutdown()
+        def names27():
+            return {t["name"] for t in srv27.handle(
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})["result"]["tools"]}
+        assert NOTE_REPLY_TOOL not in names27(), "没开页面口子就没有回便条的工具"
+        srv27.enable_notes()
+        assert NOTE_REPLY_TOOL in names27()
+        h27, b27 = serve27(admin=AdminAPI(srv27), admin_token="admin-27", ui_dir=str(ui27))
+        assert get27(b27 + "/admin/api/top")[0] == 401
+        assert get27(b27 + "/admin/api/top", tok="mcp-27")[0] == 401, "模型那把钥匙进不了页面口子"
+        c27, hd27, body27 = get27(b27 + "/admin/api/top", tok="admin-27")
+        assert c27 == 200 and "修咖啡机" in body27 and hd27["Cache-Control"] == "no-store"
+        assert get27(b27 + "/mcp", tok="admin-27", method="POST")[0] == 401, "页面那把钥匙调不动 /mcp"
+        assert get27(b27 + "/admin/api/top", tok="admin-27", method="POST")[0] == 404, "只收 GET"
+        assert get27(b27 + "/admin/api/top", tok="admin-27", origin="https://evil.example")[0] == 403
+        assert get27(b27 + "/admin/api/top?n=99", tok="admin-27")[0] == 400, "参数超限 400"
+        assert get27(b27 + "/hut/prototype.html")[2] == "<p>hut</p>", "静态页不用钥匙"
+        assert get27(b27 + "/hut/%2e%2e/secret.txt")[0] == 404, "不许走出 --ui 目录"
+
+        # 便条：页面贴一张 → 开场最先给 → TA 回 → 页面看得到；模型那把钥匙贴不进
+        def post27(url, tok, obj):
+            rq = urllib.request.Request(url, method="POST", data=json.dumps(obj).encode("utf-8"),
+                                        headers={"Content-Type": "application/json"})
+            if tok:
+                rq.add_header("Authorization", f"Bearer {tok}")
+            try:
+                with urllib.request.urlopen(rq, timeout=10) as r:
+                    return r.status, json.loads(r.read().decode("utf-8"))
+            except urllib.error.HTTPError as e:
+                return e.code, e.read().decode("utf-8")
+        note = {"text": "保险丝不是熔断，是跳闸。", "recordId": "0123456789abcdef", "kind": "wrong"}
+        assert post27(b27 + "/admin/api/notes", "mcp-27", note)[0] == 401, "模型那把钥匙贴不进便条"
+        assert post27(b27 + "/admin/api/notes", "admin-27", {"text": "  "})[0] == 400, "空便条 400"
+        assert post27(b27 + "/admin/api/top", "admin-27", note)[0] == 404, "POST 只有贴便条一条路"
+        c27n, n27 = post27(b27 + "/admin/api/notes", "admin-27", note)
+        assert c27n == 200 and n27["state"] == "wait" and n27["id"].startswith("N-"), n27
+        def call27(name, args):
+            return srv27.handle({"jsonrpc": "2.0", "id": 5, "method": "tools/call",
+                                 "params": {"name": name, "arguments": args}})["result"]
+        opening27 = call27("latent_session_start", {})["content"][0]["text"]
+        assert opening27.startswith("【对方写给你的便条】") and n27["id"] in opening27 \
+            and "record=0123456789abcdef" in opening27, opening27[:200]
+        assert call27(NOTE_REPLY_TOOL, {"id": n27["id"], "decision": "declined"}).get("isError"), \
+            "不改却不说为什么，要拒"
+        r27 = call27(NOTE_REPLY_TOOL, {"id": n27["id"], "decision": "declined", "reply": "原文写的就是跳闸。"})
+        assert not r27.get("isError"), r27
+        c27g, _, body27g = get27(b27 + "/admin/api/notes", tok="admin-27")
+        got27 = json.loads(body27g)["notes"][0]
+        assert c27g == 200 and got27["state"] == "said" and got27["reply"] == "原文写的就是跳闸。", got27
+        assert "【对方写给你的便条】" not in call27("latent_session_start", {})["content"][0]["text"], \
+            "回过的便条不再进开场"
+        h27.shutdown()
+
+    print("selftest ok（27项断言：握手 / 工具表 / 调用往返 / 薄适配层 / 错误分层（含 "
           "session_start 读取异常只重试一次、未预料异常不空断、写工具不重放）/ "
           "完整链路 / stdio / UTF-8 / 写回当场可查 / 写回预检（零写入、补索引预检、"
           "参数错误写错／写对对照）/ 事实变迁链（A→B→C 双向链接、默认只返回 current、"
@@ -7336,7 +7955,7 @@ def _selftest():
           "长流被关掉＝指出口、开满＝说开满），且三句都不许糊到别的被拒行上）/ "
           "--log-file 让 stderr 留得下痕·真进程（诊断人话落盘、父目录自建、"
           "每次启动一条带 pid 的横幅，同一文件跑两次＝两条横幅且追加不截断——"
-          "「子进程重启过」由此可直接读出，不必再靠 token 账单倒推） / 隐藏入口按凭证隔离·真 HTTP（开自动浮现时宿主凭证 10 项、普通凭证恰 9 项且其余九项逐字不变；普通凭证盲调隐藏入口回「未知工具」而非参数校验错——凭证判断早于校验，错误文案不泄漏入口的存在与形状；宿主那条路的返回结构与三个 version 字段照旧；没配 --hook-token 时 fail-closed：所有凭证都看不见、盲调也是未知工具，宿主 hook 自己也用不了，漏配当场坏而不是静默全开）")
+          "「子进程重启过」由此可直接读出，不必再靠 token 账单倒推） / 隐藏入口按凭证隔离·真 HTTP（开自动浮现时宿主凭证 10 项、普通凭证恰 9 项且其余九项逐字不变；普通凭证盲调隐藏入口回「未知工具」而非参数校验错——凭证判断早于校验，错误文案不泄漏入口的存在与形状；宿主那条路的返回结构与三个 version 字段照旧；没配 --hook-token 时 fail-closed：所有凭证都看不见、盲调也是未知工具，宿主 hook 自己也用不了，漏配当场坏而不是静默全开） / 页面读数据的口子·真端口（默认关、三把钥匙互不通用、只收 GET、外来 Origin 403、no-store、参数超限 400、静态页不出目录；便条：不开口子没有回便条的工具、模型那把钥匙贴不进、空的 400、POST 只有便条一条路、开场最先列、不改必须说为什么、回了页面看得到、回过不再进开场）")
 
 
 if __name__ == "__main__":
@@ -7353,6 +7972,8 @@ if __name__ == "__main__":
     ap.add_argument("--doctor", action="store_true",
                     help="部署体检：查语料目录、时间戳成色、sidecar、写回落点与 MCP 接线，"
                          "只读不写盘。有一项过不去时退出码为 1")
+    ap.add_argument("--json", action="store_true",
+                    help="配 --doctor：体检结果按 JSON 打到 stdout（给 UI／脚本读），退出码不变")
     ap.add_argument("--corpus", help="md 语料目录")
     ap.add_argument("--index-dir",
                     help="独立索引摘要目录（推荐；未配时 latent_append 兼容写入 <corpus>/index）")
@@ -7402,6 +8023,14 @@ if __name__ == "__main__":
                          "--token 那条与其它任何调用方拿到的工具表少这一项，盲调也只"
                          "得到「未知工具」。⚠ fail-closed：不配＝对所有凭证关闭，宿主 hook 自己"
                          "也用不了——它跟「部署必须配 token」是一套。")
+    ap.add_argument("--admin-token", dest="admin_token",
+                    help="给人看的只读口子（/admin/api，记忆可视化用）的钥匙，也认环境变量 "
+                         "MEMORY_HTTP_ADMIN_TOKEN。不配＝这个口子不存在。不能跟 --token、"
+                         "--hook-token 相同；模型看不见它，它也调不动 /mcp")
+    ap.add_argument("--ui", metavar="目录",
+                    help="配 --http：把这个目录挂在 /hut/（记忆可视化的静态页；页面里没有记忆）")
+    ap.add_argument("--persona", metavar="人格文件",
+                    help="配 --admin-token：/admin/api/milestones 只读其中的里程碑那一节")
     ap.add_argument("--log-file", dest="log_file", metavar="路径",
                     help="把本该只走 stderr 的诊断输出（启动横幅、拒绝记录、异常堆栈）"
                          "同时追加落盘一份。stdio 形态下 stderr 由客户端接管、经常被直接"
@@ -7471,7 +8100,8 @@ if __name__ == "__main__":
                           time_context=time_ctx, index_dir=args.index_dir,
                           require_unresolved_review=args.require_unresolved_review,
                           write_dir=args.write_dir)
-        print(format_doctor_report(checks))
+        print(json.dumps(doctor_json(checks), ensure_ascii=False, indent=2) if args.json
+              else format_doctor_report(checks))
         # 退出码给自动化用：有 ✗ 就非零，⚠ 不算失败（那些是"能用但会悄悄变差"）
         sys.exit(1 if any(c["level"] == FAIL for c in checks) else 0)
     elif args.corpus:
@@ -7509,10 +8139,28 @@ if __name__ == "__main__":
             if hook_token and hook_token == token:
                 ap.error("--hook-token 跟 --token 一样等于没分开：两条凭证相同时"
                          "服务端照样分不出宿主 hook 与模型，隐藏入口仍然全开。")
+            admin_token = (args.admin_token
+                           or os.environ.get("MEMORY_HTTP_ADMIN_TOKEN") or None)
+            if admin_token and admin_token in (token, hook_token):
+                ap.error("--admin-token 不能跟 --token／--hook-token 相同：三把钥匙要分开，"
+                         "不然模型拿着自己那把就能读页面口子")
+            admin = None
+            if admin_token:
+                from admin_api import AdminAPI
+                srv.enable_notes()
+                admin = AdminAPI(
+                    srv, persona_path=args.persona,
+                    fact_path=(os.environ.get("LATENT_PASSIVE_FACTS")
+                               or Path(args.corpus).resolve().parent / "事实库"),
+                    diagnose=lambda: doctor_json(diagnose(
+                        args.corpus, threads_path=args.threads, time_context=time_ctx,
+                        index_dir=args.index_dir, write_dir=args.write_dir,
+                        require_unresolved_review=args.require_unresolved_review)))
             try:
                 httpd = make_http_server(srv, host=host, port=int(port), token=token,
                                          sse_stream=args.sse_stream,
-                                         hook_token=hook_token)
+                                         hook_token=hook_token, admin=admin,
+                                         admin_token=admin_token, ui_dir=args.ui)
             except ValueError as e:
                 ap.error(str(e))
             except OSError as e:                     # 端口被占等绑定失败（第 3 条）
@@ -7523,6 +8171,8 @@ if __name__ == "__main__":
             print(f"Streamable HTTP 服务在 http://{host}:{httpd.server_address[1]} "
                   f"（鉴权：{'Bearer token' if token else '无——仅限回环+外层反代'}；"
                   f"隐藏入口：{hidden_note}；"
+                  f"{'页面口子：开（/admin/api）；' if admin else ''}"
+                  f"{'静态页：/hut/；' if args.ui else ''}"
                   f"语料变化自动重读）", file=sys.stderr)
             # 非回环绑定多打一行 TLS 提醒：只提示、不拒绝起动，也不看有没有配 token
             notice = http_tls_notice(host)

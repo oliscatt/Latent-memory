@@ -192,6 +192,28 @@ class FactModeTests(unittest.TestCase):
         result = _ask(self.service(), "备份脚本每半小时拉一次", 1)
         self.assertIn("当时的状态", result.get("content", ""), result)
 
+    def test_topic_field_not_read(self):
+        """#45 第 3 步 P4：同一份事实库每行加上 topic 和不加，逐句问两遍（第二遍看冷却），candidate() 逐位一致。"""
+        asks = ["九月想喝酒", "备份脚本每半小时拉一次", "海边小镇的汤饭", "给猫买的发光球", "楼下那家面", "qqqq zzzz xxxx"]
+
+        def run(root, facts):
+            root.mkdir()
+            path = root / "facts.jsonl"
+            path.write_text("".join(json.dumps(f, ensure_ascii=False) + "\n" for f in facts), encoding="utf-8")
+            index = FactIndex(path, provider=FakeProvider())
+            self.assertFalse(any("topic" in row["meta"] for row in index.rows), "topic 不进 meta")
+            service = pr.PassiveRecallService(StubIndex(TODAY), assemble_candidates=True, fact_index=index,
+                                              fact_cooldown=FactCooldown(root / "cool.json"))
+            return [json.dumps(_ask(service, q, n, session=f"s{r}"), ensure_ascii=False, sort_keys=True)
+                    for r in range(2) for n, q in enumerate(asks)]
+
+        base = Path(self.tmp.name)
+        tagged = [dict(f, topic="备份" if f["kind"] == "state" else f"话题{f['id']}") for f in FACTS]
+        plain = run(base / "plain", FACTS)
+        self.assertEqual(plain, run(base / "topic", tagged))
+        self.assertTrue(any('"status": "ready"' in r for r in plain) and any("fact_cooled" in r for r in plain),
+                        "比的里面要有递出的轮次和冷却的轮次")
+
     def test_background_build_warms_then_serves(self):
         import threading
         gate = threading.Event()
@@ -857,6 +879,36 @@ class SupersedeHintTests(unittest.TestCase):
                                       now=_epoch((2026, 6, 2)))
         self.assertIn(f"recordId={ids['R4']}（", out)
         self.assertNotIn(ids["R1"], out)
+
+    def test_h7_same_day_records_are_not_candidates(self):
+        """与新记录同一天（记录自己的日期，东八区自然日）的记录不进候选。实测标定按 5% 选出的线
+        只提示 3 条，第一名都和新记录同一天，多半是同一件事接着写，不是旧状态被取代。"""
+        srv, ids, _ = self.build()
+
+        def pool(rid):
+            idx = next(i for i, m in enumerate(srv.index.meta)
+                       if m.get("layer", "timeline") == "timeline" and m.get("record_id") == rid)
+            return {srv.index.meta[i].get("record_id") for i in srv.index.supersede_pool(idx)}
+
+        def write(text, when):
+            out = srv._tool_memory_append({"text": text, "current_state": "接着说"}, now=when)
+            return re.search(r"recordId=([0-9a-f]{16})", out).group(1), out
+
+        # 同一天：R4（6 月 1 日 10 点）当晚又写一条几乎一样的（余弦 1.0），R4 不进候选；更早的 R1 照常进、照常提示
+        r5, out = write("阿离改主意了，晚上又说了一遍只报 E 校。", _epoch((2026, 6, 1), 22))
+        self.assertNotIn(ids["R4"], pool(r5))
+        self.assertIn(ids["R1"], pool(r5))
+        self.assertIn(f"recordId={ids['R1']}（", out)
+        self.assertNotIn(ids["R4"], out)
+        # 前一天的照常进
+        r6, _ = write("阿离改主意了，第二天又确认只报 E 校。", _epoch((2026, 6, 2), 10))
+        self.assertLessEqual({ids["R4"], r5}, pool(r6))
+        # 跨午夜：两对都选在 UTC 日期与东八区日期不一致的时刻，按 UTC 算日期两条都会判反
+        late, _ = write("会发光的球滚到了沙发底下。", _epoch((2026, 6, 10), 23) + 50 * 60)
+        early, _ = write("会发光的球又被猫推出来了。", _epoch((2026, 6, 11), 0) + 10 * 60)
+        self.assertIn(late, pool(early), "前一天 23:50 的照常进（UTC 下两条同一天）")
+        night, _ = write("会发光的球被收进了柜子。", _epoch((2026, 6, 11), 23) + 50 * 60)
+        self.assertNotIn(early, pool(night), "同一天 00:10 的不进（UTC 下两条不同天）")
 
     def test_l3_bad_args_are_fixable_and_write_nothing(self):
         srv, ids, _ = self.build()

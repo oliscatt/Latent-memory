@@ -1,0 +1,686 @@
+<!doctype html>
+<html lang="zh">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>山屋</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,600;1,9..144,400;1,9..144,600&family=Noto+Serif+SC:wght@400;600&display=swap">
+<style>
+/* 山屋全景：窗外是巴塔哥尼亚，屋里是我们。
+   竖屏放不下整间屋，左右拖着看，默认停在中间。点接了数据的物件，镜头推过去，那一张近景叠上来；近景里点返回，镜头拉回来。
+   近景之间的按钮（回到那一天、这条记错了、去地图看）走 hut.js，由这一页切页、带上那天的日子或那句话。
+   点墙上的气象板不推近：石板摘下来斜放在桌上，拨天气窗外当场变（见 weather-mock）。猫、Clawd 玩偶、猫头鹰、灯只给反馈。 */
+:root{
+  --paper:#FBF8F2;
+  --ink:#3A2F28;
+  --ink-2:#76695F;
+  --brick:#A4493E;
+  --glacier:#5D84A2;
+  --gold:#8B6A31;
+  --gold-2:#B08A45;
+  /* 石板和粉笔：粉笔色是红、蓝、金三个 token 调淡 */
+  --slate:#34424A;
+  --slate-2:#2C3940;
+  --chalk:#F2EFE8;
+  --chalk-2:rgba(242,239,232,.66);
+  --chalk-3:rgba(242,239,232,.4);
+  --chalk-rule:rgba(242,239,232,.2);
+  --c-pink:#F0B4AA;
+  --c-blue:#AFCFE6;
+  --c-gold:#F0D9A0;
+  --oak:#CFAB7E;
+  --f-latin:"Fraunces","Georgia",serif;
+  --f-cn:"Noto Serif SC","Songti SC","STSong",serif;
+  --ease:cubic-bezier(.22,.61,.36,1);
+  color-scheme:light;
+}
+html,body{height:100%;margin:0}
+body{background:#3b2a1e;color:var(--ink);font-family:var(--f-cn);overflow:hidden;-webkit-font-smoothing:antialiased}
+button{-webkit-tap-highlight-color:transparent;font:inherit;color:inherit}
+
+/* ---------- 全景：窗外 → 天气 → 屋里 → 物件 → 光 ---------- */
+.view{position:fixed;inset:0;overflow:hidden}
+.room{position:absolute}
+.room > *{position:absolute;display:block;max-width:none;user-select:none;-webkit-user-drag:none;pointer-events:none}
+.room .outside{transition:filter 1.2s var(--ease)}
+#outsideB{transition:filter 1.2s var(--ease),opacity 1.1s var(--ease)}
+.room canvas{left:0;top:0;width:100%;height:100%}
+.cloud{left:0;top:0;width:100%;height:100%;background:linear-gradient(180deg,rgba(138,150,163,.85),rgba(170,178,188,.5) 60%,rgba(190,196,202,.35));opacity:0;transition:opacity 1.2s var(--ease)}
+.fog{left:0;top:0;width:100%;height:100%;background:linear-gradient(180deg,rgba(236,240,244,.9),rgba(224,230,236,.75));opacity:0;transition:opacity 1.2s var(--ease)}
+.sill-snow{left:0;top:0;width:100%;height:100%;background:linear-gradient(180deg,#fff,#eef3f7);opacity:0;transition:opacity 1.6s var(--ease)}
+.tint{left:0;top:0;width:100%;height:100%;mix-blend-mode:multiply;opacity:0;transition:opacity 1.2s var(--ease),background 1.2s}
+.glow{left:0;top:0;width:100%;height:100%;mix-blend-mode:screen;background:radial-gradient(circle at 93% 39%,rgba(255,196,120,.55),rgba(255,180,100,.18) 14%,rgba(255,170,90,0) 30%);opacity:0;transition:opacity .8s var(--ease)}
+.glow.on{opacity:1}
+/* 镜头：整间屋连同可点的地方一起推近、拉远 */
+.cam{position:absolute;inset:0;transform-origin:0 0;transition:transform .75s cubic-bezier(.45,.05,.2,1);will-change:transform}
+.hots{position:absolute}
+.hot{position:absolute;background:transparent;border:0;padding:0;cursor:pointer;border-radius:12px;-webkit-tap-highlight-color:transparent}
+.hot:focus-visible{outline:1.5px dashed rgba(255,250,240,.9);outline-offset:2px}
+.room #owl{transition:transform .45s cubic-bezier(.3,1.6,.5,1);transform-origin:50% 92%}
+/* 近景：叠在全景上面的那一页 */
+.page{position:fixed;inset:0;z-index:20;width:100%;height:100%;border:0;opacity:0;pointer-events:none;transition:opacity .35s var(--ease);background:transparent}
+.page.on{opacity:1;pointer-events:auto}
+/* 屋里的光也落在近景上：傍晚偏蓝、清晨偏粉 */
+.tint2{position:fixed;inset:0;z-index:21;pointer-events:none;mix-blend-mode:multiply;opacity:0;transition:opacity .4s}
+.tint2.show{opacity:var(--o,0)}
+.flash{position:fixed;inset:0;z-index:8;background:#fff;opacity:0;pointer-events:none}
+
+/* 顶上：示例切换、记号候选 */
+.bar{position:fixed;top:calc(env(safe-area-inset-top,0px) + 12px);z-index:9;display:flex;align-items:center;font:400 12px/1 var(--f-cn);color:rgba(255,250,240,.86);text-shadow:0 1px 4px rgba(0,0,0,.55)}
+.bar span{margin-right:4px}
+.bar button{border:0;background:transparent;padding:9px 5px;cursor:pointer;text-shadow:inherit}
+.bar button[aria-pressed=true]{color:#fff;text-decoration:underline 1.5px var(--gold-2);text-underline-offset:5px}
+.bar.l{left:10px}
+.bar.r{right:10px}
+.sample{position:fixed;right:16px;top:calc(env(safe-area-inset-top,0px) + 22px);z-index:9;font:italic 400 11px/1 var(--f-latin);letter-spacing:.1em;color:rgba(255,250,240,.9);text-shadow:0 1px 4px rgba(0,0,0,.45)}
+
+/* ---------- 石板 ---------- */
+.slate{position:fixed;z-index:6;left:50%;bottom:calc(16px + env(safe-area-inset-bottom,0px));width:min(420px,calc(100vw - 28px));transform-origin:50% 100%;transform:translateX(-50%) scale(var(--k,1)) rotate(-1deg);perspective:1600px;touch-action:none}
+.slate.shut{visibility:hidden}
+.flip{position:relative;transform-style:preserve-3d;transition:transform .75s cubic-bezier(.45,.05,.25,1)}
+.flip.over{transform:rotateY(180deg)}
+.face{position:absolute;inset:0;backface-visibility:hidden;-webkit-backface-visibility:hidden;border-radius:9px;padding:10px;
+  background:linear-gradient(135deg,#DDBF95,var(--oak) 38%,#D9B88C 55%,#BE9265);box-shadow:0 1px 0 rgba(255,240,215,.5) inset,0 -1px 0 rgba(90,55,25,.35) inset,0 22px 34px rgba(38,24,12,.38),0 4px 8px rgba(38,24,12,.25)}
+.face::before{content:"";position:absolute;inset:0;border-radius:inherit;pointer-events:none;opacity:.35;mix-blend-mode:multiply;
+  background:repeating-linear-gradient(92deg,rgba(120,80,40,0) 0 7px,rgba(120,80,40,.22) 7px 8px,rgba(120,80,40,0) 8px 15px,rgba(120,80,40,.12) 15px 16px)}
+.back{transform:rotateY(180deg)}
+.flip.over .front,.flip:not(.over) .back{pointer-events:none}
+.surf{position:relative;height:100%;box-sizing:border-box;border-radius:3px;overflow:hidden;color:var(--chalk);
+  background:radial-gradient(ellipse 40% 30% at 22% 30%,rgba(255,255,255,.05),rgba(255,255,255,0) 70%),radial-gradient(ellipse 45% 25% at 75% 72%,rgba(255,255,255,.045),rgba(255,255,255,0) 70%),linear-gradient(170deg,var(--slate),var(--slate-2));
+  box-shadow:0 2px 7px rgba(0,0,0,.5) inset,0 0 0 1px rgba(0,0,0,.25) inset}
+/* 粉笔颗粒：一层细小的暗点压在字上，字就有粉笔那种断续 */
+.surf::after{content:"";position:absolute;inset:0;pointer-events:none;mix-blend-mode:multiply;opacity:.55;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='180' height='180'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='1.1' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 .2 0 0 0 0 .25 0 0 0 0 .28 2.4 0 0 0 -1.15'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E")}
+/* 屋里的光也落在石板上：傍晚偏蓝、清晨偏粉，灯亮时右上角一点暖 */
+.surf .lit{position:absolute;inset:0;pointer-events:none;mix-blend-mode:soft-light;opacity:0;transition:opacity 1.2s,background 1.2s}
+.in{position:relative;z-index:1;box-sizing:border-box;min-height:100%;display:flex;flex-direction:column;padding:16px 18px 14px}
+
+/* 正面 */
+.eyes{display:flex;justify-content:space-between;align-items:baseline;font:600 9px/1 var(--f-latin);letter-spacing:.26em;color:var(--chalk-3)}
+.eyes i{font:italic 400 11.5px/1 var(--f-latin);letter-spacing:.02em;color:var(--chalk-2)}
+.now{display:flex;align-items:center;gap:14px;width:100%;margin:12px 0 4px;padding:0;border:0;background:transparent;text-align:left;cursor:pointer}
+.now:focus-visible{outline:1.5px dashed var(--chalk-3);outline-offset:4px}
+.wx{flex:none;width:50px;height:42px;overflow:visible}
+.wd b{display:block;font:600 22px/1.15 var(--f-cn);letter-spacing:.06em}
+.wd em{display:inline-flex;align-items:center;gap:4px;margin-top:4px;font:400 13.5px/1.3 var(--f-cn);font-style:normal;color:var(--c-gold)}
+.wd em svg{width:9px;height:9px}
+.rule{height:0;margin:12px 0;border-top:1px dashed var(--chalk-rule)}
+.rd{display:grid;grid-template-columns:repeat(4,1fr);gap:4px;text-align:center}
+.rd b{display:block;font:italic 400 22px/1.05 var(--f-latin);font-variant-numeric:lining-nums;letter-spacing:-.01em}
+.rd span{display:block;margin-top:5px;font:400 10.5px/1 var(--f-cn);color:var(--chalk-2);letter-spacing:.08em}
+.row{display:grid;grid-template-columns:38px 1fr;align-items:center;min-height:36px}
+.row .k{font:400 13px/1 var(--f-cn);color:var(--chalk-2);letter-spacing:.1em}
+.row.lvl{align-items:start}
+.row.lvl .k{padding-top:9px}
+.opts{display:flex;gap:6px}
+.opt{position:relative;border:0;background:transparent;padding:7px 9px;cursor:pointer;font:400 15px/1 var(--f-cn);color:var(--chalk-2);transition:color .3s}
+.opt[aria-pressed=true]{color:var(--chalk)}
+.opt:focus-visible{outline:1px dashed var(--chalk-3);outline-offset:1px}
+.opt svg{position:absolute;left:-6px;top:-5px;width:calc(100% + 12px);height:calc(100% + 10px);overflow:visible;pointer-events:none}
+.opt path{fill:none;stroke:var(--c-gold);stroke-width:1.5;stroke-linecap:round;stroke-dasharray:1;stroke-dashoffset:1;opacity:0;transition:opacity .2s}
+.opt[aria-pressed=true] path{stroke-dashoffset:0;opacity:.9;transition:stroke-dashoffset .5s var(--ease)}
+/* 风雨雪雷：一条粉笔刻度，四颗由小到大的粉笔点是无、小、中、大；上面吸一块搪瓷小磁铁，磁铁上画着这一样天气。拖它，或点刻度 */
+.rg{position:relative;height:46px;--p:0}
+.rg .ln{position:absolute;left:14px;right:14px;top:14px;height:2px;border-radius:1px;
+  background:linear-gradient(90deg,var(--chalk) 0 calc(var(--p)*100%),transparent calc(var(--p)*100%)),repeating-linear-gradient(90deg,var(--chalk-3) 0 5px,transparent 5px 9px);opacity:.8}
+.rg .tk{position:absolute;top:15px;width:var(--d);height:var(--d);margin:calc(var(--d)/-2) 0 0 calc(var(--d)/-2);border-radius:50%;background:var(--chalk-3);transition:background .3s}
+.rg .tk.lit{background:var(--chalk)}
+.rg .lb{position:absolute;top:34px;transform:translateX(-50%);font:400 10px/1 var(--f-cn);color:var(--chalk-2);opacity:0;transition:opacity .3s}
+.rg .lb.on{opacity:1}
+.rg input{position:absolute;left:0;top:0;width:100%;height:30px;margin:0;-webkit-appearance:none;appearance:none;background:transparent;cursor:pointer;touch-action:none}
+.rg input:focus-visible{outline:1px dashed var(--chalk-3);outline-offset:2px}
+.rg input::-webkit-slider-runnable-track{height:30px;background:transparent}
+.rg input::-moz-range-track{height:30px;background:transparent}
+.rg input::-webkit-slider-thumb{-webkit-appearance:none;box-sizing:border-box;width:28px;height:28px;margin-top:1px;border-radius:50%;border:1.5px solid rgba(255,255,255,.72);
+  background:var(--ico) center/15px 15px no-repeat,radial-gradient(circle at 32% 26%,rgba(255,255,255,.62),rgba(255,255,255,0) 46%),var(--mag);
+  box-shadow:0 3px 6px rgba(0,0,0,.42),0 1px 1px rgba(0,0,0,.3),inset 0 -2px 3px rgba(0,0,0,.13);transition:transform .2s var(--ease)}
+.rg input::-moz-range-thumb{box-sizing:border-box;width:28px;height:28px;border-radius:50%;border:1.5px solid rgba(255,255,255,.72);
+  background:var(--ico) center/15px 15px no-repeat,radial-gradient(circle at 32% 26%,rgba(255,255,255,.62),rgba(255,255,255,0) 46%),var(--mag);
+  box-shadow:0 3px 6px rgba(0,0,0,.42),0 1px 1px rgba(0,0,0,.3),inset 0 -2px 3px rgba(0,0,0,.13)}
+.rg input:active::-webkit-slider-thumb{transform:scale(1.12)}
+.ft{display:flex;justify-content:space-between;align-items:center;min-height:30px;margin-top:auto;padding-top:6px;font:400 12px/1 var(--f-cn);color:var(--chalk-2)}
+.ft .mode{display:inline-flex;align-items:center;gap:7px;letter-spacing:.06em}
+.ft .dot{width:6px;height:6px;border-radius:50%;background:var(--c-blue);box-shadow:0 0 6px rgba(175,207,230,.7)}
+.ft .go{border:0;background:transparent;padding:8px 0;cursor:pointer;font:400 12.5px/1 var(--f-cn);color:var(--c-gold)}
+
+/* 背面：体检 */
+.bh{display:flex;align-items:center;gap:8px}
+.bh .bk{display:inline-flex;align-items:center;gap:3px;height:36px;margin:-10px 0 -10px -8px;padding:0 10px 0 4px;border:0;background:transparent;cursor:pointer;font:400 13px/1 var(--f-cn);color:var(--c-gold)}
+.bh .bk svg{width:14px;height:14px}
+.bh .eb{margin-left:auto;font:600 9px/1 var(--f-latin);letter-spacing:.26em;color:var(--chalk-3)}
+.bh i{margin-left:8px;font:italic 400 11.5px/1 var(--f-latin);color:var(--chalk-2)}
+.verdict{margin:12px 0 0;font:600 17px/1.35 var(--f-cn);letter-spacing:.04em}
+.bad{list-style:none;margin:12px 0 0;padding:0}
+.bad li{display:grid;grid-template-columns:20px 1fr;gap:8px;padding:9px 0;border-top:1px dashed var(--chalk-rule)}
+.bad li svg{width:16px;height:16px;margin-top:2px}
+.bad b{display:block;font:600 14px/1.4 var(--f-cn)}
+.bad p{margin:3px 0 0;font:400 12.5px/1.62 var(--f-cn);color:var(--chalk-2)}
+.okh{margin:12px 0 8px;padding-top:12px;border-top:1px dashed var(--chalk-rule);font:400 12px/1 var(--f-cn);color:var(--chalk-2);letter-spacing:.06em}
+.okh b{font:italic 400 15px/1 var(--f-latin);color:var(--chalk);margin:0 2px}
+.chips{display:flex;flex-wrap:wrap;gap:2px 4px}
+.chip{display:inline-flex;align-items:center;gap:4px;border:0;background:transparent;padding:5px 5px;cursor:pointer;font:400 12.5px/1.2 var(--f-cn);color:var(--chalk-2);border-radius:3px}
+.chip svg{width:10px;height:10px}
+.chip[aria-pressed=true]{color:var(--chalk);background:rgba(242,239,232,.08)}
+.okd{min-height:20px;margin:8px 0 0;font:400 12.5px/1.6 var(--f-cn);color:var(--chalk-2)}
+
+/* ---------- 记号：气压表，钉在石板右上角 ---------- */
+.mk{position:absolute;inset:0;pointer-events:none;z-index:2;transition:opacity .25s}
+.slate.turning .mk{opacity:0}
+.baro{position:absolute;right:14px;top:-46px;width:66px;height:66px;filter:drop-shadow(0 3px 4px rgba(30,18,8,.35))}
+.baro .ndl{transform-origin:33px 33px;transition:transform 1.4s cubic-bezier(.25,1.45,.45,1)}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+
+<div class="view" id="view">
+ <div class="cam" id="cam">
+  <div class="room" id="room">
+    <img class="outside" id="outside" alt="" src="assets/图层/plate-outside-spring.webp">
+    <img class="outside" id="outsideB" alt="" src="assets/图层/plate-outside-spring.webp" style="opacity:0">
+    <div class="cloud" id="cloud"></div>
+    <canvas id="fx"></canvas>
+    <div class="fog" id="fog"></div>
+    <img id="plate" alt="" src="assets/图层/plate-room-web.webp">
+    <div class="sill-snow" id="sillSnow"></div>
+    <img id="cairn" alt="" src="assets/图层/cairn.webp">
+    <img id="flag1" alt="" src="assets/图层/flag-1.webp">
+    <img id="flag2" alt="" src="assets/图层/flag-2.webp">
+    <img id="flag3" alt="" src="assets/图层/flag-3.webp">
+    <img id="cat" alt="" src="assets/图层/cat-sleep.webp">
+    <img id="toy" alt="" src="assets/图层/clawd-idle.webp">
+    <img id="owl" alt="" src="assets/图层/owl.webp">
+    <img id="lamp" alt="" src="assets/图层/lamp-on.webp">
+    <div class="tint" id="tint"></div>
+    <div class="glow" id="glow"></div>
+  </div>
+  <div class="hots" id="hots"></div>
+ </div>
+</div>
+<div class="flash" id="flash"></div>
+<nav class="bar l" id="demo" aria-label="示例体检结果"><span>示例</span></nav>
+<span class="sample">sample data</span>
+
+<div class="slate" id="slate" role="dialog" aria-label="气象板">
+  <div class="flip" id="flip">
+    <section class="face front"><div class="surf"><i class="lit"></i><div class="in" id="front"></div></div></section>
+    <section class="face back"><div class="surf"><i class="lit"></i><div class="in" id="backIn"></div></div></section>
+  </div>
+  <div class="mk" id="mk"></div>
+</div>
+<iframe class="page" id="page" name="hut" title="近景" src="about:blank"></iframe>
+<div class="tint2" id="tint2"></div>
+
+<script src="hut.js"></script>
+<script>
+(() => {
+const IW = 1440, IH = 2560, $ = s => document.querySelector(s);
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const RM = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;'}[c]));
+const A = 'assets/图层/';
+
+/* ---------- 示例数据：--doctor 的体检项（level＋title＋detail），标题里 .weights.json 这类文件名换成人话。
+   体检时间是示意：现在 --doctor 只往终端打字，要改成定时跑、返回结构化结果（见《技术备忘》4）。 ---------- */
+const BASE = [
+  ['语料目录', 'ok', '436 个 md 文件'],
+  ['未解决复核策略', 'ok', '兼容模式'],
+  ['未解决清单', 'ok', '16 件，格式和 ID 都对'],
+  ['未解决来源', 'ok', '16 个 recordId 都能核对回正文'],
+  ['索引摘要', 'ok', '体检只读；latent_append 可以往里写'],
+  ['建库', 'ok', '30,412 块（索引层 2,960 / 叙事层 27,452），中位块长 118 字'],
+  ['时间范围', 'ok', '2026-06-15 ~ 2026-10-04，最后一天对得上最近一次聊天'],
+  ['时间戳来源', 'ok', '都取自正文里写的日期，没有退回文件修改时间'],
+  ['撤回账本', 'ok', '接上 12 块，没有孤儿条目'],
+  ['命中权重', 'ok', '接上 2,184 块，没有孤儿条目'],
+  ['实体标注', 'ok', '没有（正常：第一次用到时才生成）'],
+  ['变迁账本', 'ok', '9 个链节点双向一致，都能定位'],
+  ['写回落点', 'ok', '可写，latent_append 按窗口号和日期落盘'],
+  ['会话线索', 'ok', 'threads.jsonl：66 条'],
+  ['时区', 'ok', 'Asia/Shanghai，自然日按这个时区的零点到午夜算'],
+  ['MCP 接线', 'ok', '握手正常，工具 9 个'],
+  ['工具定义', 'ok', '全部工具的入参都是对象，没有 anyOf／oneOf'],
+  ['检索自查', 'ok', '拿语料自己的标题"山屋"查得到'],
+];
+const OVR = {
+  ok:{}, real:{},
+  warn:{'命中权重':['warn', '接上 2,184 块，但有 37 条孤儿条目：那几块正文改过，旧权重对不上号了。不报错，只是这些块被想起的次数悄悄归零。'],
+        '时区':['warn', '没配 --timezone，用的是默认东八区。人不在东八区的时候，跨午夜写下的记忆会归错日子。']},
+  fail:{'写回落点':['fail', '不可写：TA 会说"记下了"，但每一次写回都会失败。先修这一项再起服务。'],
+        '命中权重':['warn', '接上 2,184 块，但有 37 条孤儿条目：那几块正文改过，旧权重对不上号了。']},
+};
+const STATS = [['436', '篇正文'], ['30,412', '块'], ['10,593', '条事实'], ['16', '件未解决']];
+let CHECKED_AT = '10.05 · 04:12';
+let demo = 'warn';
+/* 示例开关：真实＝体检原样；全过＝每项都过（录屏要晴天用）；要注意／坏了＝在上面盖几项 */
+const checks = () => BASE.map(([t, l, d]) => demo === 'ok' ? [t, 'ok', d] : OVR[demo][t] ? [t, ...OVR[demo][t]] : [t, l, d]);
+function health(){
+  const c = checks(), nf = c.filter(x => x[1] === 'fail').length, nw = c.filter(x => x[1] === 'warn').length;
+  if (nf) return {lv:'fail', word:'暴风雪', say:`${nf} 项过不去` + (nw ? `、${nw} 项要注意` : ''), nf, nw, n:c.length};
+  if (nw) return {lv:'warn', word:'起风', say:`能用，${nw} 项要注意`, nf, nw, n:c.length};
+  return {lv:'ok', word:'晴', say:'体检全部通过', nf, nw, n:c.length};
+}
+
+/* ---------- 天气：默认跟着记忆库（全过晴，有要注意的起风转阴，有过不去的暴风雪）；
+   季节按用的人所在的北半球算（3–5 春、6–8 夏、9–11 秋、12–2 冬），天色按此刻的钟点 ---------- */
+const SEASONS = ['春', '夏', '秋', '冬'], SKIES = ['清晨', '白天', '傍晚'], LV = ['无', '小', '中', '大'];
+/* 磁铁：搪瓷底色＋这一样天气的小图（风、雨滴、雪花、闪电） */
+const LEVELS = [
+  ['wind', '风', '#EAD6A6', '#7A5E2A', '<path d="M2 6.2h8.2a2.1 2.1 0 1 0-2-2.6M2 9.8h10.4a2.1 2.1 0 1 1-2 2.6"/>'],
+  ['rain', '雨', '#B7D3E8', '#2F5B7E', '<path d="M8 2.2C6.3 4.7 4.4 7.2 4.4 9.7a3.6 3.6 0 0 0 7.2 0C11.6 7.2 9.7 4.7 8 2.2z" fill="#2F5B7E" stroke="none"/>'],
+  ['snow', '雪', '#F6F4EF', '#6A8399', '<path d="M8 2v12M2.8 5l10.4 6M13.2 5L2.8 11M6.4 2.9L8 4.3l1.6-1.4M6.4 13.1L8 11.7l1.6 1.4"/>'],
+  ['thunder', '雷', '#EDB8AE', '#8A3428', '<path d="M9.3 1.6L4.3 9h3.6l-1.1 5.4L12 7H8.3z" fill="#8A3428"/>'],
+];
+const ico = (c, body) => `url('data:image/svg+xml,${encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" stroke="${c}" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">${body}</svg>`)}')`;
+function auto(){
+  const now = new Date(), m = now.getMonth() + 1, h = now.getHours();
+  const season = m >= 3 && m <= 5 ? '春' : m <= 8 && m >= 6 ? '夏' : m >= 9 && m <= 11 ? '秋' : '冬';
+  /* 录屏可以把天色定住：?sky=白天（不然跟着钟点走，录到一半可能换天色） */
+  const pin = new URLSearchParams(location.search).get('sky');
+  const sky = SKIES.includes(pin) ? pin : h < 9 ? '清晨' : h < 17 ? '白天' : '傍晚';
+  const lv = health().lv;
+  return {season, sky, wind:lv === 'warn' ? 1 : lv === 'fail' ? 3 : 0, rain:0, snow:lv === 'fail' ? 3 : 0, thunder:0, gray:lv === 'warn' ? 1 : lv === 'fail' ? 2 : 0, manual:false};
+}
+let W = auto();
+/* 跟着记忆库时，季节和天色跟着时间走：每分钟对一次，过了 9 点、17 点就换 */
+setInterval(() => { if (W.manual) return; const n = auto(); if (n.sky !== W.sky || n.season !== W.season){ W = n; applyWeather(); } }, 60000);
+
+/* ---------- 全景 ---------- */
+const room = $('#room'), slate = $('#slate');
+const pct = (x, y, w, h) => `left:${x/IW*100}%;top:${y/IH*100}%;width:${w/IW*100}%;height:${h/IH*100}%`;
+const LAYERS = {outside:[-109, -97, 1308, 1164], outsideB:[-109, -97, 1308, 1164], plate:[0, 0, IW, IH], cairn:[24, 875, 134, 190], flag1:[153, 1255, 52, 76], flag2:[197, 1293, 52, 87], flag3:[287, 1321, 57, 89], cat:[115, 845, 497, 270], toy:[565, 900, 323, 215], owl:[866, 930, 108, 160], lamp:[1240, 907, 194, 469]};
+for (const [id, b] of Object.entries(LAYERS)) $('#' + id).style.cssText = pct(...b);
+const BOARD = [1290, 30, 140, 560], BOARD_SLATE = [1303, 358, 95, 205];
+let S = 1, OX = 0, OY = 0, panK = .5;
+function layout(){
+  const vw = innerWidth, vh = innerHeight;
+  /* 手机竖屏铺满（左右拖着看）；屏幕偏宽时按高度放下整间屋，两边留暗 */
+  S = vw/vh > .62 ? vh/IH : Math.max(vw/IW, vh/IH);
+  OY = 0; place(); sizeFx(); fitSlate();
+  if (cur) camTo(PAGES[cur].box, true);
+}
+function place(){
+  const vw = innerWidth, dw = IW*S, dh = IH*S;
+  OX = dw > vw ? (vw - dw)*panK : (vw - dw)/2;
+  for (const el of [room, $('#hots')]) Object.assign(el.style, {left:OX + 'px', top:OY + 'px', width:dw + 'px', height:dh + 'px'});
+}
+/* 石板按内容定高；太高就整体缩一点，顶边不越过屏幕 38%，窗户留着 */
+function fitSlate(){
+  const fr = $('#front'), bk = $('#backIn'), pad = 20;
+  $('#flip').style.height = '0px';
+  const h = Math.max(fr.scrollHeight, bk.scrollHeight) + pad;
+  $('#flip').style.height = h + 'px';
+  const room = innerHeight*.62 - 16;
+  slate.style.setProperty('--k', Math.min(1, room/h).toFixed(3));
+  drawRings();
+}
+
+/* 黑白遮罩转成透明遮罩：雨雪只落在窗玻璃上，积雪只积在窗台上 */
+function alphaMask(src, cb){
+  const im = new Image(); im.onload = () => {
+    const c = document.createElement('canvas'); c.width = im.width/4; c.height = im.height/4;
+    const x = c.getContext('2d'); x.drawImage(im, 0, 0, c.width, c.height);
+    const d = x.getImageData(0, 0, c.width, c.height);
+    for (let i = 0; i < d.data.length; i += 4){ d.data[i + 3] = d.data[i]; d.data[i] = d.data[i + 1] = d.data[i + 2] = 255; }
+    x.putImageData(d, 0, 0); cb(c.toDataURL());
+  }; im.src = src;
+}
+const maskOn = (el, url) => { el.style.webkitMaskImage = el.style.maskImage = `url(${url})`; el.style.webkitMaskSize = el.style.maskSize = '100% 100%'; };
+alphaMask(A + 'mask-window-web.png', u => ['#fx', '#fog', '#cloud'].forEach(s => maskOn($(s), u)));
+alphaMask(A + 'mask-sill.png', u => maskOn($('#sillSnow'), u));
+
+let lampForce = null, lastSky = null, lampOn = false;
+function setLamp(on){ lampOn = on; $('#lamp').src = A + (on ? 'lamp-on.webp' : 'lamp-off.webp'); $('#glow').classList.toggle('on', on); }
+function applyWeather(){
+  const wet = Math.max(W.rain, W.snow, W.thunder), gray = W.manual ? (wet ? Math.min(2, 1 + (W.thunder > 1 || wet > 2)) : 0) : W.gray;
+  const f = gray ? `brightness(${1 - gray*.06}) saturate(${1 - gray*.18})` : 'none';
+  $('#outside').style.filter = $('#outsideB').style.filter = f;
+  swapSeason(W.season);
+  $('#cloud').style.opacity = gray*.42;
+  $('#fog').style.opacity = Math.min(.6, (W.season === '冬' ? .2 : 0) + W.snow*.08 + W.rain*.05);
+  $('#sillSnow').style.opacity = Math.min(.95, W.snow*.32);
+  const tint = $('#tint');
+  tint.style.background = W.sky === '清晨' ? 'linear-gradient(180deg,#FFCDBF,#FFE9DD 55%,#FFF6EF)' : W.sky === '傍晚' ? 'linear-gradient(180deg,#7D8FC6,#A2A3CE 55%,#B4A9C8)' : 'transparent';
+  tint.style.opacity = W.sky === '白天' ? 0 : W.sky === '清晨' ? .55 : .62;
+  if (W.sky !== lastSky){ lampForce = null; lastSky = W.sky; }
+  setLamp(lampForce ?? W.sky === '傍晚');
+  const t2 = $('#tint2'); t2.style.background = tint.style.background; t2.style.setProperty('--o', (parseFloat(tint.style.opacity) || 0)*.7);
+  document.querySelectorAll('.surf .lit').forEach(el => {
+    el.style.background = W.sky === '傍晚' ? 'radial-gradient(circle at 92% 0%,rgba(255,190,110,.9),rgba(255,190,110,0) 45%),linear-gradient(#5d6fae,#5d6fae)' : W.sky === '清晨' ? 'linear-gradient(#ffb9a8,#ffb9a8)' : 'transparent';
+    el.style.opacity = W.sky === '白天' ? 0 : .35;
+  });
+  syncControls(); syncMark();
+}
+
+/* 换季：窗外换成那个季节的图（从同一张窗外图调出来的），新的一张淡入盖上去 */
+const SEASON_IMG = {春:'spring', 夏:'summer', 秋:'autumn', 冬:'winter'};
+Object.values(SEASON_IMG).forEach(n => { new Image().src = `${A}plate-outside-${n}.webp`; });
+let shownSeason = null, swapT = 0;   /* 刚打开那一下直接换，不先露一眼春天再淡过去 */
+function swapSeason(se){
+  if (se === shownSeason) return; const first = shownSeason === null; shownSeason = se;
+  const a = $('#outside'), b = $('#outsideB'), url = `${A}plate-outside-${SEASON_IMG[se]}.webp`;
+  clearTimeout(swapT);
+  if (RM || first){ a.src = url; return; }
+  b.style.transition = 'none'; b.style.opacity = 0; b.src = url; void b.offsetWidth; b.style.transition = ''; b.style.opacity = 1;
+  swapT = setTimeout(() => { a.src = url; b.style.transition = 'none'; b.style.opacity = 0; void b.offsetWidth; b.style.transition = ''; }, 1150);
+}
+
+/* ---------- 雨雪风雷（画在窗玻璃上） ---------- */
+const fx = $('#fx'), g = fx.getContext('2d');
+let fxW = 0, fxH = 0, parts = [], gusts = [], lastFlash = 0;
+function sizeFx(){ const dpr = Math.min(2, devicePixelRatio || 1); fxW = IW*S; fxH = IH*S; fx.width = fxW*dpr; fx.height = fxH*dpr; g.setTransform(dpr, 0, 0, dpr, 0, 0); parts = []; gusts = []; }
+function stepFx(t){
+  g.clearRect(0, 0, fxW, fxH);
+  const top = fxH*.4, want = W.rain*70 + W.snow*60, wind = W.wind*1.4;
+  while (parts.length < want) parts.push({x:Math.random()*fxW, y:Math.random()*top, v:Math.random(), snow:W.snow && (!W.rain || Math.random() < W.snow/(W.rain + W.snow))});
+  if (parts.length > want) parts.length = want;
+  for (const p of parts){
+    if (p.snow){ p.y += .6 + p.v*.9; p.x += wind*.6 + Math.sin(t/700 + p.v*9)*.4; g.fillStyle = 'rgba(255,255,255,.92)'; g.beginPath(); g.arc(p.x, p.y, 1 + p.v*1.6, 0, 7); g.fill(); }
+    else { p.y += 7 + p.v*5; p.x += wind; g.strokeStyle = 'rgba(225,235,245,.6)'; g.lineWidth = 1; g.beginPath(); g.moveTo(p.x, p.y); g.lineTo(p.x - wind*2, p.y - 10 - p.v*8); g.stroke(); }
+    if (p.y > top || p.x > fxW || p.x < 0){ p.y = -5; p.x = Math.random()*fxW; }
+  }
+  /* 风：几道淡淡的弧线从窗前掠过，风越大越多越快 */
+  const wantG = W.wind*4;
+  while (gusts.length < wantG) gusts.push({x:-Math.random()*fxW*.6, y:top*(.08 + Math.random()*.8), l:40 + Math.random()*70, v:.6 + Math.random()*.6, b:(Math.random() - .5)*14});
+  if (gusts.length > wantG) gusts.length = wantG;
+  g.lineCap = 'round';
+  for (const s of gusts){
+    s.x += (2.4 + W.wind*2.2)*s.v;
+    const a = .18 + .08*W.wind;
+    g.strokeStyle = `rgba(255,255,255,${a.toFixed(2)})`; g.lineWidth = 1.2;
+    g.beginPath(); g.moveTo(s.x, s.y); g.quadraticCurveTo(s.x + s.l*.5, s.y + s.b, s.x + s.l, s.y + Math.sin(t/400 + s.y)*3); g.stroke();
+    if (s.x > fxW){ s.x = -s.l - Math.random()*120; s.y = top*(.08 + Math.random()*.8); }
+  }
+  if (W.thunder && t - lastFlash > 9000/W.thunder && Math.random() < .012){
+    lastFlash = t; $('#flash').animate([{opacity:0}, {opacity:.7}, {opacity:.1}, {opacity:.5}, {opacity:0}], {duration:700});
+  }
+  if (!RM) requestAnimationFrame(stepFx);
+}
+
+/* ---------- 粉笔画的小图 ---------- */
+const CH = 'stroke-linecap="round" stroke-linejoin="round" fill="none"';
+const glyph = {
+  sun:(c = 'var(--c-gold)') => `<g ${CH} stroke="${c}" stroke-width="1.8" stroke-dasharray="7 .9"><circle cx="25" cy="21" r="8.5"/>${[...Array(9)].map((_, i) => { const a = i/9*Math.PI*2 + .2, r1 = 13, r2 = 18 + (i % 2)*2; return `<path d="M${(25 + Math.cos(a)*r1).toFixed(1)},${(21 + Math.sin(a)*r1).toFixed(1)}L${(25 + Math.cos(a)*r2).toFixed(1)},${(21 + Math.sin(a)*r2).toFixed(1)}"/>`; }).join('')}</g>`,
+  cloud:c => `<path ${CH} stroke="${c}" stroke-width="1.8" stroke-dasharray="9 .9" d="M12,27 Q5,27 6,21 Q7,15 14,16 Q16,8 25,9 Q33,9 35,16 Q42,15 43,21 Q44,27 37,27 Z"/>`,
+  wind:(c, y = 33) => `<g ${CH} stroke="${c}" stroke-width="1.6"><path d="M8,${y} Q24,${y - 2} 34,${y} Q40,${y + 1} 39,${y - 4} Q37,${y - 7} 34,${y - 4}"/><path d="M14,${y + 6} Q26,${y + 4} 42,${y + 6}"/></g>`,
+  flakes:c => `<g ${CH} stroke="${c}" stroke-width="1.5">${[[13, 33], [25, 37], [37, 33]].map(([x, y]) => `<path d="M${x - 3.2},${y}L${x + 3.2},${y}M${x - 1.6},${y - 2.8}L${x + 1.6},${y + 2.8}M${x + 1.6},${y - 2.8}L${x - 1.6},${y + 2.8}"/>`).join('')}</g>`,
+};
+const big = lv => `<svg class="wx" viewBox="0 0 50 42" aria-hidden="true">${lv === 'ok' ? glyph.sun() : lv === 'warn' ? glyph.cloud('var(--chalk)') + glyph.wind('var(--c-blue)', 34) : glyph.cloud('var(--chalk)') + glyph.flakes('var(--c-pink)')}</svg>`;
+const small = lv => lv === 'ok' ? `<svg viewBox="0 0 10 10" aria-hidden="true"><path ${CH} stroke="var(--c-blue)" stroke-width="1.4" d="M1.5,5.4 L4,7.8 L8.6,2.2"/></svg>`
+  : lv === 'warn' ? `<svg viewBox="0 0 16 16" aria-hidden="true"><g ${CH} stroke="var(--c-gold)" stroke-width="1.4"><path d="M1.5,6 Q8,4.6 12,6 Q15,7 14,4 Q13,2 11,3.6"/><path d="M3,10.5 Q8,9.4 14.5,10.5"/></g></svg>`
+  : `<svg viewBox="0 0 16 16" aria-hidden="true"><path ${CH} stroke="var(--c-pink)" stroke-width="1.5" d="M3,8 L13,8 M5.5,3.7 L10.5,12.3 M10.5,3.7 L5.5,12.3"/></svg>`;
+const chev = `<svg viewBox="0 0 9 9" aria-hidden="true"><path ${CH} stroke="currentColor" stroke-width="1.3" d="M3,1.5 L6.5,4.5 L3,7.5"/></svg>`;
+
+/* 粉笔圈：围着选中的字手画一圈，起笔落笔交叠一点；选中时一笔画出来 */
+function scribble(w, h, seed){
+  let n = seed*7919 + 13; const r = () => (n = (n*16807) % 2147483647)/2147483647;
+  const cx = w/2, cy = h/2, rx = w/2 - 2, ry = h/2 - 2, a0 = -2.4 + r()*.5, pts = [];
+  for (let i = 0; i <= 28; i++){ const a = a0 + i/26*Math.PI*2*1.05, j = 1 + (r() - .5)*.07 + (i > 24 ? .07 : 0); pts.push([cx + Math.cos(a)*rx*j, cy + Math.sin(a)*ry*j]); }
+  let d = `M${pts[0][0].toFixed(1)},${pts[0][1].toFixed(1)}`;
+  for (let i = 1; i < pts.length - 1; i++){ const m = [(pts[i][0] + pts[i + 1][0])/2, (pts[i][1] + pts[i + 1][1])/2]; d += `Q${pts[i][0].toFixed(1)},${pts[i][1].toFixed(1)} ${m[0].toFixed(1)},${m[1].toFixed(1)}`; }
+  return d;
+}
+function drawRings(){
+  document.querySelectorAll('.opt').forEach((b, i) => {
+    const w = b.offsetWidth + 12, h = b.offsetHeight + 10, svg = b.querySelector('svg');
+    if (!w || !svg) return;
+    svg.setAttribute('viewBox', `0 0 ${w} ${h}`);
+    svg.innerHTML = `<path pathLength="1" d="${scribble(w, h, i + 3)}"/>`;
+  });
+}
+
+/* ---------- 石板正面 ---------- */
+function renderFront(){
+  const H = health();
+  $('#front').innerHTML = `
+    <div class="eyes"><span>MEMORY WEATHER</span><i>${CHECKED_AT}</i></div>
+    <button class="now" id="now" type="button" aria-label="翻到背面看体检">${big(H.lv)}<span class="wd"><b>${H.word}</b><em>${H.say}${chev}</em></span></button>
+    <div class="rule"></div>
+    <div class="rd">${STATS.map(([v, l]) => `<div><b>${v}</b><span>${l}</span></div>`).join('')}</div>
+    <div class="rule"></div>
+    <div class="row"><span class="k">季节</span><div class="opts" role="group" aria-label="季节">${SEASONS.map(v => `<button class="opt" type="button" data-key="season" data-v="${v}">${v}<svg aria-hidden="true"></svg></button>`).join('')}</div></div>
+    <div class="row"><span class="k">天色</span><div class="opts" role="group" aria-label="天色">${SKIES.map(v => `<button class="opt" type="button" data-key="sky" data-v="${v}">${v}<svg aria-hidden="true"></svg></button>`).join('')}</div></div>
+    ${LEVELS.map(([k, n, c, ic, body]) => `<div class="row lvl"><label class="k" for="w-${k}">${n}</label><div class="rg" style="--mag:${c};--ico:${ico(ic, body)}"><i class="ln"></i>${LV.map((l, i) => `<i class="tk" data-i="${i}" style="left:calc(14px + ${i}*(100% - 28px)/3);--d:${3 + i*1.5}px"></i><span class="lb" data-i="${i}" style="left:calc(14px + ${i}*(100% - 28px)/3)">${l}</span>`).join('')}<input id="w-${k}" type="range" min="0" max="3" step="1" value="0" data-k="${k}" aria-valuetext="无"></div></div>`).join('')}
+    <div class="ft" id="ft"></div>`;
+}
+function syncControls(){
+  document.querySelectorAll('.opt').forEach(b => b.setAttribute('aria-pressed', String(W[b.dataset.key] === b.dataset.v)));
+  for (const [k] of LEVELS){
+    const inp = $('#w-' + k); if (!inp) continue;
+    inp.value = W[k]; inp.setAttribute('aria-valuetext', LV[W[k]]);
+    const rg = inp.parentNode; rg.style.setProperty('--p', W[k]/3);
+    rg.querySelectorAll('.lb').forEach(l => l.classList.toggle('on', +l.dataset.i === W[k]));
+    rg.querySelectorAll('.tk').forEach(t => t.classList.toggle('lit', +t.dataset.i <= W[k]));
+  }
+  $('#ft').innerHTML = W.manual ? `<span class="mode">手动</span><button class="go" id="reset" type="button">回到跟着记忆库</button>` : `<span class="mode"><i class="dot"></i>跟着记忆库</span>`;
+}
+$('#front').addEventListener('click', e => {
+  const o = e.target.closest('.opt'); if (o){ W[o.dataset.key] = o.dataset.v; W.manual = true; applyWeather(); return; }
+  if (e.target.closest('#reset')){ W = auto(); applyWeather(); return; }
+  if (e.target.closest('#now')) turn(true);
+});
+$('#front').addEventListener('input', e => { const k = e.target.dataset.k; if (!k) return; W[k] = +e.target.value; W.manual = true; applyWeather(); });
+
+/* ---------- 石板背面：体检 ---------- */
+let okOpen = -1;
+function renderBack(){
+  const c = checks(), H = health(), bad = c.filter(x => x[1] !== 'ok').sort((a, b) => (a[1] === 'fail' ? 0 : 1) - (b[1] === 'fail' ? 0 : 1)), ok = c.filter(x => x[1] === 'ok');
+  $('#backIn').innerHTML = `
+    <div class="bh"><button class="bk" id="bk" type="button"><svg viewBox="0 0 14 14" aria-hidden="true"><path ${CH} stroke="currentColor" stroke-width="1.5" d="M8.6,2.6 L4.4,7 L8.6,11.4"/></svg>拨天气</button><span class="eb">CHECK-UP</span><i>${CHECKED_AT}</i></div>
+    <p class="verdict">${H.lv === 'ok' ? '全部通过' : H.say}</p>
+    ${bad.length ? `<ul class="bad">${bad.map(([t, l, d]) => `<li>${small(l)}<div><b>${esc(t)}</b><p>${esc(d)}</p></div></li>`).join('')}</ul>` : ''}
+    <div class="okh">${bad.length ? `其余<b>${ok.length}</b>项都过了` : `<b>${ok.length}</b>项都过了`}</div>
+    <div class="chips">${ok.map(([t], i) => `<button class="chip" type="button" data-i="${i}" aria-pressed="${i === okOpen}">${small('ok')}${esc(t)}</button>`).join('')}</div>
+    <p class="okd" id="okd">${okOpen >= 0 && ok[okOpen] ? esc(ok[okOpen][2]) : ''}</p>`;
+}
+$('#backIn').addEventListener('click', e => {
+  if (e.target.closest('#bk')){ turn(false); return; }
+  const b = e.target.closest('.chip'); if (!b) return;
+  okOpen = +b.dataset.i === okOpen ? -1 : +b.dataset.i; renderBack();
+});
+function turn(over){
+  if (!RM){ slate.classList.add('turning'); setTimeout(() => slate.classList.remove('turning'), 760); }
+  $('#flip').classList.toggle('over', over);
+  $('.front').inert = over; $('.back').inert = !over;
+}
+$('.back').inert = true;
+/* 横着划一下石板也翻面（拖磁铁不算）；划完那一下不算点 */
+(() => { let p = null, swiped = false; const fl = $('#flip');
+  fl.addEventListener('pointerdown', e => { p = e.target.closest('input') ? null : {x:e.clientX, y:e.clientY}; });
+  fl.addEventListener('pointerup', e => {
+    if (!p) return; const dx = e.clientX - p.x, dy = e.clientY - p.y; p = null;
+    if (Math.abs(dx) > 56 && Math.abs(dy) < 44){ swiped = true; turn(!fl.classList.contains('over')); setTimeout(() => { swiped = false; }, 400); }
+  });
+  fl.addEventListener('click', e => { if (swiped){ swiped = false; e.stopPropagation(); e.preventDefault(); } }, true);
+})();
+
+/* ---------- 摘下来／挂回去：石板从墙上那块小石板的位置飞到桌上，收起时飞回去 ---------- */
+let open = true, anim = null;
+function boardDelta(){
+  const r = slate.getBoundingClientRect(), bx = OX + (BOARD_SLATE[0] + BOARD_SLATE[2]/2)*S, by = OY + (BOARD_SLATE[1] + BOARD_SLATE[3]/2)*S;
+  const k = BOARD_SLATE[2]*S/r.width;
+  return {dx:bx - (r.left + r.width/2), dy:by - (r.top + r.height) + r.height*k/2, k};
+}
+const baseT = () => `translateX(-50%) scale(${getComputedStyle(slate).getPropertyValue('--k') || 1})`;
+function setOpen(on){
+  if (on === open) return; open = on;
+  if (anim) anim.cancel();
+  slate.classList.remove('shut');
+  const d = boardDelta(), far = `translate(${d.dx}px,${d.dy}px) ${baseT()} scale(${d.k}) rotate(4deg)`, near = `${baseT()} rotate(-1deg)`;
+  if (RM){ slate.classList.toggle('shut', !on); return; }
+  anim = slate.animate(on
+    ? [{transform:far, opacity:.2}, {transform:`${baseT()} rotate(-2.4deg) translateY(-14px)`, opacity:1, offset:.72}, {transform:near, opacity:1}]
+    : [{transform:near, opacity:1}, {transform:far, opacity:.1}],
+    {duration:on ? 620 : 420, easing:on ? 'cubic-bezier(.3,.7,.3,1)' : 'cubic-bezier(.5,0,.8,.5)'});
+  anim.onfinish = () => { anim = null; if (!open) slate.classList.add('shut'); };
+  if (on) syncMark(true);
+}
+$('#view').addEventListener('click', () => { if (open){ turn(false); setOpen(false); } });
+
+/* ---------- 记号：气压表——老气压表上的 STORMY · CHANGE · FAIR，指针指着这次体检 ---------- */
+function renderMark(){
+  const H = health(), mk = $('#mk');
+  {
+    const ticks = [...Array(27)].map((_, i) => { const a = (-130 + i*10)*Math.PI/180, r1 = i % 5 ? 24.5 : 23, r2 = 27; return `<path d="M${(33 + Math.sin(a)*r1).toFixed(2)},${(33 - Math.cos(a)*r1).toFixed(2)}L${(33 + Math.sin(a)*r2).toFixed(2)},${(33 - Math.cos(a)*r2).toFixed(2)}"/>`; }).join('');
+    mk.innerHTML = `<svg class="baro" viewBox="0 0 66 66" aria-hidden="true">
+      <defs><linearGradient id="rim" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#F0D9A0"/><stop offset=".45" stop-color="#B08A45"/><stop offset="1" stop-color="#7C5D27"/></linearGradient>
+      <radialGradient id="face" cx=".42" cy=".38" r=".7"><stop offset="0" stop-color="#FFFDF8"/><stop offset="1" stop-color="#EFE7D8"/></radialGradient></defs>
+      <circle cx="33" cy="33" r="32" fill="url(#rim)"/><circle cx="33" cy="33" r="28.5" fill="url(#face)"/>
+      <path d="M${33 + Math.sin(-2.27)*21},${33 - Math.cos(-2.27)*21} A21 21 0 0 1 ${33 + Math.sin(-.6)*21},${33 - Math.cos(-.6)*21}" fill="none" stroke="#A4493E" stroke-width="2.2" opacity=".35"/>
+      <path d="M${33 + Math.sin(.6)*21},${33 - Math.cos(.6)*21} A21 21 0 0 1 ${33 + Math.sin(2.27)*21},${33 - Math.cos(2.27)*21}" fill="none" stroke="#5D84A2" stroke-width="2.2" opacity=".35"/>
+      <g stroke="#76695F" stroke-width=".6" stroke-linecap="round">${ticks}</g>
+      <g font-family="Fraunces, Georgia, serif" font-weight="600" font-size="4.6" letter-spacing=".5" fill="#76695F" text-anchor="middle">
+        <text x="16" y="44">STORMY</text><text x="33" y="18.5">CHANGE</text><text x="50" y="44">FAIR</text></g>
+      <g class="ndl" style="transform:rotate(${H.lv === 'ok' ? 100 : H.lv === 'warn' ? -8 - 10*(H.nw - 1) : -100}deg)">
+        <path d="M33,10 L34.6,33 L33,38 L31.4,33 Z" fill="#3A2F28"/><circle cx="33" cy="12" r="1.2" fill="#3A2F28"/></g>
+      <circle cx="33" cy="33" r="3" fill="url(#rim)"/></svg>`;
+  }
+  syncMark();
+}
+function syncMark(fresh){
+  if (fresh && !RM){ const n = $('.baro .ndl'); if (n){ const t = n.style.transform; n.style.transition = 'none'; n.style.transform = 'rotate(-130deg)'; void n.offsetWidth; n.style.transition = ''; n.style.transform = t; } }
+}
+
+/* ---------- 示例：全过／要注意／坏了，看天气怎么跟着变 ---------- */
+const DEMO = {ok:'全过', warn:'要注意', fail:'坏了'};
+$('#demo').insertAdjacentHTML('beforeend', Object.entries(DEMO).map(([k, n]) => `<button type="button" data-d="${k}" aria-pressed="${k === demo}">${n}</button>`).join(''));
+$('#demo').addEventListener('click', e => {
+  const b = e.target.closest('[data-d]'); if (!b) return;
+  demo = b.dataset.d; $('#demo').querySelectorAll('[data-d]').forEach(x => x.setAttribute('aria-pressed', String(x === b)));
+  W = auto();   /* 点示例就是想看这份体检的天气：手动拨过的也回到跟着记忆库 */
+  okOpen = -1; renderFront(); renderBack(); renderMark(); fitSlate(); applyWeather(); syncMark(true);
+  setOpen(true);
+});
+['#demo', '.sample'].forEach(s => $(s).addEventListener('click', e => e.stopPropagation()));
+/* 录屏：?rec 把示例开关藏起来；?rec=ok／warn／fail 定在那份体检，不写就是真实 */
+const REC = new URLSearchParams(location.search).get('rec');
+if (REC !== null) $('#demo').style.display = 'none';
+
+/* ---------- 真数据：体检（/admin/api/health）。拿到就换上真的四个大数和逐项，开关最前面多一个「真实」并选上 ---------- */
+hut.api('/health').then(r => {
+  if (!r) return;
+  const n = v => (v ?? 0).toLocaleString('en-US'), s = r.stats || {};
+  STATS.splice(0, 4, [n(s.files), '篇正文'], [n(s.chunks), '块'], [n(s.facts), '条事实'], [n(s.unresolved), '件未解决']);
+  BASE.splice(0, BASE.length, ...r.checks.map(c => [c.title, c.level, c.detail]));
+  ['warn', 'fail'].forEach(k => { if (OVR[k]['命中权重']) OVR[k]['.weights.json'] = OVR[k]['命中权重']; });
+  const d = new Date();
+  CHECKED_AT = `${String(d.getMonth() + 1).padStart(2, '0')}.${String(d.getDate()).padStart(2, '0')} · ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  $('#demo span').insertAdjacentHTML('afterend', '<button type="button" data-d="real" aria-pressed="false">真实</button>');
+  demo = REC in DEMO ? REC : 'real';
+  $('#demo').querySelectorAll('[data-d]').forEach(x => x.setAttribute('aria-pressed', String(x.dataset.d === demo)));
+  if (!W.manual) W = auto();
+  okOpen = -1; renderFront(); renderBack(); renderMark(); fitSlate(); applyWeather(); syncMark(true);
+});
+slate.addEventListener('click', e => e.stopPropagation());
+
+/* ---------- 可点的物件（图的像素）：接了数据的推近，别的只给反馈 ---------- */
+const PAGES = {
+  cassette:{f:'cassette-mock.html', box:[8, 1600, 405, 285], n:'磁带 · 记忆正文'},
+  factbook:{f:'factbook-mock.html', box:[416, 1600, 690, 325], n:'事实簿'},
+  passport:{f:'passport-mock.html', box:[1015, 1405, 400, 215], n:'护照 · 里程碑'},
+  map:{f:'map-mock.html', box:[0, 1228, 442, 237], n:'地图 · 还没结束的事'},
+  camera:{f:'camera-mock.html', box:[110, 10, 850, 265], n:'拍立得 · 换窗时带回了什么'},
+  letter:{f:'letter-mock.html', box:[1126, 1645, 282, 166], n:'火漆信 · 上个窗口留下的话'},
+  lock:{f:'lock-mock.html', box:[1143, 1808, 280, 172], n:'小锁信 · 写给 TA'},
+  cairn:{f:'cairn-mock.html', box:[24, 875, 134, 190], n:'石堆 · 最常被想起的'},
+  ice:{f:'ice-mock.html', box:[420, 560, 680, 240], n:'窗外浮冰'},
+};
+/* 后放的压在先放的上面：湖在猫和玩偶底下，地图在相机底下。点相机和点窗上那串拍立得都推到拍立得 */
+const HOTS = [
+  {k:'camera'}, {k:'ice'}, {k:'map'}, {k:'cam', page:'camera', box:[60, 1405, 220, 150], n:'相机 · 换窗时带回了什么'}, {k:'cassette'}, {k:'factbook'}, {k:'passport'}, {k:'letter'}, {k:'lock'},
+  {k:'pad', page:'lock', box:[374, 1952, 311, 179], n:'便利贴本 · 写给 TA'}, {k:'cairn'},
+  {k:'board', box:BOARD, n:'气象板'}, {k:'toy', box:[600, 925, 250, 175], n:'Clawd'},
+  {k:'owl', box:[866, 930, 108, 160], n:'猫头鹰'}, {k:'lamp', box:[1255, 915, 175, 450], n:'煤油灯'},
+];
+$('#hots').innerHTML = HOTS.map((h, i) => { const p = PAGES[h.page || h.k], b = h.box || p.box; return `<button class="hot" type="button" data-i="${i}" aria-label="${h.n || p.n}" style="${pct(...b)}"></button>`; }).join('');
+$('#hots').addEventListener('click', e => {
+  const b = e.target.closest('.hot'); if (!b || panned) return; e.stopPropagation();
+  const h = HOTS[+b.dataset.i]; wake();
+  if (PAGES[h.page || h.k]) return openPage(h.page || h.k);
+  if (h.k === 'board'){ if (!open){ panTo(1); } setOpen(!open); return; }
+  if (open){ turn(false); setOpen(false); }
+  if (h.k === 'owl'){ $('#owl').style.transform = 'rotate(-14deg)'; setTimeout(() => { $('#owl').style.transform = ''; }, 700); }
+  if (h.k === 'lamp'){ lampForce = !lampOn; setLamp(lampForce); }
+  if (h.k === 'toy'){ setToy('blink'); setTimeout(() => setToy('idle'), 220); }
+});
+/* Clawd 玩偶：没动静二十几秒就打盹，一碰就醒 */
+let idle = 0, toy = 'idle';
+function setToy(s){ toy = s; $('#toy').src = A + 'clawd-' + s + '.webp'; }
+function wake(){ idle = 0; if (toy === 'sleep') setToy('idle'); }
+setInterval(() => { idle++; if (idle > 25 && toy === 'idle' && !cur && !open) setToy('sleep'); }, 1000);
+['pointerdown', 'keydown'].forEach(t => addEventListener(t, wake, true));
+
+/* ---------- 左右拖着看全屋（推近的时候不动） ---------- */
+let panned = false;
+(() => { let x0 = null, k0 = .5;
+  $('#view').addEventListener('pointerdown', e => { if (cur || e.button > 0) return; x0 = e.clientX; k0 = panK; panned = false; });
+  addEventListener('pointermove', e => {
+    if (x0 === null) return; const dw = IW*S, room = dw - innerWidth; if (room <= 0) return;
+    const dx = e.clientX - x0; if (!panned && Math.abs(dx) < 7) return;
+    panned = true; panK = clamp(k0 - dx/room, 0, 1); place();
+  });
+  addEventListener('pointerup', () => { x0 = null; setTimeout(() => { panned = false; }, 0); });
+  addEventListener('pointercancel', () => { x0 = null; panned = false; });
+})();
+function panTo(k){
+  if (IW*S <= innerWidth) return;
+  const from = panK, t0 = performance.now();
+  const step = now => { const q = Math.min(1, (now - t0)/450), e = 1 - Math.pow(1 - q, 3); panK = from + (k - from)*e; place(); if (q < 1) requestAnimationFrame(step); };
+  RM ? (panK = k, place()) : requestAnimationFrame(step);
+}
+
+/* ---------- 推近：镜头推到物件上，那一张近景淡进来；返回时淡出、镜头拉回 ---------- */
+const frame = $('#page'), cam = $('#cam');
+let cur = null, tok = 0;
+function camTo(box, now){
+  if (now) cam.style.transition = 'none';
+  if (!box) cam.style.transform = '';
+  else {
+    const vw = innerWidth, vh = innerHeight, [x, y, w, h] = box;
+    const cx = OX + (x + w/2)*S, cy = OY + (y + h/2)*S, s = clamp(.8*vw/(w*S), 1.6, 3.4);
+    /* 推到图的边就停：物件贴着图边（窗框上的拍立得）时，不推出图外露出深色底 */
+    const tx = clamp(vw/2 - s*cx, vw - s*(OX + IW*S), -s*OX), ty = clamp(vh/2 - s*cy, vh - s*(OY + IH*S), -s*OY);
+    cam.style.transform = `translate(${tx.toFixed(1)}px,${ty.toFixed(1)}px) scale(${s.toFixed(3)})`;
+  }
+  if (now){ void cam.offsetWidth; cam.style.transition = ''; }
+}
+function openPage(key, data = {}){
+  const pg = PAGES[key]; if (!pg) return;
+  if (key === cur){ frame.contentWindow?.postMessage({hut:'show', data}, '*'); return; }
+  if (open){ turn(false); setOpen(false); }
+  const t = ++tok, from = cur, t0 = performance.now(); cur = key;
+  frame.classList.remove('on'); $('#tint2').classList.remove('show');
+  /* 从一张近景跳到另一张：先淡出，镜头从这一件移到那一件 */
+  const lag = from && !RM ? 280 : 0;
+  setTimeout(() => { if (t === tok) camTo(pg.box); }, lag);
+  setTimeout(() => {
+    if (t !== tok) return;
+    frame.onload = () => {
+      if (t !== tok || frame.src.endsWith('about:blank')) return;
+      frame.contentWindow.postMessage({hut:'show', data}, '*');
+      setTimeout(() => { if (t !== tok) return; frame.classList.add('on'); $('#tint2').classList.add('show'); frame.focus(); }, RM ? 0 : Math.max(0, lag + 560 - (performance.now() - t0)));
+    };
+    frame.src = pg.f;
+  }, lag + 60);
+}
+function closePage(){
+  if (!cur) return;
+  const t = ++tok; cur = null;
+  frame.classList.remove('on'); $('#tint2').classList.remove('show');
+  setTimeout(() => { if (t === tok) camTo(null); }, RM ? 0 : 220);
+  setTimeout(() => { if (t === tok){ frame.onload = null; frame.src = 'about:blank'; } }, 800);
+}
+addEventListener('message', e => {
+  if (e.source !== frame.contentWindow || !e.data || !e.data.hut) return;
+  if (e.data.hut === 'back') closePage();
+  if (e.data.hut === 'go') openPage(e.data.page, e.data.data || {});
+});
+addEventListener('keydown', e => { if (e.key === 'Escape'){ if (cur) closePage(); else if (open){ turn(false); setOpen(false); } } });
+
+addEventListener('resize', layout);
+renderFront(); renderBack(); renderMark(); layout(); applyWeather();
+document.fonts?.ready.then(() => { fitSlate(); syncControls(); });
+if (!RM) requestAnimationFrame(stepFx); else stepFx(0);
+/* 一进来：石板从墙上摘下来 */
+open = false; slate.classList.add('shut');
+})();
+</script>

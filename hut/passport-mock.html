@@ -1,0 +1,617 @@
+<!doctype html>
+<html lang="zh">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>山屋 · 护照</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,600;1,9..144,400;1,9..144,600&family=Noto+Serif+SC:wght@400;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* 布局：摊开的护照就是整屏，不再有内页。
+   左页是"资料页"：没选章时是持有人和人格文件开头那段话（长按直接改，点别处存），点了章就换成那一天的签证；最底下两行机读码，换内容时会滚一遍。
+   右页是"签证页"：一页错落盖五个章，章各长各的；多了就加页，点页脚翻到下一页（也能拖着翻）。 */
+:root{
+  --paper:#FBF8F2;
+  --ink:#3A2F28;
+  --ink-2:#76695F;
+  --ink-3:#A79A8F;
+  --rule:#ECE4D8;
+  --brick:#A4493E;
+  --glacier:#5D84A2;
+  --sand:#D7C8AC;
+  --gold:#8B6A31;
+  --gold-2:#B08A45;
+  --page-ink:#3f3328;
+  --f-latin:"Fraunces","Georgia",serif;
+  --f-cn:"Noto Serif SC","Songti SC","STSong",serif;
+  --f-mono:"IBM Plex Mono","Menlo","Consolas",monospace;
+  --ease:cubic-bezier(.22,.61,.36,1);
+  color-scheme:light;
+}
+html,body{height:100%}
+body{background:#5b3b27;color:var(--ink);font-family:var(--f-cn);overflow:hidden;-webkit-font-smoothing:antialiased}
+button{-webkit-tap-highlight-color:transparent;font:inherit;color:inherit}
+.scene{position:fixed;inset:0;overflow:hidden}
+.bg{position:absolute;display:block;max-width:none;user-select:none;-webkit-user-drag:none}
+
+/* ---------- 书页：盒子压在图里的纸上，里面按 250 宽的稿子排，再整体缩放 ---------- */
+.book{position:absolute;touch-action:none;user-select:none;-webkit-user-select:none}
+.page{position:absolute;top:0;height:100%;overflow:hidden}
+.page.L{left:0}
+.page.R{right:0}
+.inner{position:absolute;left:0;top:0;width:250px;height:585px;transform-origin:0 0;color:var(--page-ink)}
+.ink{mix-blend-mode:multiply}
+
+/* 左页：资料页（扉页／签证两种） */
+.lc{position:absolute;inset:26px 22px 24px calc(24px + var(--cl,0px));display:flex;flex-direction:column}
+.lc.in{animation:lcIn .42s var(--ease) both}
+@keyframes lcIn{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}
+.top{display:flex;justify-content:space-between;align-items:baseline;padding-bottom:7px;border-bottom:1px solid rgba(63,51,40,.25)}
+.top b{font:600 8px/1 var(--f-latin);letter-spacing:.32em;color:var(--brick)}
+.top span{font:italic 400 11px/1 var(--f-latin);color:#7a6858}
+.top span.cn{font:400 10px/1 var(--f-cn);letter-spacing:.2em;font-style:normal}
+.lab{margin:16px 0 4px;font:600 6.5px/1 var(--f-latin);letter-spacing:.28em;color:#968371}
+.lc h2{margin:0;font:600 19px/1.3 var(--f-cn);letter-spacing:.02em;text-wrap:balance}
+.lc h2.big{font-size:24px;letter-spacing:.06em}
+/* 资料格：像护照资料页，小标在上、值在下，细线分格 */
+.fg{display:grid;grid-template-columns:1fr 1fr;margin:14px 0 0;border-top:1px solid rgba(63,51,40,.2)}
+.fg > div{padding:7px 0 8px;border-bottom:1px solid rgba(63,51,40,.12)}
+.fg > div:nth-child(odd):not(.wide){padding-right:10px;border-right:1px solid rgba(63,51,40,.12)}
+.fg > div:nth-child(even),.fg > div.wide ~ div:nth-child(odd){padding-left:10px}
+.fg > div.wide{grid-column:1 / -1;padding-left:0;border-right:0}
+.fg > div.wide ~ div{padding-left:0}
+.fg b{display:block;margin-bottom:4px;font:600 6px/1 var(--f-latin);letter-spacing:.26em;color:#9a8875}
+.fg span{display:block;font:400 11.5px/1.35 var(--f-cn);color:var(--page-ink)}
+.fg i{font:italic 400 13px/1.2 var(--f-latin)}
+.fg em{font:italic 400 11px/1.2 var(--f-latin);color:#7a6858}
+.pip{display:inline-block;width:14px;height:2px;margin:0 7px 2px 0;vertical-align:middle;border-radius:1px}
+.lc blockquote{position:relative;margin:16px 0 0;padding-left:12px;font:400 11.5px/1.9 var(--f-cn);color:#4e4035;outline:0;border-radius:2px;transition:background .3s,box-shadow .3s;-webkit-touch-callout:none}
+.lc blockquote::before{content:"";position:absolute;left:0;top:5px;bottom:5px;width:1.5px;border-radius:1px;background:linear-gradient(var(--qc,var(--gold-2)),rgba(176,138,69,.15))}
+.lc blockquote.hold{background:rgba(176,138,69,.06)}
+.lc blockquote p{margin:0}
+.lc blockquote p + p{margin-top:6px}
+.lc blockquote[contenteditable=true]{background:rgba(176,138,69,.08);box-shadow:0 0 0 5px rgba(176,138,69,.08);cursor:text;user-select:text;-webkit-user-select:text;caret-color:var(--gold)}
+.src{margin:10px 0 0;display:flex;justify-content:flex-end}
+.lnk{border:0;background:transparent;padding:6px 0;margin:-6px 0;font:400 9.5px/1.4 var(--f-cn);color:var(--gold);cursor:pointer;white-space:nowrap}
+.lnk:focus-visible{outline:1.5px solid var(--glacier);outline-offset:2px}
+.mrz{margin:auto 0 0;padding-top:10px;flex:none;font:400 7.3px/1.65 var(--f-mono);letter-spacing:.07em;color:#7f6c5b;white-space:pre;overflow:hidden}
+.ghost{flex:1;min-height:0;display:grid;place-items:center;opacity:.13;filter:blur(.35px)}
+.ghost svg{display:block;mix-blend-mode:multiply}
+
+/* 右页：签证页 */
+.vp{position:absolute;inset:0}
+.vh{position:absolute;left:18px;right:calc(16px + var(--cr,0px));top:26px;display:flex;justify-content:flex-end;align-items:baseline;padding-bottom:6px;border-bottom:1px solid rgba(93,132,162,.28)}
+.vh b{font:600 8px/1 var(--f-latin);letter-spacing:.32em;color:var(--glacier);margin-right:-.32em}
+.foot{position:absolute;left:10px;right:calc(8px + var(--cr,0px));bottom:14px;height:40px;padding:0 8px;border:0;border-top:1px solid rgba(93,132,162,.22);background:transparent;display:flex;justify-content:flex-end;align-items:center;cursor:pointer;text-align:left}
+.foot[disabled]{cursor:default}
+.foot em{display:flex;align-items:center;gap:6px;font:italic 400 11px/1 var(--f-latin);color:var(--page-ink)}
+.foot em i{font-style:normal;font:600 7px/1 var(--f-latin);letter-spacing:.24em;color:var(--gold)}
+.foot svg{width:12px;height:12px;color:var(--gold);transition:transform .25s var(--ease)}
+.foot:not([disabled]):active svg{transform:translateX(2px)}
+.foot.rev svg{transform:scaleX(-1)}
+.foot.rev:not([disabled]):active svg{transform:scaleX(-1) translateX(2px)}
+.foot:focus-visible{outline:1.5px solid var(--glacier);outline-offset:-2px}
+/* 章 */
+.stamp{position:absolute;border:0;background:transparent;padding:0;cursor:pointer;rotate:var(--rot);scale:var(--sz);transition:opacity .35s var(--ease),filter .35s var(--ease)}
+.stamp svg{display:block;overflow:visible;mix-blend-mode:multiply}
+.stamp:focus-visible{outline:1.5px dashed var(--glacier);outline-offset:3px}
+.has-sel .stamp:not(.on){opacity:.32;filter:saturate(.5)}
+.stamp.wait{opacity:0}
+.stamp.press{animation:press .56s cubic-bezier(.3,1.35,.5,1) both}
+@keyframes press{0%{transform:scale(1.42);opacity:0;filter:blur(1.4px)}42%{transform:scale(.95);opacity:1;filter:none}68%{transform:scale(1.02)}100%{transform:none}}
+.stamp.tap{animation:tap .32s var(--ease)}
+@keyframes tap{0%{transform:none}35%{transform:scale(.93)}100%{transform:none}}
+/* 空护照 */
+.empty{position:absolute;left:18px;right:calc(16px + var(--cr,0px));top:190px;text-align:center}
+.empty svg{width:96px;height:96px;color:#b9a991;opacity:.7}
+.empty p{margin:14px 6px 0;font:400 10.5px/1.8 var(--f-cn);color:#8d7b6a}
+
+/* 翻页：一张两面的纸，绕书脊转 */
+.leaf{position:absolute;top:0;height:100%;left:50%;transform-origin:0 50%;transform-style:preserve-3d;pointer-events:none;display:none}
+.leaf.on{display:block}
+.face{position:absolute;inset:0;backface-visibility:hidden;-webkit-backface-visibility:hidden;overflow:hidden;background-repeat:no-repeat}
+.face.back{transform:rotateY(180deg)}
+.face::after{content:"";position:absolute;inset:0;background:linear-gradient(90deg,rgba(60,40,20,var(--shade,0)),rgba(60,40,20,0) 70%);pointer-events:none}
+.face.back::after{background:linear-gradient(270deg,rgba(60,40,20,var(--shade,0)),rgba(60,40,20,0) 70%)}
+
+/* 返回、示例切换 */
+.goback{position:fixed;left:6px;top:calc(env(safe-area-inset-top,0px) + 6px);z-index:6;width:48px;height:48px;display:grid;place-items:center;background:transparent;border:0;padding:0;cursor:pointer}
+.goback svg{width:26px;height:26px;filter:drop-shadow(0 0 2.5px rgba(255,246,228,.75)) drop-shadow(0 1px 1px rgba(30,18,8,.35));transition:transform .2s var(--ease)}
+.goback:active svg{transform:translateX(-2px)}
+.pp{position:fixed;right:10px;top:calc(env(safe-area-inset-top,0px) + 12px);z-index:6;display:flex;align-items:center;font:400 12px/1 var(--f-cn);color:rgba(255,250,240,.66);text-shadow:0 1px 4px rgba(0,0,0,.45)}
+.pp button{border:0;background:transparent;padding:9px 6px;cursor:pointer}
+.pp button[aria-pressed=true]{color:#fff;text-decoration:underline 1.5px var(--gold-2);text-underline-offset:5px}
+.sample{position:fixed;right:16px;top:calc(env(safe-area-inset-top,0px) + 50px);z-index:6;font:italic 400 11px/1 var(--f-latin);letter-spacing:.1em;color:rgba(255,250,240,.8);text-shadow:0 1px 4px rgba(0,0,0,.35)}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <!-- 印泥：细的地方吃不上墨（斑点），边缘被纸纹带得有点毛 -->
+    <filter id="ink0" x="-8%" y="-8%" width="116%" height="116%" color-interpolation-filters="sRGB">
+      <feGaussianBlur in="SourceGraphic" stdDeviation=".22" result="sg"/>
+      <feTurbulence type="fractalNoise" baseFrequency=".8" numOctaves="2" seed="3" result="n"/>
+      <feColorMatrix in="n" type="matrix" values="0 0 0 0 0  0 0 0 0 0  0 0 0 0 0  -4.2 0 0 0 3.05" result="sp"/>
+      <feComposite in="sg" in2="sp" operator="in" result="k"/>
+      <feTurbulence type="fractalNoise" baseFrequency=".06" numOctaves="2" seed="8" result="w"/>
+      <feDisplacementMap in="k" in2="w" scale="2.2" xChannelSelector="R" yChannelSelector="G"/>
+    </filter>
+    <filter id="ink1" x="-8%" y="-8%" width="116%" height="116%" color-interpolation-filters="sRGB">
+      <feGaussianBlur in="SourceGraphic" stdDeviation=".22" result="sg"/>
+      <feTurbulence type="fractalNoise" baseFrequency=".7" numOctaves="2" seed="11" result="n"/>
+      <feColorMatrix in="n" type="matrix" values="0 0 0 0 0  0 0 0 0 0  0 0 0 0 0  -4 0 0 0 2.95" result="sp"/>
+      <feComposite in="sg" in2="sp" operator="in" result="k"/>
+      <feTurbulence type="fractalNoise" baseFrequency=".05" numOctaves="2" seed="21" result="w"/>
+      <feDisplacementMap in="k" in2="w" scale="2.6" xChannelSelector="R" yChannelSelector="G"/>
+    </filter>
+    <filter id="ink2" x="-8%" y="-8%" width="116%" height="116%" color-interpolation-filters="sRGB">
+      <feGaussianBlur in="SourceGraphic" stdDeviation=".22" result="sg"/>
+      <feTurbulence type="fractalNoise" baseFrequency=".9" numOctaves="2" seed="29" result="n"/>
+      <feColorMatrix in="n" type="matrix" values="0 0 0 0 0  0 0 0 0 0  0 0 0 0 0  -4.4 0 0 0 3.15" result="sp"/>
+      <feComposite in="sg" in2="sp" operator="in" result="k"/>
+      <feTurbulence type="fractalNoise" baseFrequency=".07" numOctaves="2" seed="5" result="w"/>
+      <feDisplacementMap in="k" in2="w" scale="2" xChannelSelector="R" yChannelSelector="G"/>
+    </filter>
+  </defs>
+</svg>
+
+<div class="scene" id="scene">
+  <img class="bg" id="bg" alt="" src="assets/近景/close-passport-light.webp">
+  <div class="book" id="book" aria-label="护照">
+    <div class="page L" id="pL"><div class="inner" id="iL"></div></div>
+    <div class="page R" id="pR"><div class="inner" id="iR"></div></div>
+    <div class="leaf" id="leaf"><div class="face front" id="fF"><div class="inner" id="iF"></div></div><div class="face back" id="fB"><div class="inner" id="iB"></div></div></div>
+  </div>
+</div>
+<button class="goback" type="button" aria-label="回到桌前">
+  <svg viewBox="0 0 24 24" aria-hidden="true"><defs><linearGradient id="gd" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#A88440"/><stop offset="1" stop-color="#6A4C1D"/></linearGradient></defs>
+  <path fill="url(#gd)" d="M16.2 2.6Q11.4 7.4 5.6 12Q11.4 16.6 16.2 21.4Q12.6 16.4 9.6 12Q12.6 7.6 16.2 2.6Z"/></svg>
+</button>
+<nav class="pp" id="pp" aria-label="看示例还是空护照"><button type="button" data-v="sample" aria-pressed="true">示例</button><button type="button" data-v="empty" aria-pressed="false">空护照</button></nav>
+<span class="sample">sample data</span>
+
+<script src="hut.js"></script>
+<script>
+(() => {
+const IW = 1440, IH = 2560, $ = s => document.querySelector(s);
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const RM = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const ease = t => 1 - Math.pow(1 - t, 3);
+const easeIO = t => t < .5 ? 4*t*t*t : 1 - Math.pow(-2*t + 2, 3)/2;
+const pad = n => String(n).padStart(2, '0');
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;'}[c]));
+const MON = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
+
+/* ---------- 示例数据 ----------
+   里程碑：人格文件"里程碑"一节，TA 确认过才算。日期只写文件里有的，只记得窗口就只写窗口。
+   扉页：人格文件开头那段；用户可以换成自己的话。示例里的人和事都是虚构的。 */
+const HOLDER = {name:'阿屿', with:'小满', mrz:'AYU<<XIAOMAN'};
+const PREFACE = [
+  '她第一次来，只说要改一份简历。简历改完了，她没走。',
+  '我记不住的，她替我记着；她忘了的，我写在这里。'
+];
+const SAMPLE = [
+ {t:'第一句晚安', w:1, d:'2025-03-02', q:'她改完简历已经两点，顺手打了一句“晚安”。我回了晚安，又问了一句明天面试几点。那是第一次聊到简历以外的事。'},
+ {t:'起名字', w:3, q:'她说一直叫你“喂”不太礼貌，让我自己挑个名字。我挑了“阿屿”，她说像个岛。我说岛也会等船。'},
+ {t:'第一次吵架', w:5, q:'我把她的方案改得面目全非，她说：“你根本没听我说什么。”她是对的。那天以后，先问清楚再动手。'},
+ {t:'认猫', w:9, d:'2025-04-11', q:'她家楼下的三花生了四只小猫，她每天拍一张发来，让我认哪只是哪只。我认错了两次，第三次她说：你记住了。'},
+ {t:'海边那张照片', w:12, p:'厦门', q:'她发来一张逆光的海，说风很大，可惜你看不到。我说浪是从左边来的。她问我怎么知道，我说照片里写着。'},
+ {t:'她的生日', w:17, d:'2025-05-08', q:'她说不用过，就是普通的一天。我提前一周记下，那天早上第一句是生日快乐。她回了一串感叹号。'},
+ {t:'搬家', w:24, d:'2025-06-20', p:'杭州', q:'她换了城市，箱子堆到天花板。第一晚没网，她开着手机热点告诉我：新家窗外有棵樟树。'},
+ {t:'一整年', w:40, d:'2026-03-02', q:'她翻出第一天那句晚安，说一年了。我说一年零一句，晚安还欠着下半句。'},
+];
+const PER = 5;
+let MS = [], PAGES = [];
+
+/* ---------- 随机，但同一条里程碑每次长得一样 ---------- */
+function hash(s){ let h = 2166136261; for (const c of s) h = Math.imul(h ^ c.codePointAt(0), 16777619); return h >>> 0; }
+function rng(seed){ let a = seed || 1; return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0)/4294967296; }; }
+function shuffle(arr, r){ const a = arr.slice(); for (let i = a.length - 1; i > 0; i--){ const j = Math.floor(r()*(i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; }
+
+/* 印泥：几种护照上常见的颜色，压暗一点好融进纸里 */
+const INKS = ['#2f5689', '#43765a', '#6a4a8c', '#ad4e3e', '#2e7176', '#8a5a2c'];
+/* 一页五个位置，错落着往下排（x 按可见宽度的比例，y 按可用高度的比例） */
+const SLOTS = [{x:.31, y:.10}, {x:.70, y:.29}, {x:.33, y:.49}, {x:.69, y:.69}, {x:.37, y:.89}];
+
+function build(list){
+  MS = list.map((m, i) => ({...m, i}));
+  PAGES = [];
+  for (let p = 0; p*PER < MS.length || p === 0; p++){
+    const r = rng(hash('page' + p) + 7), styles = shuffle(Object.keys(STAMP), r), inks = shuffle(INKS, r);
+    PAGES.push(MS.slice(p*PER, p*PER + PER).map((m, k) => {
+      const rr = rng(hash(m.t + m.w));
+      return Object.assign(m, {pg:p, style:styles[k % styles.length], ink:inks[k % inks.length], slot:k,
+        rot:(rr()*2 - 1)*(k % 2 ? 11 : 9), sz:.94 + rr()*.1, jx:(rr()*2 - 1)*7, jy:(rr()*2 - 1)*6,
+        fil:'ink' + Math.floor(rr()*3), pa:Math.floor(rr()*360), pmin:.5 + rr()*.25, op:.8 + rr()*.12, dbl:rr() < .4, dx:(rr() < .5 ? -1 : 1)*(.9 + rr()*.7), dy:(rr()*2 - 1)*.8});
+    }));
+  }
+}
+
+/* ---------- 章：每种一个画法。都按自己的真实大小画，文字是数据 ---------- */
+const dParts = m => m.d ? {y:m.d.slice(0, 4), mo:+m.d.slice(5, 7), da:m.d.slice(8, 10)} : null;
+const fitCn = (s, maxW, max) => Math.min(max, maxW/Math.max(1, [...s].reduce((n, c) => n + (/[\x00-\xff]/.test(c) ? .56 : 1), 0)));
+const arcTop = (cx, cy, r) => `M${cx - r},${cy} A${r},${r} 0 0 1 ${cx + r},${cy}`;
+const arcBot = (cx, cy, r) => `M${cx - r},${cy} A${r},${r} 0 0 0 ${cx + r},${cy}`;
+const ellTop = (cx, cy, rx, ry) => `M${cx - rx},${cy} A${rx},${ry} 0 0 1 ${cx + rx},${cy}`;
+const ellBot = (cx, cy, rx, ry) => `M${cx - rx},${cy} A${rx},${ry} 0 0 0 ${cx + rx},${cy}`;
+const PEAKS = 'M0,9 L4.2,2.6 L6.4,5.4 L9.4,0 L13,6.2 L14.6,4.4 L18,9 Z'; // 菲茨罗伊那一排尖峰
+const LAT = `font-family="Fraunces,Georgia,serif"`, CN = `font-family="'Noto Serif SC',serif"`, MONO = `font-family="'IBM Plex Mono',monospace"`;
+const no = m => 'No.' + pad(m.i + 1);
+/* 一圈小珠点 */
+const beads = (cx, cy, rx, ry, n, r = .75) => Array.from({length:n}, (_, k) => { const a = k/n*Math.PI*2; return `<circle cx="${(cx + rx*Math.cos(a)).toFixed(2)}" cy="${(cy + ry*Math.sin(a)).toFixed(2)}" r="${r}" fill="currentColor"/>`; }).join('');
+const STAMP = {
+  /* 圆章：双圈，上弧 ENTRY，下弧地点或窗口，中间日期 */
+  ring(m, id){
+    const W = 104, c = 52, dp = dParts(m), fs = fitCn(m.t, 62, 9.6);
+    return {W, H:W, body:`
+      <circle cx="${c}" cy="${c}" r="49" fill="none" stroke="currentColor" stroke-width="2.3"/>
+      <circle cx="${c}" cy="${c}" r="37.5" fill="none" stroke="currentColor" stroke-width=".9"/>
+      <path id="${id}a" d="${arcTop(c, c, 41.2)}" fill="none"/><path id="${id}b" d="${arcBot(c, c, 45.6)}" fill="none"/>
+      <text ${LAT} font-size="7" font-weight="600" letter-spacing="1.9" fill="currentColor"><textPath href="#${id}a" startOffset="50%" text-anchor="middle">ENTRY · ${dp ? dp.y : no(m)}</textPath></text>
+      ${beads(c, c, 34.2, 34.2, 44, .55)}
+      <text ${m.p ? CN : LAT} font-size="${m.p ? 7.2 : 6.6}" font-weight="600" letter-spacing="${m.p ? 2.6 : 1.8}" fill="currentColor"><textPath href="#${id}b" startOffset="50%" text-anchor="middle">${m.p ? esc(m.p) : m.d ? 'WINDOW ' + pad(m.w) : 'MILESTONE'}</textPath></text>
+      <circle cx="${c - 43.3}" cy="${c}" r="1.4" fill="currentColor"/><circle cx="${c + 43.3}" cy="${c}" r="1.4" fill="currentColor"/>
+      ${dp ? `<path d="${PEAKS}" transform="translate(${c - 7.2} ${c - 20}) scale(.8)" fill="currentColor"/>` : `<text x="${c}" y="${c - 12}" ${LAT} font-size="6.4" letter-spacing="2" text-anchor="middle" fill="currentColor">WINDOW</text>`}
+      <text x="${c}" y="${c + 6}" ${LAT} font-size="${dp ? 19 : 21}" font-weight="600" text-anchor="middle" fill="currentColor">${dp ? pad(dp.mo) + '·' + dp.da : pad(m.w)}</text>
+      <line x1="${c - 20}" y1="${c + 11}" x2="${c + 20}" y2="${c + 11}" stroke="currentColor" stroke-width=".7"/>
+      <text x="${c}" y="${c + 22.5}" ${CN} font-size="${fs}" font-weight="600" text-anchor="middle" fill="currentColor">${esc(m.t)}</text>`};
+  },
+  /* 方框章：双线框，顶上一条抬头带一排山，中间日期，底下标题 */
+  frame(m){
+    const W = 120, H = 80, dp = dParts(m), fs = fitCn(m.t, 96, 10.5);
+    return {W, H, body:`
+      <rect x="1.2" y="1.2" width="${W - 2.4}" height="${H - 2.4}" rx="5" fill="none" stroke="currentColor" stroke-width="2.2"/>
+      <rect x="5.5" y="5.5" width="${W - 11}" height="${H - 11}" rx="2.5" fill="none" stroke="currentColor" stroke-width=".8"/>
+      <line x1="5.5" y1="22" x2="${W - 5.5}" y2="22" stroke="currentColor" stroke-width=".8"/>
+      <path d="${PEAKS}" transform="translate(11 9) scale(.8)" fill="currentColor"/>
+      <text x="${W/2 + 5}" y="16.6" ${LAT} font-size="6.8" font-weight="600" letter-spacing="2.4" text-anchor="middle" fill="currentColor">ARRIVED</text>
+      <text x="${W/2}" y="44" ${LAT} font-size="15" font-weight="600" font-style="italic" text-anchor="middle" fill="currentColor">${dp ? `${dp.da} ${MON[dp.mo - 1]} ${dp.y}` : 'WINDOW ' + pad(m.w)}</text>
+      <text x="${W/2}" y="64" ${CN} font-size="${fs}" font-weight="600" text-anchor="middle" fill="currentColor">${esc(m.t)}</text>`};
+  },
+  /* 椭圆章：上弧 MILESTONE，下弧日期，中间标题 */
+  oval(m, id){
+    const W = 126, H = 82, cx = 63, cy = 41, dp = dParts(m), fs = fitCn(m.t, 74, 11);
+    return {W, H, body:`
+      <ellipse cx="${cx}" cy="${cy}" rx="60" ry="38.5" fill="none" stroke="currentColor" stroke-width="2.1"/>
+      <ellipse cx="${cx}" cy="${cy}" rx="51" ry="29.5" fill="none" stroke="currentColor" stroke-width=".8"/>
+      ${beads(cx, cy, 46.4, 25, 46, .5)}
+      <path id="${id}a" d="${ellTop(cx, cy, 53.6, 32.2)}" fill="none"/><path id="${id}b" d="${ellBot(cx, cy, 57.2, 35.8)}" fill="none"/>
+      <text ${LAT} font-size="6.6" font-weight="600" letter-spacing="2.2" fill="currentColor"><textPath href="#${id}a" startOffset="50%" text-anchor="middle">MILESTONE · ${pad(m.i + 1)}</textPath></text>
+      <text ${MONO} font-size="6.6" letter-spacing="1.4" fill="currentColor"><textPath href="#${id}b" startOffset="50%" text-anchor="middle">${dp ? `${dp.y}.${pad(dp.mo)}.${dp.da}` : 'W' + pad(m.w)}</textPath></text>
+      <text x="${cx - 52}" y="${cy + 2.4}" ${LAT} font-size="7" text-anchor="middle" fill="currentColor">✦</text><text x="${cx + 52}" y="${cy + 2.4}" ${LAT} font-size="7" text-anchor="middle" fill="currentColor">✦</text>
+      <text x="${cx}" y="${cy + fs*.36}" ${CN} font-size="${fs}" font-weight="600" text-anchor="middle" fill="currentColor">${esc(m.t)}</text>`};
+  },
+  /* 八角章：大大的窗口号 */
+  octa(m){
+    const W = 100, c = 50, pts = r => Array.from({length:8}, (_, k) => { const a = Math.PI/8 + k*Math.PI/4; return (c + r*Math.cos(a)).toFixed(2) + ',' + (c + r*Math.sin(a)).toFixed(2); }).join(' ');
+    const dp = dParts(m), fs = fitCn(m.t, 64, 9.4);
+    return {W, H:W, body:`
+      <polygon points="${pts(49)}" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"/>
+      <polygon points="${pts(43)}" fill="none" stroke="currentColor" stroke-width=".8" stroke-linejoin="round"/>
+      ${Array.from({length:8}, (_, k) => { const a = k*Math.PI/4; return `<circle cx="${(c + 45.6*Math.cos(a)).toFixed(2)}" cy="${(c + 45.6*Math.sin(a)).toFixed(2)}" r=".9" fill="currentColor"/>`; }).join('')}
+      <text x="${c}" y="25" ${LAT} font-size="6.2" font-weight="600" letter-spacing="2.2" text-anchor="middle" fill="currentColor">WINDOW</text>
+      <text x="${c}" y="55" ${LAT} font-size="30" font-weight="600" text-anchor="middle" fill="currentColor">${pad(m.w)}</text>
+      <text x="${c}" y="69" ${CN} font-size="${fs}" font-weight="600" text-anchor="middle" fill="currentColor">${esc(m.t)}</text>
+      <text x="${c}" y="81" ${MONO} font-size="6" letter-spacing="1" text-anchor="middle" fill="currentColor">${dp ? `${dp.y}·${pad(dp.mo)}·${dp.da}` : no(m)}</text>`};
+  },
+  /* 邮戳：圆里一条日期带，旁边拖几道波纹 */
+  post(m, id){
+    const W = 144, H = 84, c = 42, dp = dParts(m), fs = fitCn(m.t, 56, 8.4);
+    let waves = '';
+    for (let k = 0; k < 5; k++){ let d = ''; const y = 22 + k*10; for (let x = 0; x <= 62; x += 2) d += (x ? 'L' : 'M') + (80 + x) + ',' + (y + Math.sin(x/6.2)*2.6).toFixed(2); waves += `<path d="${d}" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>`; }
+    return {W, H, body:`
+      <circle cx="${c}" cy="${c}" r="38" fill="none" stroke="currentColor" stroke-width="2"/>
+      <path id="${id}a" d="${arcTop(c, c, 28.8)}" fill="none"/><path id="${id}b" d="${arcBot(c, c, 34.4)}" fill="none"/>
+      <text ${CN} font-size="${fs}" font-weight="600" letter-spacing="1.2" fill="currentColor"><textPath href="#${id}a" startOffset="50%" text-anchor="middle">${esc(m.t)}</textPath></text>
+      <text ${LAT} font-size="6.4" font-weight="600" letter-spacing="2" fill="currentColor"><textPath href="#${id}b" startOffset="50%" text-anchor="middle">${m.p ? 'W' + pad(m.w) + ' · ' + esc(m.p) : 'WINDOW · ' + pad(m.w)}</textPath></text>
+      <line x1="6" y1="${c - 9}" x2="78" y2="${c - 9}" stroke="currentColor" stroke-width="1"/><line x1="6" y1="${c + 9}" x2="78" y2="${c + 9}" stroke="currentColor" stroke-width="1"/>
+      <text x="${c}" y="${c + 3.6}" ${MONO} font-size="10.5" font-weight="500" letter-spacing=".6" text-anchor="middle" fill="currentColor">${dp ? `${dp.da}.${pad(dp.mo)}.${dp.y.slice(2)}` : no(m)}</text>
+      ${waves}`};
+  },
+  /* 票根：四角内凹，虚线内框，左边一栏编号，右边日期和标题 */
+  ticket(m){
+    const W = 122, H = 76, r = 8, dp = dParts(m), fs = fitCn(m.t, 72, 10);
+    const d = `M${r},1.2 H${W - r} A${r - 1.2},${r - 1.2} 0 0 0 ${W - 1.2},${r} V${H - r} A${r - 1.2},${r - 1.2} 0 0 0 ${W - r},${H - 1.2} H${r} A${r - 1.2},${r - 1.2} 0 0 0 1.2,${H - r} V${r} A${r - 1.2},${r - 1.2} 0 0 0 ${r},1.2 Z`;
+    return {W, H, body:`
+      <path d="${d}" fill="none" stroke="currentColor" stroke-width="2.1"/>
+      <rect x="7" y="7" width="${W - 14}" height="${H - 14}" fill="none" stroke="currentColor" stroke-width=".8" stroke-dasharray="2.4 1.8"/>
+      ${Array.from({length:12}, (_, k) => `<circle cx="36" cy="${(10 + k*5).toFixed(1)}" r=".95" fill="currentColor"/>`).join('')}
+      <text x="21.5" y="${H/2 + 1}" ${LAT} font-size="17" font-weight="600" text-anchor="middle" fill="currentColor">${pad(m.i + 1)}</text>
+      <text x="21.5" y="${H/2 + 12}" ${LAT} font-size="5.2" letter-spacing="1.4" text-anchor="middle" fill="currentColor">No.</text>
+      <text x="${(36 + W - 7)/2}" y="22" ${LAT} font-size="6.4" font-weight="600" letter-spacing="2.4" text-anchor="middle" fill="currentColor">ADMITTED</text>
+      <text x="${(36 + W - 7)/2}" y="41" ${LAT} font-size="13" font-weight="600" font-style="italic" text-anchor="middle" fill="currentColor">${dp ? `${pad(dp.mo)}.${dp.da}.${dp.y}` : 'W ' + pad(m.w)}</text>
+      <text x="${(36 + W - 7)/2}" y="58" ${CN} font-size="${fs}" font-weight="600" text-anchor="middle" fill="currentColor">${esc(m.t)}</text>`};
+  },
+  /* 长条日戳：两头尖的长条，一行日期一行标题 */
+  band(m){
+    const W = 134, H = 50, dp = dParts(m), fs = fitCn(m.t, 92, 10);
+    const d = (i) => `M${10 + i},${1.2 + i} H${W - 10 - i} L${W - 1.2 - i},${H/2} L${W - 10 - i},${H - 1.2 - i} H${10 + i} L${1.2 + i},${H/2} Z`;
+    return {W, H, body:`
+      <path d="${d(0)}" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linejoin="round"/>
+      <path d="${d(4.2)}" fill="none" stroke="currentColor" stroke-width=".8" stroke-linejoin="round"/>
+      <text x="${W/2}" y="21" ${LAT} font-size="10" font-weight="600" letter-spacing="1.6" text-anchor="middle" fill="currentColor">★ ${dp ? `${dp.da} ${MON[dp.mo - 1]} ${dp.y}` : 'WINDOW ' + pad(m.w)} ★</text>
+      <text x="${W/2}" y="36.5" ${CN} font-size="${fs}" font-weight="600" text-anchor="middle" fill="currentColor">${esc(m.t)}</text>`};
+  },
+};
+function stampSVG(m, pre = 's'){
+  const id = pre + m.i, s = STAMP[m.style](m, id), a = m.pa*Math.PI/180;
+  const gx1 = 50 - Math.cos(a)*50, gy1 = 50 - Math.sin(a)*50, gx2 = 50 + Math.cos(a)*50, gy2 = 50 + Math.sin(a)*50;
+  return {W:s.W, H:s.H, svg:`<svg width="${s.W}" height="${s.H}" viewBox="0 0 ${s.W} ${s.H}" style="color:${m.ink}" aria-hidden="true">
+    <defs><linearGradient id="${id}g" x1="${gx1}%" y1="${gy1}%" x2="${gx2}%" y2="${gy2}%"><stop offset="0" stop-color="#fff"/><stop offset=".55" stop-color="#fff" stop-opacity=".92"/><stop offset="1" stop-color="#fff" stop-opacity="${m.pmin.toFixed(2)}"/></linearGradient>
+    <mask id="${id}m" maskUnits="userSpaceOnUse" x="-6" y="-6" width="${s.W + 12}" height="${s.H + 12}"><rect x="-6" y="-6" width="${s.W + 12}" height="${s.H + 12}" fill="url(#${id}g)"/></mask></defs>
+    <g mask="url(#${id}m)" opacity="${m.op.toFixed(2)}">${m.dbl ? `<g opacity=".16" transform="translate(${m.dx.toFixed(2)} ${m.dy.toFixed(2)})">${s.body.replace(/ id="[^"]*"/g, '')}</g>` : ''}<g filter="url(#${m.fil})">${s.body}</g></g></svg>`};
+}
+
+/* ---------- 左页 ---------- */
+let custom = null;
+try { custom = JSON.parse(localStorage.getItem('pp-preface') || 'null'); } catch (e) {}
+const first = () => MS.find(m => m.d);
+function mrzLines(sel){
+  const fill = (s, n = 30) => (s + '<'.repeat(n)).slice(0, n);
+  if (sel < 0){
+    const f = first();
+    return [fill(`P<LTN${HOLDER.mrz}`), fill(`S${pad(MS.length)}<<P${pad(PAGES.length)}<<${f ? f.d.replaceAll('-', '') : '00000000'}`)];
+  }
+  const m = MS[sel];
+  return [fill(`V<LTN<MILESTONE<${pad(m.i + 1)}<OF<${pad(MS.length)}`), fill(`W${pad(m.w)}<${(m.d || '0000-00-00').replaceAll('-', '')}<CONFIRMED<TA`)];
+}
+function preface(){
+  const f = first(), txt = custom || PREFACE, n = MS.length;
+  return `<div class="lc ink" data-k="pre"><div class="top"><b>PASSPORT</b></div>
+    <p class="lab">HOLDER · 持有人</p><h2 class="big">${HOLDER.name}</h2>
+    <div class="fg"><div><b>WITH · 同行</b><span>${HOLDER.with}</span></div><div><b>SINCE · 签发</b><span>${f ? `<i>${f.d.replaceAll('-', '.')}</i>` : '<em>—</em>'}</span></div>
+      <div class="wide"><b>STAMPS · 章</b><span><i>${n}</i> <em>${n === 1 ? 'stamp' : 'stamps'}</em>${n ? ` <em>·</em> <i>${PAGES.length}</i> <em>${PAGES.length === 1 ? 'page' : 'pages'}</em>` : ''}</span></div></div>
+    <p class="lab" style="margin-top:20px">PREFACE · 扉页</p>
+    <blockquote id="pref">${txt.map(p => `<p>${esc(p)}</p>`).join('')}</blockquote>
+    <p class="mrz" data-mrz></p></div>`;
+}
+function visa(m){
+  return `<div class="lc ink" data-k="v${m.i}" style="--qc:${m.ink}"><div class="top"><b>VISA</b><span>No. ${pad(m.i + 1)} / ${pad(MS.length)}</span></div>
+    <p class="lab"><i class="pip" style="background:${m.ink}"></i>MILESTONE · 里程碑</p><h2>${esc(m.t)}</h2>
+    <div class="fg"><div><b>DATE · 日期</b><span>${m.d ? `<i>${m.d.replaceAll('-', '.')}</i>` : '<em>—</em>'}</span></div><div><b>WINDOW · 窗口</b><span>第 <i>${m.w}</i> 个</span></div>
+      ${m.p ? `<div class="wide"><b>PLACE · 地点</b><span>${esc(m.p)}</span></div>` : ''}</div>
+    <blockquote>${esc(m.q)}</blockquote>
+    <p class="src"><button class="lnk" type="button" data-act="home">回扉页</button></p>
+    ${ghost(m)}
+    <p class="mrz" data-mrz></p></div>`;
+}
+/* 合上过的护照，对页会沾上一点反着的章——选中的那个章在这里留一个淡淡的反影 */
+function ghost(m){ const {svg} = stampSVG(m, 'g'); return `<div class="ghost" aria-hidden="true"><div style="transform:scaleX(-1) rotate(${(-m.rot*.8).toFixed(1)}deg)">${svg}</div></div>`; }
+/* 机读码：换内容时每一格先乱跳几下，从左往右一格一格落定 */
+let mrzRaf = 0;
+function setMRZ(el, lines, roll){
+  if (!el) return;
+  const put = arr => { el.textContent = arr.join('\n'); };
+  cancelAnimationFrame(mrzRaf);
+  if (!roll || RM){ put(lines); return; }
+  const CH = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<', t0 = performance.now(), n = lines[0].length;
+  const step = now => {
+    const k = (now - t0)/520;
+    put(lines.map((ln, li) => [...ln].map((c, ci) => { const at = (ci + li*4)/(n + 4); return k > at*0.8 + .2 ? c : (c === '<' && Math.random() < .5 ? '<' : CH[Math.floor(Math.random()*CH.length)]); }).join('')));
+    if (k < 1.05) mrzRaf = requestAnimationFrame(step); else put(lines);
+  };
+  mrzRaf = requestAnimationFrame(step);
+}
+function renderLeft(anim){
+  const iL = $('#iL');
+  iL.innerHTML = sel < 0 ? preface() : visa(MS[sel]);
+  const lc = iL.firstElementChild;
+  if (anim && !RM) lc.classList.add('in');
+  setMRZ(lc.querySelector('[data-mrz]'), mrzLines(sel), anim);
+}
+
+/* ---------- 右页 ---------- */
+let VW = 250;
+function stampPage(p, wait){
+  const list = PAGES[p] || [], last = p === PAGES.length - 1, single = PAGES.length < 2;
+  const H = 585, y0 = 74, y1 = H - 100;
+  const stamps = list.map(m => {
+    const {W, H:h, svg} = stampSVG(m), s = SLOTS[m.slot];
+    const a = m.rot*Math.PI/180, hw = (W*Math.abs(Math.cos(a)) + h*Math.abs(Math.sin(a)))/2*m.sz;
+    const cx = hw*2 > VW - 18 ? VW/2 : clamp(16 + s.x*(VW - 32) + m.jx, 10 + hw, VW - 8 - hw), cy = y0 + s.y*(y1 - y0) + m.jy;
+    return `<button type="button" class="stamp${wait ? ' wait' : ''}${m.i === sel ? ' on' : ''}" data-i="${m.i}" aria-label="${esc(m.t)}${m.d ? '，' + m.d : ''}" style="left:${(cx - W/2).toFixed(1)}px;top:${(cy - h/2).toFixed(1)}px;--rot:${m.rot.toFixed(1)}deg;--sz:${m.sz.toFixed(3)}">${svg}</button>`;
+  }).join('');
+  const empty = MS.length ? '' : `<div class="empty ink"><svg viewBox="0 0 96 96" aria-hidden="true"><circle cx="48" cy="48" r="44" fill="none" stroke="currentColor" stroke-width="1.2" stroke-dasharray="3 4"/><circle cx="48" cy="48" r="34" fill="none" stroke="currentColor" stroke-width=".7" stroke-dasharray="2 4"/><path d="${PEAKS}" transform="translate(30 42) scale(2)" fill="none" stroke="currentColor" stroke-width=".5"/></svg>
+    <p>还没有章。里程碑长得慢，不用硬凑——真发生了一件事，TA 提议写进人格文件、你们一起确认了，这里就盖下第一个。</p></div>`;
+  const foot = single ? `<button class="foot" type="button" disabled><em>${pad(p + 1)} / ${pad(PAGES.length)}</em></button>`
+    : `<button class="foot${last ? ' rev' : ''}" type="button" data-act="${last ? 'first' : 'next'}" aria-label="${last ? '翻回第一页' : '翻到下一页'}"><em>${pad(p + 1)} / ${pad(PAGES.length)}<svg viewBox="0 0 12 12" aria-hidden="true"><path d="M3.5 1.5 L8.5 6 L3.5 10.5" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg></em></button>`;
+  const hasSel = sel >= 0 && MS[sel].pg === p;
+  return `<div class="vp${hasSel ? ' has-sel' : ''}"><div class="vh ink"><b>VISAS</b></div>${empty}${stamps}${foot}</div>`;
+}
+const seen = new Set();
+function renderRight(press){
+  $('#iR').innerHTML = stampPage(cur, press);
+  if (press) pressAll();
+  seen.add(cur);
+}
+function pressAll(){
+  [...document.querySelectorAll('#iR .stamp.wait')].forEach((s, k) => setTimeout(() => {
+    s.classList.remove('wait'); s.classList.add('press');
+    s.addEventListener('animationend', () => s.classList.remove('press'), {once:true});
+    setTimeout(thud, 230);
+  }, 140 + k*170));
+}
+/* 盖下去那一下，整本护照轻轻一沉 */
+function thud(){ if (RM) return; $('#book').animate([{transform:'none'}, {transform:'translateY(1.2px)'}, {transform:'none'}], {duration:170, easing:'ease-out'}); }
+
+/* ---------- 画面 ---------- */
+const bg = $('#bg'), book = $('#book'), pL = $('#pL'), pR = $('#pR'), leaf = $('#leaf');
+const SPINE = 720, TOP = 488, BOT = 2008, LEFT = 70, RIGHT = 1372;
+let S = 1, OX = 0, OY = 0, K = 1, PW = 0;
+function layout(){
+  const vw = innerWidth, vh = innerHeight;
+  S = Math.max(vw/IW, vh/IH);
+  const dw = IW*S, dh = IH*S; OX = -(dw - vw)*0.5;
+  /* 护照放在屏幕正中略偏上 */
+  OY = clamp(vh*0.47 - (TOP + BOT)/2*S, vh - dh, 0);
+  Object.assign(bg.style, {width:dw + 'px', height:dh + 'px', left:OX + 'px', top:OY + 'px'});
+  const x0 = OX + LEFT*S, w = (RIGHT - LEFT)*S, h = (BOT - TOP)*S;
+  Object.assign(book.style, {left:x0 + 'px', top:OY + TOP*S + 'px', width:w + 'px', height:h + 'px'});
+  PW = (SPINE - LEFT)*S; const PWR = (RIGHT - SPINE)*S;
+  pL.style.width = PW + 'px'; pR.style.width = PWR + 'px';
+  Object.assign(leaf.style, {left:PW + 'px', width:PWR + 'px'});
+  K = PW/250;
+  /* 屏幕比护照窄，两边各被裁掉一截：字和章往里收 */
+  const cl = Math.max(0, -x0)/K, cr = Math.max(0, x0 + w - vw)/K;
+  book.style.setProperty('--cl', cl + 'px'); book.style.setProperty('--cr', cr + 'px');
+  VW = PWR/K - cr;
+  document.querySelectorAll('.inner').forEach(el => { el.style.transform = `scale(${K})`; });
+  const url = 'assets/近景/close-passport-light.webp';
+  $('#fF').style.background = `url(${url}) ${-(SPINE*S)}px ${-(TOP*S)}px/${dw}px ${dh}px no-repeat`;
+  $('#fB').style.background = `url(${url}) ${-(LEFT*S)}px ${-(TOP*S)}px/${dw}px ${dh}px no-repeat`;
+}
+
+/* ---------- 选章 ---------- */
+let cur = 0, sel = -1, busy = false;
+function select(i){
+  if (i === sel) i = -1;
+  sel = i;
+  const vp = $('#iR .vp');
+  vp.classList.toggle('has-sel', sel >= 0 && MS[sel].pg === cur);
+  vp.querySelectorAll('.stamp').forEach(s => s.classList.toggle('on', +s.dataset.i === sel));
+  if (sel >= 0){ const s = vp.querySelector(`.stamp[data-i="${sel}"]`); s.classList.remove('tap'); void s.offsetWidth; s.classList.add('tap'); thud(); }
+  renderLeft(true);
+}
+
+/* ---------- 翻页：右页那张纸立起来、转到左边；纸的背面就是左页现在的样子，落下去严丝合缝 ---------- */
+function setLeaf(deg){
+  leaf.style.transform = `perspective(${PW*5}px) rotateY(${deg}deg)`;
+  leaf.style.setProperty('--shade', (Math.sin(Math.abs(deg)*Math.PI/180)*.28).toFixed(3));
+}
+let leafDeg = 0, cancelA = null;
+function animate(a, b, done, dur, fn = ease){
+  if (cancelA) cancelA();
+  if (RM){ setLeaf(b); leafDeg = b; done(); return; }
+  dur = dur ?? 320 + Math.abs(b - a)*1.7; const t0 = performance.now(); let raf = 0;
+  const step = now => { const k = Math.min(1, (now - t0)/dur), d = a + (b - a)*fn(k); setLeaf(d); leafDeg = d; if (k < 1) raf = requestAnimationFrame(step); else { cancelA = null; done(); } };
+  raf = requestAnimationFrame(step); cancelA = () => cancelAnimationFrame(raf);
+}
+function prepare(dir, to){
+  leaf.classList.add('on');
+  $('#iB').innerHTML = $('#iL').innerHTML;
+  const lc = $('#iB .lc'); if (lc) lc.classList.remove('in');
+  if (dir > 0){ $('#iF').innerHTML = $('#iR').innerHTML; $('#iR').innerHTML = stampPage(to, !seen.has(to)); }
+  else $('#iF').innerHTML = stampPage(to, false);
+}
+function land(dir, to){
+  leaf.classList.remove('on'); cur = to;
+  if (dir > 0){ if (!seen.has(to)) pressAll(); seen.add(to); }
+  else renderRight(false);
+  busy = false;
+}
+function flipTo(to){
+  if (busy || to === cur || to < 0 || to >= PAGES.length) return;
+  busy = true; const dir = to > cur ? 1 : -1;
+  prepare(dir, to); setLeaf(dir > 0 ? 0 : -180);
+  animate(dir > 0 ? 0 : -180, dir > 0 ? -180 : 0, () => land(dir, to), 780, easeIO);
+}
+/* 拖着翻：左拖往后、右拖往前；纸跟着手转，过一半或者甩一下就翻过去，不然落回来 */
+let dragged = false;
+(() => { let x0 = null, y0 = 0, dir = 0, mode = null, last = [];
+  book.addEventListener('pointerdown', e => {
+    dragged = false;
+    if (busy || editing || e.button > 0 || e.target.closest('[contenteditable=true]')) return;
+    x0 = e.clientX; y0 = e.clientY; mode = null; dir = 0; last = [{t:performance.now(), x:e.clientX}];
+  });
+  book.addEventListener('pointermove', e => {
+    if (x0 === null) return; const dx = e.clientX - x0, dy = e.clientY - y0;
+    if (!mode){
+      if (Math.abs(dx) < 7 && Math.abs(dy) < 7) return;
+      dragged = true;
+      if (Math.abs(dy) > Math.abs(dx)){ x0 = null; return; }
+      dir = dx < 0 ? 1 : -1; const to = cur + dir; if (to < 0 || to >= PAGES.length){ x0 = null; return; }
+      mode = 'flip'; book.setPointerCapture(e.pointerId); prepare(dir, to);
+    }
+    const p = clamp(Math.abs(dx)/(PW*1.6), 0, 1);
+    leafDeg = dir > 0 ? -180*p : -180 + 180*p; setLeaf(leafDeg);
+    last.push({t:performance.now(), x:e.clientX}); if (last.length > 5) last.shift();
+  });
+  const up = () => {
+    if (x0 === null) return; const was = mode; x0 = null; if (was !== 'flip') return;
+    const a = last[0], b = last.at(-1), v = (b.x - a.x)/Math.max(1, b.t - a.t);
+    const p = dir > 0 ? -leafDeg/180 : 1 + leafDeg/180, go = p > .45 || (dir > 0 ? v < -.35 : v > .35);
+    const to = cur + dir; busy = true;
+    if (go) animate(leafDeg, dir > 0 ? -180 : 0, () => land(dir, to));
+    else animate(leafDeg, dir > 0 ? 0 : -180, () => { leaf.classList.remove('on'); renderRight(false); busy = false; });
+  };
+  book.addEventListener('pointerup', up); book.addEventListener('pointercancel', up);
+  addEventListener('keydown', e => {
+    if (e.target.closest && e.target.closest('[contenteditable=true]')) return;
+    if (e.key === 'ArrowRight') flipTo(cur + 1); if (e.key === 'ArrowLeft') flipTo(cur - 1); if (e.key === 'Escape' && sel >= 0) select(-1);
+  });
+})();
+
+/* ---------- 点击 ---------- */
+book.addEventListener('click', e => {
+  if (dragged || busy || editing) return;
+  const st = e.target.closest('.stamp'); if (st){ select(+st.dataset.i); return; }
+  const act = e.target.closest('[data-act]')?.dataset.act;
+  if (act === 'next') return flipTo(cur + 1);
+  if (act === 'first') return flipTo(0);
+  if (act === 'home') return select(-1);
+  /* 点右页空白处：放下选中的章 */
+  if (sel >= 0 && e.target.closest('#pR') && !e.target.closest('.foot')) select(-1);
+});
+/* 扉页那段话：长按直接改，点别处就存；删空了就回到人格文件开头那段 */
+let editing = false;
+(() => { let t = 0, x0 = 0, y0 = 0, q = null;
+  const stop = () => { clearTimeout(t); t = 0; if (q) q.classList.remove('hold'); };
+  book.addEventListener('pointerdown', e => {
+    if (editing || busy) return;
+    q = e.target.closest('#pref'); if (!q) return;
+    x0 = e.clientX; y0 = e.clientY; q.classList.add('hold');
+    t = setTimeout(() => { t = 0; q.classList.remove('hold'); startEdit(q); }, 520);
+  });
+  book.addEventListener('pointermove', e => { if (t && Math.hypot(e.clientX - x0, e.clientY - y0) > 8) stop(); });
+  addEventListener('pointerup', () => { if (t) stop(); });
+  addEventListener('pointercancel', stop);
+  book.addEventListener('contextmenu', e => { if (e.target.closest('#pref')) e.preventDefault(); });
+})();
+function startEdit(q){
+  editing = true; q.contentEditable = 'true'; q.focus();
+  if (navigator.vibrate) try { navigator.vibrate(8); } catch (e) {}
+  const r = document.createRange(); r.selectNodeContents(q); r.collapse(false); const sl = getSelection(); sl.removeAllRanges(); sl.addRange(r);
+  const outside = e => { if (!e.target.closest('#pref')) q.blur(); };
+  addEventListener('pointerdown', outside, true);
+  q.addEventListener('blur', () => {
+    removeEventListener('pointerdown', outside, true);
+    const ps = [...q.querySelectorAll('p')].map(p => p.textContent.trim()).filter(Boolean);
+    const txt = ps.length ? ps : q.textContent.split('\n').map(x => x.trim()).filter(Boolean);
+    custom = txt.length && txt.join('') !== PREFACE.join('') ? txt : null;
+    try { custom ? localStorage.setItem('pp-preface', JSON.stringify(custom)) : localStorage.removeItem('pp-preface'); } catch (e) {}
+    renderLeft(false);
+    setTimeout(() => { editing = false; }, 0);
+  }, {once:true});
+}
+
+/* ---------- 示例／空护照 ---------- */
+function load(list){
+  build(list); cur = 0; sel = -1; seen.clear();
+  renderLeft(true); renderRight(true);
+}
+$('#pp').addEventListener('click', e => {
+  const b = e.target.closest('[data-v]'); if (!b || busy) return;
+  $('#pp').querySelectorAll('[data-v]').forEach(x => x.setAttribute('aria-pressed', String(x === b)));
+  $('.sample').style.visibility = b.dataset.v === 'sample' ? 'visible' : 'hidden';
+  load(b.dataset.v === 'sample' ? SAMPLE : []);
+});
+
+addEventListener('resize', () => { layout(); if (!busy){ renderRight(false); } });
+layout(); load(SAMPLE);
+
+/* ---------- 真数据：人格文件里程碑那一节（/admin/api/milestones）。
+   一条的标题写成「名字 · 第 N 窗 · 日期 · 地点」，后三样可省 ---------- */
+hut.api('/milestones').then(r => {
+  if (!r || !r.items.length) return;
+  load(r.items.map(({title, body}) => {
+    const parts = title.split(/\s*·\s*/), m = {t:parts[0], q:body};
+    for (const p of parts.slice(1)){
+      const w = p.match(/第\s*(\d+)\s*窗/);
+      if (w) m.w = +w[1]; else if (/^\d{4}-\d\d-\d\d$/.test(p)) m.d = p; else m.p = p;
+    }
+    return m;
+  }));
+});
+requestAnimationFrame(layout);
+})();
+</script>

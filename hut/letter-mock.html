@@ -1,0 +1,347 @@
+<!doctype html>
+<html lang="zh">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>山屋 · 火漆信</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,600;1,9..144,400;1,9..144,600&family=Noto+Serif+SC:wght@400;600&display=swap">
+<style>
+/* 布局：没有内页。桌上摊着一张三折过的信纸，字直接写在纸上——这是上一个窗口收尾时写给下一个窗口的信（会话线索 thread）。
+   上面那摞火漆信是更早的信；点它，信封在桌上摊成一把扇子，挑一封，Clawd 跑过去顶着它搬到信纸上，火漆一掰，字一行行洇出来。
+   窗口断掉、系统替它补写的那种（自动收尾，没确认过），信封上没有火漆，只贴一条纸胶带。 */
+:root{
+  --paper:#FBF8F2;
+  --ink:#3A2F28;
+  --ink-2:#76695F;
+  --ink-3:#A79A8F;
+  --rule:#ECE4D8;
+  --brick:#A4493E;
+  --glacier:#5D84A2;
+  --gold:#8B6A31;
+  --gold-2:#B08A45;
+  --env:#F8F5EF;
+  --env-2:#EEE9DF;
+  --letter-ink:#2e2925;
+  --f-latin:"Fraunces","Georgia",serif;
+  --f-cn:"Noto Serif SC","Songti SC","STSong",serif;
+  --ease:cubic-bezier(.22,.61,.36,1);
+  color-scheme:light;
+}
+html,body{height:100%}
+body{background:#5b3b27;color:var(--ink);font-family:var(--f-cn);overflow:hidden;-webkit-font-smoothing:antialiased}
+button{-webkit-tap-highlight-color:transparent;font:inherit;color:inherit}
+.scene{position:fixed;inset:0;overflow:hidden}
+.bg{position:absolute;display:block;max-width:none;user-select:none;-webkit-user-drag:none}
+
+/* 信纸上的字：压进纸里，一行行洇出来 */
+.letter{position:absolute;z-index:2;color:var(--letter-ink);mix-blend-mode:multiply;transform-origin:0 0;display:flex;flex-direction:column}
+.letter .ln{opacity:0}
+.letter.show .ln{animation:ink .9s var(--ease) forwards;animation-delay:calc(var(--k)*90ms)}
+.letter.gone{transition:opacity .3s;opacity:0}
+.letter.measure{display:block;visibility:hidden}
+.letter.measure .ln{opacity:1;animation:none}
+.lt-cont{font:italic 400 11px/1 var(--f-latin);color:#a0968d;margin-bottom:6px}
+.pager{position:absolute;left:0;bottom:2px;font:italic 400 11px/1 var(--f-latin);color:#8d8279}
+.letter.dense .lt-t{margin-top:4px;line-height:1.62}
+.pager i{font:400 11px/1 var(--f-cn);font-style:normal;color:var(--gold)}
+@keyframes ink{0%{opacity:0;filter:blur(1.6px)}60%{opacity:.85;filter:blur(.2px)}100%{opacity:1;filter:none}}
+.lt-head{display:flex;justify-content:space-between;align-items:baseline;padding-bottom:8px;border-bottom:1px solid rgba(46,41,37,.16)}
+.lt-head b{font:600 7.5px/1 var(--f-latin);letter-spacing:.3em;color:var(--glacier)}
+.lt-head span{font:italic 400 12px/1 var(--f-latin);color:#7d736b}
+.lt-to{margin-top:18px;font:600 20px/1.35 var(--f-cn);letter-spacing:.02em}
+.lt-lab{margin-top:20px;font:600 7.5px/1 var(--f-latin);letter-spacing:.3em;color:#a0968d}
+.lt-lab i{font:400 11px/1 var(--f-cn);letter-spacing:.08em;color:#a0968d;font-style:normal;margin-left:6px}
+.lt-t{margin-top:7px;padding-left:14px;position:relative;font:400 14px/1.75 var(--f-cn)}
+.lt-t::before{content:"";position:absolute;left:0;top:.72em;width:5px;height:5px;border-radius:50%;background:var(--brick);opacity:.75}
+.lt-s{margin-top:7px;font:400 14.5px/1.85 var(--f-cn)}
+.lt-auto{margin-top:16px;align-self:flex-start;display:flex;align-items:center;gap:8px;font:400 11.5px/1.5 var(--f-cn);color:#8a5a4a}
+.lt-auto b{font:600 8px/1 var(--f-latin);letter-spacing:.24em;color:var(--brick);border:1px solid rgba(164,73,62,.45);padding:4px 6px 3px;border-radius:2px;transform:rotate(-3deg)}
+.lt-sign{margin-top:18px;align-self:flex-end;text-align:right}
+.letter:not(.multi) .lt-sign{margin-top:auto}
+.lt-sign b{display:block;font:600 14px/1.4 var(--f-cn)}
+.lt-sign span{display:block;margin-top:3px;font:italic 400 11.5px/1.3 var(--f-latin);color:#7d736b}
+
+/* 那摞旧信：一个小纸签写着几封；整摞能点 */
+.pile{position:absolute;z-index:3;border:0;background:transparent;padding:0;cursor:pointer}
+.pile:focus-visible{outline:1.5px dashed var(--gold-2);outline-offset:4px}
+.tag{position:absolute;z-index:4;pointer-events:none;padding:5px 9px 5px 13px;background:#f3ead8;border-radius:1px 3px 3px 1px;box-shadow:0 1px 2px rgba(40,25,10,.25),0 3px 8px rgba(40,25,10,.15);transform:rotate(7deg);font:400 11px/1 var(--f-cn);color:#5b4636;white-space:nowrap}
+.tag::before{content:"";position:absolute;left:4px;top:50%;width:4px;height:4px;margin-top:-2px;border-radius:50%;background:#5b3b27;opacity:.6}
+.tag::after{content:"";position:absolute;left:5px;top:50%;width:26px;height:1px;background:#a88a5c;transform-origin:0 0;transform:rotate(-150deg)}
+.tag i{font:italic 600 14px/1 var(--f-latin);color:var(--brick);margin-right:3px}
+
+/* 摊开的信封 */
+.veil{position:fixed;inset:0;z-index:5;background:rgba(40,25,12,0);pointer-events:none;transition:background .35s var(--ease)}
+.veil.on{background:rgba(40,25,12,.28);pointer-events:auto}
+.env{position:absolute;z-index:6;width:124px;height:78px;margin:-39px 0 0 -62px;border:0;padding:0;cursor:pointer;background:transparent;transform-origin:50% 50%}
+.env .body{position:absolute;inset:0;border-radius:2.5px;background:linear-gradient(160deg,var(--env),var(--env-2));box-shadow:0 1px 1.5px rgba(40,25,10,.25),0 8px 16px rgba(40,25,10,.25)}
+.env svg.flap{position:absolute;inset:0;width:100%;height:100%;overflow:visible}
+.env .to{position:absolute;left:12px;bottom:10px;text-align:left;color:#4d3d31}
+.env .to b{display:block;font:600 11px/1.3 var(--f-cn)}
+.env .to span{font:italic 400 10px/1 var(--f-latin);color:#8a7766}
+.env .seal{position:absolute;left:50%;top:22px;width:30px;height:30px;margin-left:-15px;background:url(assets/近景/seal-whole.webp) center/contain no-repeat;filter:drop-shadow(0 1.5px 1px rgba(60,20,10,.35))}
+.env .seal.broke{background-image:url(assets/近景/seal-broken.webp)}
+.env .tape{position:absolute;left:50%;top:18px;width:46px;height:14px;margin-left:-23px;background:rgba(236,228,206,.86);box-shadow:0 0 0 .5px rgba(120,100,70,.25);transform:rotate(-4deg);font:600 6.5px/14px var(--f-latin);letter-spacing:.24em;color:#8a5a4a;text-align:center}
+.env.cur .body{box-shadow:0 0 0 1.5px var(--gold-2),0 8px 16px rgba(40,25,10,.25)}
+.env:focus-visible .body{box-shadow:0 0 0 2px var(--glacier),0 8px 16px rgba(40,25,10,.25)}
+.carry{pointer-events:none;z-index:8}
+
+/* Clawd：住在信纸左下角，帮忙送信 */
+.pilot{position:absolute;z-index:9;width:48px;height:32px;margin:-30px 0 0 -24px;cursor:pointer;touch-action:none;scale:1.35;transform-origin:50% 90%}
+.clawd{position:absolute;left:11px;top:8px;width:26px;height:20px;overflow:visible;transform-origin:50% 80%}
+.shade{position:absolute;left:50%;top:24px;width:20px;height:3.5px;margin-left:-10px;border-radius:50%;background:rgba(58,47,40,.18)}
+.clawd .lg{transform-box:fill-box;transform-origin:50% 0}
+.clawd .eyes{transform-box:fill-box;transform-origin:50% 50%;transform:translateX(var(--ex,0px)) scaleY(var(--ey,1));transition:transform .12s}
+.pilot.r{--ex:1px}
+.pilot.l{--ex:-1px}
+.pilot.blink{--ey:.15}
+.pilot:not(.walk) .eyes{animation:idle 4.6s steps(1,end) infinite}
+@keyframes idle{95%{transform:translateX(var(--ex,0px)) scaleY(.15)}}
+.pilot.walk .clawd{animation:bob .24s steps(2,end) infinite}
+@keyframes bob{50%{transform:translateY(-1px)}}
+.pilot.walk .lg.a{animation:step .24s steps(1,end) infinite}
+.pilot.walk .lg.b{animation:step .24s steps(1,end) -.12s infinite}
+@keyframes step{50%{transform:scaleY(.5)}}
+.pilot.hop .clawd{animation:hop .46s var(--ease)}
+@keyframes hop{0%{transform:none}35%{transform:translateY(-8px)}60%{transform:translateY(0) scale(1.12,.86)}100%{transform:none}}
+.pilot .arms{transform-box:fill-box;transform-origin:50% 100%}
+.pilot.hold .arms{transform:translateY(-2px) scaleY(1.6)}
+
+/* 返回、示例 */
+.back{position:fixed;left:6px;top:calc(env(safe-area-inset-top,0px) + 6px);z-index:10;width:48px;height:48px;display:grid;place-items:center;background:transparent;border:0;padding:0;cursor:pointer}
+.back svg{width:26px;height:26px;filter:drop-shadow(0 0 2.5px rgba(255,246,228,.75)) drop-shadow(0 1px 1px rgba(30,18,8,.35));transition:transform .2s var(--ease)}
+.back:active svg{transform:translateX(-2px)}
+.sample{position:fixed;right:16px;bottom:calc(env(safe-area-inset-bottom,0px) + 16px);z-index:10;font:italic 400 11px/1 var(--f-latin);letter-spacing:.1em;color:rgba(255,250,240,.8);text-shadow:0 1px 4px rgba(0,0,0,.4)}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}.letter .ln{opacity:1}}
+</style>
+
+<div class="scene" id="scene">
+  <img class="bg" id="bg" alt="" src="assets/近景/close-letter-light.webp">
+  <div class="letter" id="letter" aria-live="polite"></div>
+  <button class="pile" id="pile" type="button" aria-label="更早的信，点开挑一封" aria-expanded="false"></button>
+  <span class="tag" id="tag"></span>
+  <div class="pilot" id="pilot" role="img" aria-label="Clawd">
+    <i class="shade"></i>
+    <svg class="clawd" viewBox="0 0 13 10" shape-rendering="crispEdges" aria-hidden="true">
+      <rect x="1" y="1" width="11" height="5" fill="#D9805F"/>
+      <g class="arms" fill="#D9805F"><rect x="0" y="3" width="1" height="2"/><rect x="12" y="3" width="1" height="2"/></g>
+      <g class="eyes" fill="#2A2320"><rect x="3" y="2" width="1" height="2"/><rect x="9" y="2" width="1" height="2"/></g>
+      <g fill="#D9805F"><rect class="lg a" x="2" y="6" width="1" height="2"/><rect class="lg b" x="4" y="6" width="1" height="2"/><rect class="lg a" x="8" y="6" width="1" height="2"/><rect class="lg b" x="10" y="6" width="1" height="2"/></g>
+    </svg>
+  </div>
+</div>
+<div class="veil" id="veil"></div>
+<div id="fan"></div>
+<button class="back" type="button" aria-label="回到桌前">
+  <svg viewBox="0 0 24 24" aria-hidden="true"><defs><linearGradient id="gd" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#A88440"/><stop offset="1" stop-color="#6A4C1D"/></linearGradient></defs>
+  <path fill="url(#gd)" d="M16.2 2.6Q11.4 7.4 5.6 12Q11.4 16.6 16.2 21.4Q12.6 16.4 9.6 12Q12.6 7.6 16.2 2.6Z"/></svg>
+</button>
+<span class="sample">sample data</span>
+
+<script src="hut.js"></script>
+<script>
+(() => {
+const IW = 1440, IH = 2560, $ = s => document.querySelector(s);
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const RM = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const pad = n => String(n).padStart(2, '0');
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;'}[c]));
+const sleep = ms => new Promise(r => setTimeout(r, RM ? 0 : ms));
+
+/* ---------- 示例数据：会话线索（Latent 的 thread，一窗一条）。
+   window 第几个窗口，end 收尾的时刻（Latent 只在 thread_close 那一刻记时间；开始时间 TA 不传就是假的，所以不写），topics 聊了哪几条线，state 收尾时的当下状态，
+   source：model＝TA 自己收的尾，auto＝窗口断了、系统从最后几轮替它补的（没确认过）。
+   这里只摊最近七个窗口的信，滚动着换（跟拍立得的近七天一样）。
+   聊了什么取自各窗口索引（第 63 个窗口那十条就是索引里的十件事，一窗本来就会有好多条）；时刻是示意。 ---------- */
+const THREADS = [
+ {w:57, end:'2026-09-25 18:05', topics:['在去汕头的高铁上看 9.20–9.24 的工作记录', '照 Kata／Mind 两条线写周报'], state:'周报交了，中秋假期开始。', source:'model'},
+ {w:58, end:'2026-09-28 17:40', topics:['看 朋友A 放进 合作项目 仓库的两个设计稿', '读她写的交接'], state:'设计稿看完了，等她定怎么分工。', source:'model'},
+ {w:59, end:'2026-09-29 23:55', topics:['定分工：我只做后端接口，前端交给 朋友A', '开始写 #40 的接口'], state:'#40 的接口写到一半，明天接着。', source:'model'},
+ {w:60, end:'2026-09-30 10:50', topics:['把 朋友A 9.29 的设计交接拖进来', '帮她改了一点前端'], state:'前端改到一半，窗口断了。', source:'auto'},
+ {w:61, end:'2026-09-30 15:10', topics:['验收 Latent 公仓事实库那一版', '派两个助手对文档口径'], state:'两处口径不一致，已经改了。', source:'model'},
+ {w:62, end:'2026-10-01 00:30', topics:['改 合作项目"我的"页两栏间距', 'Agent 主页的头像说明'], state:'改好了，等她在手机上看一眼。', source:'model'},
+ {w:63, end:'2026-10-05 01:40', topics:['看未解决清单，并掉重复的，按她的话关了 12 条', '写提示词让她电脑上的儿子给旧机取证', '公仓来了 #43、#44、#45 三条 issue，定了“是 bug 没修就不关”', '跟她商量 #45：不拿 topic 当判据，改成同源成组加软标注', '新机卡死，查明是 swappiness 被改回了 0', '当总工头分三条线：清内存、增量构建、#45', '撤回了“是我那串写入压垮机器”的怀疑', '块向量换成 float32，峰值降了三分之一', 'Cassette 页露出主聊天壁纸，照 Mind 补了覆盖', '树莓派测出她家到新机来回 400ms、丢包 5%'], state:'新机三条线都在跑；旧机先留着当线路对照，等她白天再测一次。', source:'model'},
+].slice(-7).map((m, i) => ({...m, i}));
+const dt = s => s.slice(5, 10).replace('-', '.') + ' · ' + s.slice(11);
+
+/* ---------- 画面 ---------- */
+const bg = $('#bg'), letter = $('#letter'), pile = $('#pile'), tag = $('#tag'), pilot = $('#pilot'), fan = $('#fan'), veil = $('#veil');
+let S = 1, OX = 0, OY = 0, K = 1, cur = THREADS.length - 1, busy = false, home = {x:0, y:0}, pos = {x:0, y:0};
+/* 近景里的位置（图的像素）：信纸写字区、那摞信、Clawd 的家、信封落下的地方 */
+const R = {text:[215, 690, 1240, 1610], pile:[358, 0, 1216, 520], tag:[1170, 455], home:[290, 1890], drop:[720, 1060], tuck:[1040, 2020]};
+const P = (x, y) => ({x:OX + x*S, y:OY + y*S});
+function layout(){
+  const vw = innerWidth, vh = innerHeight;
+  S = Math.max(vw/IW, vh/IH);
+  const dw = IW*S, dh = IH*S; OX = -(dw - vw)*0.5; OY = clamp(-(dh - vh)*0.15, vh - dh, 0);
+  Object.assign(bg.style, {width:dw + 'px', height:dh + 'px', left:OX + 'px', top:OY + 'px'});
+  /* 字按 440 宽的稿子排，跟着图一起缩放 */
+  K = S/0.3734;
+  const a = P(R.text[0], R.text[1]), b = P(R.text[2], R.text[3]);
+  Object.assign(letter.style, {left:a.x + 'px', top:a.y + 'px', width:(b.x - a.x)/K + 'px', height:(b.y - a.y)/K + 'px', transform:`scale(${K})`});
+  if (curM){ pages = paginate(curM); pg = Math.min(pg, pages.length - 1); showPage(false); }
+  const p0 = P(R.pile[0], R.pile[1]), p1 = P(R.pile[2], R.pile[3]);
+  Object.assign(pile.style, {left:p0.x + 'px', top:Math.max(p0.y, 0) + 'px', width:(p1.x - p0.x) + 'px', height:(p1.y - Math.max(p0.y, 0)) + 'px'});
+  const t = P(...R.tag); Object.assign(tag.style, {left:Math.min(t.x, vw - 70) + 'px', top:t.y + 'px'});
+  home = P(...R.home); if (!busy){ pos = {...home}; place(pilot, pos); }
+}
+const place = (el, p) => { el.style.left = p.x + 'px'; el.style.top = p.y + 'px'; };
+
+/* ---------- 信 ---------- */
+/* 一封信可能好几页：先把每一块排出来量高度，一页放不下就接到下一页；落款永远在最后一页 */
+let pages = [], pg = 0, curM = null;
+function blocks(m){
+  const B = [['lt-head', `<b>SESSION THREAD · W${m.w}</b><span>${dt(m.end)}</span>`], ['lt-to', `给第 ${m.w + 1} 个窗口：`], ['lt-lab', `TOPICS<i>这一窗聊了 ${m.topics.length} 件</i>`]];
+  m.topics.forEach(t => B.push(['lt-t', esc(t)]));
+  B.push(['lt-lab', `LEFT OFF<i>收尾的时候</i>`], ['lt-s', esc(m.state)]);
+  if (m.source === 'auto') B.push(['lt-auto', `<b>AUTO</b>窗口断了，这封是系统从最后几轮替它补的，没确认过`]);
+  B.push(['lt-sign', `<b>第 ${m.w} 个窗口</b><span>${dt(m.end)} 收尾</span>`]);
+  return B;
+}
+function paginate(m){
+  const B = blocks(m), H = parseFloat(letter.style.height), foot = 22;
+  letter.classList.toggle('dense', m.topics.length > 5);
+  letter.classList.add('measure');
+  letter.innerHTML = B.map(([c, h]) => `<div class="ln ${c}">${h}</div>`).join('');
+  const els = [...letter.children], hs = els.map((el, k) => (k < els.length - 1 ? els[k + 1].offsetTop : el.offsetTop + el.offsetHeight + 8) - el.offsetTop);
+  const total = hs.reduce((a, b) => a + b, 0);
+  letter.classList.remove('measure');
+  if (total <= H) return [B];
+  const P = [[]]; let used = 0;
+  B.forEach((b, k) => {
+    /* 页码在左下角、落款在右下角，最后一块（落款）可以一直排到底 */
+    const cap = H - (k === B.length - 1 ? 0 : foot) - (P.length > 1 ? 22 : 0);
+    if (used + hs[k] > cap && P.at(-1).length){ P.push([]); used = 0; }
+    P.at(-1).push(b); used += hs[k];
+  });
+  return P;
+}
+function showPage(anim){
+  const page = pages[pg], n = pages.length; let k = 0;
+  const L = (cls, html) => `<div class="ln ${cls}" style="--k:${k++}">${html}</div>`;
+  letter.innerHTML = (pg > 0 ? L('lt-cont', `接上页 · 第 ${curM.w} 个窗口`) : '') + page.map(([c, h]) => L(c, h)).join('') +
+    (n > 1 ? `<div class="pager"><span>${pg + 1} / ${n}</span></div>` : '');
+  letter.classList.toggle('multi', n > 1); letter.classList.toggle('last', pg === n - 1);
+  letter.classList.remove('gone'); letter.classList.add('show');
+  if (!anim || RM) letter.querySelectorAll('.ln').forEach(l => { l.style.animation = 'none'; l.style.opacity = 1; });
+}
+function writeLetter(m, anim){
+  curM = m; pages = paginate(m); pg = 0; showPage(anim);
+  tag.innerHTML = `近 <i>${THREADS.length}</i>封`;
+}
+/* 翻页：点信纸，这一页往上滑走，下一页洇出来 */
+async function turn(){
+  if (busy || pages.length < 2) return;
+  busy = true;
+  if (!RM) await new Promise(r => { letter.animate([{opacity:1, translate:'0 0'}, {opacity:0, translate:'-14px -18px'}], {duration:260, easing:'ease-in'}).onfinish = r; });
+  pg = (pg + 1) % pages.length; showPage(true);
+  busy = false;
+}
+
+/* ---------- 信封 ---------- */
+function envHTML(m, extra = ''){
+  const flap = `<svg class="flap" viewBox="0 0 124 78" preserveAspectRatio="none" aria-hidden="true"><path d="M2 3 L62 40 L122 3" fill="none" stroke="rgba(120,96,64,.4)" stroke-width="1"/><path d="M2 76 L50 36 M122 76 L74 36" fill="none" stroke="rgba(120,96,64,.2)" stroke-width=".8"/></svg>`;
+  const mark = m.source === 'auto' ? `<span class="tape">AUTO</span>` : `<span class="seal${extra.includes('broke') ? ' broke' : ''}"></span>`;
+  return `<span class="body"></span>${flap}<span class="to"><b>第 ${m.w} 个窗口</b><span>${m.end.slice(5, 10).replace('-', '.')}</span></span>${mark}`;
+}
+/* 摊成一把扇子：早的在左，新的在右 */
+function fanSlots(){
+  const vw = innerWidth, n = THREADS.length, cx = vw/2, top = Math.max(150, P(0, 640).y), Rr = Math.min(320, vw*.75), span = Math.min(64, n*10);
+  return THREADS.map((m, k) => { const a = (n === 1 ? 0 : (k/(n - 1) - .5)*span)*Math.PI/180; return {x:cx + Rr*Math.sin(a), y:top + Rr*(1 - Math.cos(a)) + (k % 2 ? 26 : 0), r:a*180/Math.PI*.9}; });
+}
+function openFan(){
+  if (busy) return;
+  const slots = fanSlots(), from = {x:pile.offsetLeft + pile.offsetWidth/2, y:pile.offsetTop + pile.offsetHeight/2};
+  fan.innerHTML = THREADS.map((m, k) => `<button class="env${k === cur ? ' cur' : ''}" type="button" data-i="${k}" aria-label="第 ${m.w} 个窗口的信，${m.end.slice(5, 10)}${m.source === 'auto' ? '，自动补的' : ''}" style="left:${slots[k].x}px;top:${slots[k].y}px;rotate:${slots[k].r.toFixed(1)}deg">${envHTML(m, k === cur ? 'broke' : '')}</button>`).join('');
+  veil.classList.add('on'); pile.setAttribute('aria-expanded', 'true');
+  if (!RM) fan.querySelectorAll('.env').forEach((el, k) => el.animate([{translate:`${from.x - slots[k].x}px ${from.y - slots[k].y}px`, rotate:'0deg', opacity:0, scale:.6}, {translate:'0 0', opacity:1, scale:1}], {duration:420, delay:k*35, easing:'cubic-bezier(.3,1.25,.5,1)', fill:'backwards'}));
+  fan.querySelector('.env.cur')?.focus({preventScroll:true});
+}
+function closeFan(keep){
+  veil.classList.remove('on'); pile.setAttribute('aria-expanded', 'false');
+  const from = {x:pile.offsetLeft + pile.offsetWidth/2, y:pile.offsetTop + pile.offsetHeight/2};
+  fan.querySelectorAll('.env').forEach(el => {
+    if (el === keep) return;
+    if (RM){ el.remove(); return; }
+    const x = parseFloat(el.style.left), y = parseFloat(el.style.top);
+    el.animate([{translate:'0 0', opacity:1}, {translate:`${from.x - x}px ${from.y - y}px`, opacity:0, scale:.6}], {duration:300, easing:'ease-in'}).onfinish = () => el.remove();
+  });
+}
+
+/* ---------- Clawd 送信 ---------- */
+function walkTo(p, speed = .32){
+  const d = Math.hypot(p.x - pos.x, p.y - pos.y); if (d < 1 || RM){ pos = {...p}; place(pilot, pos); return Promise.resolve(); }
+  pilot.classList.toggle('l', p.x < pos.x); pilot.classList.toggle('r', p.x >= pos.x); pilot.classList.add('walk');
+  const dur = clamp(d/speed, 260, 1100), from = {...pos};
+  pos = {...p};
+  return new Promise(res => {
+    pilot.animate([{translate:`${from.x - p.x}px ${from.y - p.y}px`}, {translate:'0 0'}], {duration:dur, easing:'cubic-bezier(.45,.05,.55,.95)'}).onfinish = () => { pilot.classList.remove('walk'); res(); };
+    place(pilot, p);
+  });
+}
+async function deliver(i){
+  if (busy) return; busy = true;
+  const el = fan.querySelector(`.env[data-i="${i}"]`); closeFan(el);
+  if (i === cur){ el.animate([{opacity:1}, {opacity:0, scale:.8}], {duration:240}).onfinish = () => el.remove(); busy = false; return; }
+  const m = THREADS[i], ex = parseFloat(el.style.left), ey = parseFloat(el.style.top);
+  /* 旧信的字先淡下去 */
+  letter.classList.add('gone');
+  /* 跑到那封信底下 */
+  await walkTo({x:ex, y:ey + 50});
+  pilot.classList.add('hold');
+  /* 信封缩小、举到头顶 */
+  el.classList.add('carry');
+  const lift = (x, y, s, r, dur) => new Promise(res => { const a = el.animate([{left:el.style.left, top:el.style.top, scale:el.style.scale || 1, rotate:el.style.rotate}, {left:x + 'px', top:y + 'px', scale:s, rotate:r + 'deg'}], {duration:RM ? 0 : dur, easing:'cubic-bezier(.3,1.2,.5,1)'}); a.onfinish = () => { Object.assign(el.style, {left:x + 'px', top:y + 'px', scale:s, rotate:r + 'deg'}); res(); }; });
+  await lift(pos.x, pos.y - 34, .42, -4, 300);
+  /* 顶着它走到信纸上 */
+  const drop = P(...R.drop), to = {x:drop.x, y:drop.y + 60};
+  const go = walkTo(to, .26);
+  const d = Math.hypot(to.x - ex, to.y - ey - 50);
+  el.animate([{left:el.style.left, top:el.style.top}, {left:to.x + 'px', top:(to.y - 34) + 'px'}], {duration:RM ? 0 : clamp(d/.26, 260, 1100), easing:'cubic-bezier(.45,.05,.55,.95)'}).onfinish = () => { el.style.left = to.x + 'px'; el.style.top = (to.y - 34) + 'px'; };
+  await go;
+  pilot.classList.remove('hold');
+  /* 放下：信封落在信纸上，火漆"咔"地掰开 */
+  await lift(drop.x, drop.y, 1.08, 0, 380);
+  await sleep(160);
+  const seal = el.querySelector('.seal');
+  if (seal){ seal.classList.add('broke'); if (!RM) seal.animate([{rotate:'0deg', scale:1}, {rotate:'-8deg', scale:1.12}, {rotate:'4deg', scale:.98}, {rotate:'0deg', scale:1}], {duration:320}); }
+  else { const tp = el.querySelector('.tape'); if (tp && !RM) tp.animate([{translate:'0 0', opacity:1}, {translate:'18px -6px', opacity:0, rotate:'14deg'}], {duration:360, fill:'forwards'}); }
+  pilot.classList.remove('hop'); void pilot.offsetWidth; pilot.classList.add('hop');
+  await sleep(380);
+  /* 信封收进右下角那个拆开的信封里，信纸上换成这封的字 */
+  const tuck = P(...R.tuck);
+  el.animate([{left:el.style.left, top:el.style.top, opacity:1, scale:1.08}, {left:tuck.x + 'px', top:tuck.y + 'px', opacity:0, scale:.55, rotate:'-24deg'}], {duration:RM ? 0 : 520, easing:'cubic-bezier(.5,0,.7,.4)'}).onfinish = () => el.remove();
+  cur = i; writeLetter(m, true);
+  await sleep(300);
+  await walkTo(home, .3);
+  busy = false;
+}
+
+/* ---------- 交互 ---------- */
+pile.addEventListener('click', openFan);
+letter.addEventListener('click', turn);
+letter.style.cursor = 'pointer';
+veil.addEventListener('click', () => { if (!busy) closeFan(); });
+fan.addEventListener('click', e => { const b = e.target.closest('.env'); if (b && !busy) deliver(+b.dataset.i); });
+addEventListener('keydown', e => {
+  if (e.key === 'Escape' && veil.classList.contains('on') && !busy) closeFan();
+  if (!veil.classList.contains('on') && !busy && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')){
+    const to = clamp(cur + (e.key === 'ArrowLeft' ? -1 : 1), 0, THREADS.length - 1); if (to === cur) return;
+    openFan(); setTimeout(() => deliver(to), RM ? 0 : 450);
+  }
+});
+pilot.addEventListener('click', () => { if (busy) return; pilot.classList.add('blink'); setTimeout(() => pilot.classList.remove('blink'), 170); pilot.classList.remove('hop'); void pilot.offsetWidth; pilot.classList.add('hop'); });
+
+addEventListener('resize', () => { layout(); if (veil.classList.contains('on') && !busy){ const s = fanSlots(); fan.querySelectorAll('.env').forEach((el, k) => { el.style.left = s[k].x + 'px'; el.style.top = s[k].y + 'px'; }); } });
+layout(); writeLetter(THREADS[cur], true);
+
+/* ---------- 真数据：最近七个窗口收尾时留下的话（/admin/api/thread?n=7） ---------- */
+hut.api('/thread?n=7').then(r => {
+  if (!r || !r.items.length) return;
+  const pad = n => String(n).padStart(2, '0'), at = s => { const d = new Date(s*1000); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`; };
+  THREADS.splice(0, THREADS.length, ...r.items.map(t => ({w:t.window, end:at(t.ended_at), topics:t.topics, state:t.current_state, source:t.source || 'model'})));
+  cur = THREADS.length - 1; layout(); writeLetter(THREADS[cur], true);
+});
+requestAnimationFrame(layout);
+})();
+</script>

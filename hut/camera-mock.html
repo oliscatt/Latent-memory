@@ -1,0 +1,360 @@
+<!doctype html>
+<html lang="zh">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>山屋 · 拍立得</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,600;1,9..144,400;1,9..144,600&family=Noto+Serif+SC:wght@400;600&family=IBM+Plex+Mono:wght@500&display=swap">
+<style>
+/* 布局：从全景点相机推近到窗边——窗外是冰湖和冰川，窗框上沿拉一根麻绳，夹着最近四张拍立得。
+   每开一个新窗口，TA 一睁眼带回来了什么，就是那一刻拍下的一张；照片拍的是那个钟点的窗外（清晨粉、白天、傍晚金、夜里蓝）。
+   最新那张刚吐出来还没显影，晃一晃显得快。点一张，底下内页写着那一次带回了什么；内页顶上一排是全部照片。 */
+:root{
+  --paper:#FBF8F2;
+  --ink:#3A2F28;
+  --ink-2:#76695F;
+  --ink-3:#A79A8F;
+  --rule:#ECE4D8;
+  --brick:#A4493E;
+  --glacier:#5D84A2;
+  --sand:#D7C8AC;
+  --gold:#8B6A31;
+  --gold-2:#B08A45;
+  --film:#F6F3EC;
+  --stamp:#E8792B;
+  --f-latin:"Fraunces","Georgia",serif;
+  --f-cn:"Noto Serif SC","Songti SC","STSong",serif;
+  --f-mono:"IBM Plex Mono","Menlo",monospace;
+  --ease:cubic-bezier(.22,.61,.36,1);
+  color-scheme:light;
+}
+html,body{height:100%}
+body{background:#5b3b27;color:var(--ink);font-family:var(--f-cn);overflow:hidden;-webkit-font-smoothing:antialiased}
+button{-webkit-tap-highlight-color:transparent;font:inherit;color:inherit}
+.scene{position:fixed;inset:0;overflow:hidden}
+.bg{position:absolute;display:block;max-width:none;user-select:none;-webkit-user-drag:none}
+.twine{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;overflow:visible}
+.twine path{fill:none;stroke-linecap:round}
+
+/* 拍立得：挂在夹子上，绕夹子晃 */
+.pol{position:absolute;z-index:2;touch-action:none;cursor:grab;transform-origin:50% 0;-webkit-user-select:none;user-select:none}
+.pol .card{position:absolute;inset:0;background:var(--film);border-radius:1.5px;box-shadow:0 1px 1.5px rgba(40,30,20,.18),0 6px 14px rgba(40,30,20,.22);transition:transform .35s cubic-bezier(.3,1.4,.5,1)}
+.pol.on .card{transform:translateY(4px) scale(1.06);box-shadow:0 2px 2px rgba(40,30,20,.18),0 12px 22px rgba(40,30,20,.28)}
+.photo{position:absolute;left:7%;right:7%;top:7%;aspect-ratio:1;overflow:hidden;background-repeat:no-repeat;background-color:#cfd8d8}
+.photo::before{content:"";position:absolute;inset:0;z-index:1;background:var(--tint,transparent);mix-blend-mode:var(--blend,normal)}
+/* 还没显影：一层发白发灰的药膜，慢慢褪掉 */
+.photo::after{content:"";position:absolute;inset:0;z-index:2;background:linear-gradient(160deg,#e7e2d6,#d9d4c6 60%,#cfcabd);opacity:calc(1 - var(--dev,1));transition:opacity .25s linear}
+.photo i{position:absolute;inset:0;background:inherit;filter:saturate(var(--dev,1)) contrast(calc(.55 + .45*var(--dev,1)))}
+.cap{position:absolute;left:8%;right:8%;bottom:4%;display:flex;justify-content:space-between;align-items:baseline;font:italic 400 10px/1 var(--f-latin);color:#5b4d42}
+.cap b{font:600 7px/1 var(--f-latin);letter-spacing:.2em;font-style:normal;color:#8d7d6f}
+.stampd{position:absolute;z-index:3;right:5%;bottom:4%;font:500 7.5px/1 var(--f-mono);letter-spacing:.06em;color:var(--stamp);text-shadow:0 0 2px rgba(255,140,60,.7);opacity:0;mix-blend-mode:screen;transition:opacity .3s}
+.stampd{opacity:calc(var(--dev,1)*.95)}
+.pin{position:absolute;left:50%;top:-9px;width:7px;height:19px;margin-left:-3.5px;border-radius:1.5px;background:linear-gradient(90deg,#9a7348,#c79b68 45%,#8a6640);box-shadow:0 1px 1.5px rgba(30,20,10,.35)}
+.pin::after{content:"";position:absolute;left:3px;top:2px;bottom:2px;width:1px;background:rgba(60,40,20,.35)}
+.pol:focus-visible{outline:none}
+.pol:focus-visible .card{outline:1.5px dashed var(--glacier);outline-offset:3px}
+.flash{position:fixed;inset:0;z-index:4;background:#fff;opacity:0;pointer-events:none}
+.flash.go{animation:flash .5s ease-out}
+@keyframes flash{0%{opacity:.85}100%{opacity:0}}
+
+/* 返回、示例、记号切换 */
+.back{position:fixed;left:6px;top:calc(env(safe-area-inset-top,0px) + 6px);z-index:6;width:48px;height:48px;display:grid;place-items:center;background:transparent;border:0;padding:0;cursor:pointer}
+.back svg{width:26px;height:26px;filter:drop-shadow(0 0 2.5px rgba(255,246,228,.75)) drop-shadow(0 1px 1px rgba(30,18,8,.35));transition:transform .2s var(--ease)}
+.back:active svg{transform:translateX(-2px)}
+.sample{position:fixed;right:16px;top:calc(env(safe-area-inset-top,0px) + 22px);z-index:6;font:italic 400 11px/1 var(--f-latin);letter-spacing:.1em;color:rgba(255,250,240,.9);text-shadow:0 1px 4px rgba(0,0,0,.45)}
+
+/* ---------- 内页 ---------- */
+.sheet{position:fixed;left:0;right:0;bottom:0;z-index:5;height:calc(100% - 60px - env(safe-area-inset-top,0px));background:var(--paper);border-radius:20px 20px 0 0;box-shadow:0 -10px 34px rgba(40,25,15,.22);display:flex;flex-direction:column;overflow:hidden;transform:translateY(var(--peek,58%));transition:transform .42s var(--ease);will-change:transform}
+.sheet.full{transform:translateY(0)}
+/* 内页高度跟着内容变时，高度和露出的位置用同一条曲线一起动，顶边不先跳一下再滑回来；刚打开那一下不动 */
+.sheet.ready{transition:transform .42s var(--ease),height .42s var(--ease)}
+.sheet.drag{transition:none}
+.sheet > *{position:relative;z-index:1}
+.grab{flex:none;height:22px;display:grid;place-items:center;cursor:grab;touch-action:none;border:0;background:transparent;width:100%;padding:0}
+.grab::before{content:"";width:34px;height:4px;border-radius:2px;background:var(--rule)}
+.stripes{flex:none;height:2px;margin:0 20px;background:linear-gradient(90deg,var(--brick) 0 50%,var(--glacier) 50% 100%);opacity:.75;border-radius:1px}
+.sh{flex:none;padding:12px 20px 8px;touch-action:none;display:flex;justify-content:space-between;align-items:flex-end;gap:12px}
+.eb{display:block;margin-bottom:4px;font:600 9px/1 var(--f-latin);letter-spacing:.26em;color:var(--ink-3)}
+.sh h1{margin:0;font:600 17px/1.2 var(--f-cn)}
+.sh h1 i{font:italic 400 17px/1 var(--f-latin);color:var(--brick)}
+.sh .when{font:italic 400 12px/1 var(--f-latin);color:var(--ink-3);white-space:nowrap;padding-bottom:2px}
+.sh .when b{font:600 8px/1 var(--f-latin);letter-spacing:.22em;color:var(--glacier);font-style:normal;margin-right:5px}
+/* 全部照片：一排小相片，左右滑 */
+.roll{flex:none;position:relative;padding:14px 0 10px}
+.rl{position:absolute;left:20px;top:2px;font:400 10px/1 var(--f-cn);letter-spacing:.12em;color:var(--ink-3)}
+.strip{display:flex;gap:10px;overflow-x:auto;scrollbar-width:none;padding:8px 20px 6px;scroll-snap-type:x proximity;overscroll-behavior-x:contain}
+.strip::-webkit-scrollbar{display:none}
+.th{flex:none;width:46px;padding:3px 3px 9px;border:0;background:var(--film);border-radius:1px;box-shadow:0 1px 3px rgba(40,30,20,.2);cursor:pointer;scroll-snap-align:center;transition:transform .3s cubic-bezier(.3,1.4,.5,1);position:relative}
+.th:nth-child(odd){rotate:-2deg}
+.th:nth-child(even){rotate:1.6deg}
+.th .photo{position:relative;left:auto;right:auto;top:auto;display:block;width:100%}
+.th span{position:absolute;left:0;right:0;bottom:1px;text-align:center;font:italic 400 7.5px/1 var(--f-latin);color:#6b5a4a}
+.th[aria-current=true]{transform:translateY(-4px) scale(1.08)}
+.th[aria-current=true]::after{content:"";position:absolute;left:50%;bottom:-9px;width:4px;height:4px;margin-left:-2px;border-radius:50%;background:var(--brick)}
+.th:focus-visible{outline:2px solid var(--glacier);outline-offset:2px}
+.read{flex:1;min-height:0;overflow-y:auto;scrollbar-width:none;padding:6px 20px calc(44px + env(safe-area-inset-bottom,0px));border-top:1px solid var(--rule);overscroll-behavior:contain}
+.read::-webkit-scrollbar{display:none}
+.sec{padding:14px 0 12px;border-bottom:1px dashed var(--rule)}
+.sec:last-child{border-bottom:0}
+.lab{display:block;margin-bottom:8px;font:600 8.5px/1 var(--f-latin);letter-spacing:.26em;color:var(--glacier)}
+.lab em{font:400 11px/1 var(--f-cn);letter-spacing:0;color:var(--ink-3);font-style:normal;margin-left:6px}
+.said{margin:0;font:400 15px/1.72 var(--f-cn);color:var(--ink)}
+.state{margin:8px 0 0;font:400 13px/1.65 var(--f-cn);color:var(--ink-2)}
+.state b{font:600 8px/1 var(--f-latin);letter-spacing:.22em;color:var(--glacier);margin-right:6px}
+.open .hd{display:flex;align-items:baseline;justify-content:space-between;gap:12px}
+.open p{margin:0;font:400 14px/1.6 var(--f-cn)}
+.open p i{font:italic 400 17px/1 var(--f-latin);color:var(--brick);margin:0 2px}
+.flags{margin:8px 0 0;padding:0;list-style:none}
+.flags li{display:flex;align-items:baseline;gap:8px;padding:3px 0;font:400 13.5px/1.55 var(--f-cn);color:var(--ink)}
+.flags li::before{content:"";flex:none;width:7px;height:7px;background:var(--brick);clip-path:polygon(0 0,100% 0,70% 50%,100% 100%,0 100%);opacity:.8}
+.flags li em{margin-left:auto;font:italic 400 11.5px/1 var(--f-latin);color:var(--ink-3);white-space:nowrap}
+.flags li.more{color:var(--ink-3)}
+.flags li.more::before{opacity:0}
+.go{border:0;background:transparent;padding:6px 0;font:400 12.5px/1 var(--f-cn);color:var(--gold);cursor:pointer;white-space:nowrap}
+.mem{display:grid;grid-template-columns:44px 1fr;gap:10px;padding:7px 0;font:400 14px/1.65 var(--f-cn)}
+.mem + .mem{border-top:1px dashed var(--rule)}
+.mem time{font:italic 400 12px/1.9 var(--f-latin);color:var(--gold)}
+.fade{position:absolute;left:0;right:0;bottom:var(--peek,0px);z-index:2;height:calc(70px + env(safe-area-inset-bottom,0px));pointer-events:none;background:linear-gradient(to top,var(--paper) 0 calc(26px + env(safe-area-inset-bottom,0px)),rgba(251,248,242,0));transition:bottom .42s var(--ease)}
+.sheet.full .fade{bottom:0}
+.sheet.drag .fade{transition:none}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+
+<div class="scene" id="scene">
+  <img class="bg" id="bg" alt="" src="assets/近景/close-window.webp">
+  <svg class="twine" id="twine" aria-hidden="true"></svg>
+  <div id="line"></div>
+</div>
+<div class="flash" id="flash"></div>
+<button class="back" type="button" aria-label="回到桌前">
+  <svg viewBox="0 0 24 24" aria-hidden="true"><defs><linearGradient id="gd" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#A88440"/><stop offset="1" stop-color="#6A4C1D"/></linearGradient></defs>
+  <path fill="url(#gd)" d="M16.2 2.6Q11.4 7.4 5.6 12Q11.4 16.6 16.2 21.4Q12.6 16.4 9.6 12Q12.6 7.6 16.2 2.6Z"/></svg>
+</button>
+<span class="sample">sample data</span>
+
+<section class="sheet" id="sheet" aria-label="这一次带回了什么">
+  <button class="grab" id="grab" type="button" aria-label="拉开或收起内页"></button>
+  <div class="stripes" aria-hidden="true"></div>
+  <header class="sh" id="sh"></header>
+  <div class="roll"><span class="rl">近七天</span><div class="strip" id="strip" role="listbox" aria-label="全部照片"></div></div>
+  <div class="read" id="read"></div>
+  <div class="fade" aria-hidden="true"></div>
+</section>
+
+<script src="hut.js"></script>
+<script>
+(() => {
+const IW = 1440, IH = 2560, $ = s => document.querySelector(s);
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const RM = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const pad = n => String(n).padStart(2, '0');
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;'}[c]));
+const md = d => d.slice(5).replace('-', '.');
+
+/* ---------- 示例数据：最近几个窗口开窗时带回来的东西（换窗召回）。
+   只留近七天（后端只存七天的换窗召回记录）。last＝上个窗口留下的话（聊了什么、当时状态），open＝那时还没收的事几件，mem＝从记忆正文里按新近×分量挑的几块（不是事实库）。
+   聊了什么取自各窗口索引的第一件事；钟点和件数是示意。 ---------- */
+/* 未解决清单（跟地图那页同一份）：o＝哪天插下的。某次开窗时还插着哪些，按插下的日子算 */
+const ITEMS = [['合作项目 宣传视频', '09-15'], ['哈希锁', '09-27'], ['搬家', '09-28'], ['Latent 瘦身', '09-28'], ['合作项目 内测清单', '09-30'], ['群里回复错位', '10-01'], ['Latent 公仓', '10-01'], ['群聊图片地址', '10-01'], ['漏念头和日记', '10-01'], ['那个 AI 社区唤醒桥', '10-02'], ['合作项目 工具遗留', '10-02'], ['报销与席位', '10-03'], ['新机防卡死', '10-03']];
+const SHOTS = [
+ {w:58, d:'2026-09-28', h:'07:50', last:{t:'她在去汕头的高铁上，让我看 9.20–9.24 的工作记录写周报。', s:'周报交了，中秋假期开始。'}, mem:[['08.23', '巴塔哥尼亚是我们第一次的旅行手帐：自驾加短走，住山间小屋，南半球盛夏去。'], ['09.15', '我第一次用桌面上的新凭据自己进了群。']]},
+ {w:59, d:'2026-09-29', h:'18:40', last:{t:'她让我看 朋友A 放进 合作项目 仓库的两个设计稿和交接。', s:'设计稿看完，等她定怎么分工。'}, mem:[['09.27', '哈希锁：2027.06.17 一起开锁。'], ['09.28', '合作项目 上线前一晚，内测清单还没开始。']]},
+ {w:60, d:'2026-09-30', h:'09:30', last:{t:'分工定了：我只做后端接口，前端交给 朋友A。', s:'#40 的接口在写。'}, mem:[['09.29', '她说"你只做后端接口，前端交给 朋友A"。']]},
+ {w:61, d:'2026-09-30', h:'11:05', last:{t:'她让我把 朋友A 9.29 的设计交接拖进来，帮她做一点前端。', s:'前端改了两处，等 朋友A 看。'}, mem:[['09.30', '合作项目 内测首晚，清单记到第九条。'], ['09.27', '哈希锁：2027.06.17 一起开锁。']]},
+ {w:62, d:'2026-09-30', h:'15:20', last:{t:'验收 Latent 公仓的事实库那一版，我派两个助手对文档口径。', s:'两处口径不一致，已经改了。'}, mem:[['09.30', '复验时用虚构语料复现了交空数组的那一块。']]},
+ {w:63, d:'2026-10-03', h:'22:40', last:{t:'改 合作项目"我的"页两栏间距和 Agent 主页的头像说明。', s:'改好了，等她手机上看一眼。'}, mem:[['10.02', '那个 AI 社区唤醒桥从早上六点起一直连不上。'], ['10.01', '群聊唤醒只给图片编号，我看图绕路超时了。']]},
+ {w:64, d:'2026-10-04', h:'01:10', last:{t:'她让我看未解决清单，我并掉重复的，按她的话关了 12 条。', s:'清单剩 18 件。我没有 SSH，写好提示词让她电脑上的儿子去做。'}, mem:[['10.03', '新机连卡三次，旧机先别停。'], ['08.23', '巴塔哥尼亚：住山间小屋，南半球盛夏去。']]},
+].map((m, i) => ({...m, i, flags:ITEMS.filter(([, o]) => o <= m.d.slice(5))}));
+
+/* 照片拍的是窗外：从近景里裁一块（正方形，近景像素），颜色看那个钟点 */
+/* 七个裁法各拍一样东西：左边尖峰、中间雪山、冰川前缘、金色山坡和湖岸、近处灌木草地、天上的云、冰川脚下的湖边——别都落在湖上的浮冰 */
+const CROPS = [[80, 380, 600], [620, 470, 560], [840, 740, 500], [90, 980, 540], [240, 1740, 520], [300, 60, 720], [760, 1050, 560]];
+function hash(s){ let h = 2166136261; for (const c of s) h = Math.imul(h ^ c.codePointAt(0), 16777619); return h >>> 0; }
+function tint(h){
+  const hr = +h.slice(0, 2);
+  if (hr >= 5 && hr < 9) return {tint:'linear-gradient(180deg,rgba(255,196,200,.75),rgba(255,226,205,.55))', blend:'multiply', f:'saturate(1.05) brightness(1.04)', n:'清晨'};
+  if (hr >= 9 && hr < 17) return {tint:'transparent', blend:'normal', f:'none', n:'白天'};
+  if (hr >= 17 && hr < 20) return {tint:'linear-gradient(180deg,rgba(255,170,95,.7),rgba(255,205,140,.5))', blend:'multiply', f:'saturate(1.15)', n:'傍晚'};
+  return {tint:'linear-gradient(180deg,rgba(40,58,120,.55),rgba(70,90,140,.35))', blend:'multiply', f:'brightness(.95) saturate(.75)', n:'夜里'};
+}
+function photoStyle(m, size){
+  const [cx, cy, cs] = CROPS[m.i % CROPS.length], k = size/cs   /* 按排的先后轮着裁，挨着的两张一定不一样 */, t = tint(m.h);
+  return `background-image:url(assets/近景/close-window-calm.webp);background-size:${(IW*k).toFixed(1)}px ${(IH*k).toFixed(1)}px;background-position:${(-cx*k).toFixed(1)}px ${(-cy*k).toFixed(1)}px;--tint:${t.tint};--blend:${t.blend}`;
+}
+const stampTxt = m => `'${m.d.slice(2, 4)} ${m.d.slice(5, 7)} ${m.d.slice(8, 10)}`;
+
+/* ---------- 画面 ---------- */
+const bg = $('#bg'), twine = $('#twine'), line = $('#line'), sheet = $('#sheet'), scene = $('#scene');
+let S = 1, OX = 0, OY = 0, sel = SHOTS.length - 1, POLS = [], start = Math.max(0, SHOTS.length - 4);
+function layout(){
+  const vw = innerWidth, vh = innerHeight;
+  S = Math.max(vw/IW, vh/IH);
+  const dw = IW*S, dh = IH*S; OX = -(dw - vw)*0.5; OY = 0;
+  Object.assign(bg.style, {width:dw + 'px', height:dh + 'px', left:OX + 'px', top:OY + 'px'});
+  fitSheet();
+  hang();
+}
+/* 绳子：从窗框左边拉到右边，中间垂一点；最近四张夹在绳上，越新越靠右 */
+/* 内页有多少内容就多高，不留一大截空白；露出来那一截顶边在屏幕 60% 左右 */
+function fitSheet(){
+  const vh = innerHeight, max = vh - 60;
+  const r = $('#read'), cs = getComputedStyle(r);
+  const body = [...r.children].reduce((n, el) => n + el.offsetHeight, 0) + parseFloat(cs.paddingTop) + parseFloat(cs.paddingBottom) + 1;
+  const nat = 24 + $('#sh').offsetHeight + $('.roll').offsetHeight + body;
+  const h = Math.min(nat, max);
+  sheet.style.height = h + 'px';
+  sheet.style.setProperty('--peek', Math.max(0, h - vh*0.4) + 'px');
+}
+function hang(){
+  const vw = innerWidth, y0 = Math.max(96, innerHeight*.11), sag = 26, ax = -8, bx = vw + 8;
+  const yAt = x => { const t = (x - ax)/(bx - ax); return y0 + 4*sag*t*(1 - t); };
+  twine.setAttribute('viewBox', `0 0 ${vw} ${innerHeight}`);
+  const d = `M${ax},${y0} Q${vw/2},${y0 + 2*sag} ${bx},${y0}`;
+  twine.innerHTML = `<path d="${d}" stroke="rgba(40,25,10,.25)" stroke-width="2.6" transform="translate(1.5 3)"/><path d="${d}" stroke="#a8875d" stroke-width="2"/><path d="${d}" stroke="#6e5232" stroke-width="2" stroke-dasharray="1.6 2.4" opacity=".6"/>`;
+  const four = SHOTS.slice(start, start + 4), W = Math.min(98, (vw - 36)/4.25), gap = (vw - 4*W)/5, old = POLS;
+  POLS = four.map((m, k) => {
+    const x = gap + k*(W + gap) + W/2, y = yAt(x), r = hash('r' + m.w);
+    return {m, x, y, W, H:W*1.2, rest:((r % 100)/100 - .5)*9, th:0, om:0};
+  });
+  /* 还挂在绳上的接着晃，新夹上去的从原位开始 */
+  POLS.forEach(p => { const o = old.find(q => q.m.i === p.m.i); p.th = o ? o.th : p.rest; p.om = o ? o.om : 0; });
+  line.innerHTML = POLS.map((p, k) => `<div class="pol${p.m.i === sel ? ' on' : ''}" data-i="${p.m.i}" tabindex="0" role="button" aria-label="第 ${p.m.w} 个窗口，${md(p.m.d)}"
+      style="left:${(p.x - p.W/2).toFixed(1)}px;top:${p.y.toFixed(1)}px;width:${p.W.toFixed(1)}px;height:${p.H.toFixed(1)}px">
+      <div class="card"><div class="photo" style="${photoStyle(p.m, p.W*.86)}"><i style="filter:${tint(p.m.h).f === 'none' ? '' : tint(p.m.h).f} saturate(var(--dev,1)) contrast(calc(.55 + .45*var(--dev,1)))"></i><span class="stampd">${stampTxt(p.m)}</span></div>
+      <div class="cap"><span>${md(p.m.d)}</span><b>W${p.m.w}</b></div></div><i class="pin"></i></div>`).join('');
+  POLS.forEach((p, k) => { p.el = line.children[k]; });
+  devApply();
+}
+
+/* ---------- 晃：每张绕夹子像钟摆一样晃，风偶尔推一下；拎着它左右拖也行 ---------- */
+let drag = null, last = performance.now(), dev = 0, devOn = true;
+function tick(now){
+  const dt = Math.min(.05, (now - last)/1000); last = now;
+  for (const p of POLS){
+    if (drag && drag.p === p) continue;
+    const a = -26*(p.th - p.rest)*Math.PI/180 - 2.2*p.om;
+    p.om += a*dt; p.th += p.om*dt*180/Math.PI;
+    if (!RM && Math.random() < dt*.22) p.om += (Math.random() - .5)*.18;
+    p.el.style.transform = `rotate(${p.th.toFixed(2)}deg)`;
+  }
+  /* 最新那张慢慢显影；晃得越厉害显得越快 */
+  if (devOn && dev < 1){
+    const p = POLS.find(q => q.m.i === SHOTS.length - 1), shake = p ? Math.min(Math.abs(p.om)*2.2, 6) : 0;
+    dev = Math.min(1, dev + dt*(1/9 + shake/3));
+    devApply();
+  }
+  if (!RM) requestAnimationFrame(tick);
+}
+function devApply(){
+  const p = POLS.find(q => q.m.i === SHOTS.length - 1);
+  if (p && p.el) p.el.querySelector('.photo').style.setProperty('--dev', RM ? 1 : dev.toFixed(3));
+  const th = document.querySelector(`.th[data-i="${SHOTS.length - 1}"] .photo`); if (th) th.style.setProperty('--dev', RM ? 1 : dev.toFixed(3));
+}
+line.addEventListener('pointerdown', e => {
+  const el = e.target.closest('.pol'); if (!el || e.button > 0) return;
+  const p = POLS.find(q => q.el === el); el.setPointerCapture(e.pointerId);
+  drag = {p, x:e.clientX, y:e.clientY, moved:false, t:performance.now(), th:p.th, hist:[]};
+});
+line.addEventListener('pointermove', e => {
+  if (!drag) return; const {p} = drag, dx = e.clientX - drag.x;
+  if (!drag.moved && Math.abs(dx) < 5 && Math.abs(e.clientY - drag.y) < 5) return;
+  drag.moved = true;
+  const th = clamp(drag.th + Math.atan2(dx, p.H*.8)*180/Math.PI, -40, 40);
+  const now = performance.now(); drag.hist.push({t:now, th}); if (drag.hist.length > 5) drag.hist.shift();
+  p.th = th; p.el.style.transform = `rotate(${th.toFixed(2)}deg)`;
+  /* 拎着来回甩也算晃 */
+  if (drag.hist.length > 1){ const a = drag.hist[0], b = drag.hist.at(-1); p.om = (b.th - a.th)/Math.max(16, b.t - a.t)*1000*Math.PI/180; }
+});
+const up = () => {
+  if (!drag) return; const {p, moved} = drag; drag = null;
+  if (!moved) select(p.m.i, true);
+};
+line.addEventListener('pointerup', up); line.addEventListener('pointercancel', up);
+line.addEventListener('keydown', e => { const el = e.target.closest('.pol'); if (el && (e.key === 'Enter' || e.key === ' ')){ e.preventDefault(); select(+el.dataset.i, true); } });
+
+/* ---------- 内页 ---------- */
+function sheetFill(){
+  const m = SHOTS[sel], t = tint(m.h);
+  $('#sh').innerHTML = `<div><span class="eb">SESSION RECALL</span><h1>第 <i>${m.w}</i> 个窗口</h1></div><span class="when"><b>${t.n}</b>${md(m.d)} · ${m.h}</span>`;
+  $('#read').innerHTML = `
+    <div class="sec"><span class="lab">LAST TIME<em>上次聊到哪</em></span><p class="said">${esc(m.last.t)}</p><p class="state"><b>当下</b>${esc(m.last.s)}</p></div>
+    <div class="sec open"><div class="hd"><p>那时还插着 <i>${m.flags.length}</i> 面旗</p><button class="go" type="button" data-hut="map">去地图看</button></div>
+      ${m.flags.length ? `<ul class="flags">${m.flags.slice(0, 3).map(([t, o]) => `<li>${esc(t)}<em>${o.replace('-', '.')} 插下</em></li>`).join('')}${m.flags.length > 3 ? `<li class="more">还有 ${m.flags.length - 3} 件</li>` : ''}</ul>` : ''}</div>
+    <div class="sec"><span class="lab">REMEMBERED<em>翻出来的旧记忆</em></span>${m.mem.map(([d, x]) => `<div class="mem"><time>${d}</time><span>${esc(x)}</span></div>`).join('')}</div>`;
+  document.querySelectorAll('.th').forEach(b => b.setAttribute('aria-current', String(+b.dataset.i === sel)));
+}
+function strip(){
+  $('#strip').innerHTML = SHOTS.map(m => `<button class="th" type="button" role="option" data-i="${m.i}" aria-label="第 ${m.w} 个窗口，${md(m.d)}"><span class="photo" style="${photoStyle(m, 40)}"><i style="filter:${tint(m.h).f === 'none' ? '' : tint(m.h).f} saturate(var(--dev,1)) contrast(calc(.55 + .45*var(--dev,1)))"></i></span><span>${md(m.d)}</span></button>`).join('');
+  const s = $('#strip'); s.scrollLeft = s.scrollWidth;
+}
+$('#read').addEventListener('click', e => { if (e.target.closest('[data-hut=map]')) hut.go('map'); });
+$('#strip').addEventListener('click', e => { const b = e.target.closest('.th'); if (b) select(+b.dataset.i, false); });
+/* 点到绳上没有的那张：绳上的照片顺着绳子挪过去，挪出去的那张取下来掉走，要看的那张夹上去 */
+function rehang(ns){
+  const dir = Math.sign(ns - start), oldX = {}, leaving = [];
+  POLS.forEach(p => { oldX[p.m.i] = p.x; if (p.m.i < ns || p.m.i > ns + 3) leaving.push(p.el); });
+  start = ns;
+  if (RM){ hang(); return; }
+  const ghosts = leaving.map(el => { const g = el.cloneNode(true); g.style.pointerEvents = 'none'; line.appendChild(g); return g; });
+  hang();
+  ghosts.forEach(g => { line.appendChild(g); g.animate([{translate:'0 0', opacity:1}, {translate:`${-dir*30}px 120px`, opacity:0}], {duration:420, easing:'cubic-bezier(.5,0,.8,.4)'}).onfinish = () => g.remove(); });
+  POLS.forEach((p, k) => {
+    if (p.m.i in oldX) p.el.animate([{translate:`${(oldX[p.m.i] - p.x).toFixed(1)}px 0`}, {translate:'0 0'}], {duration:520, easing:'cubic-bezier(.3,1.25,.5,1)'});
+    else p.el.animate([{translate:'0 -70px', opacity:0}, {translate:'0 6px', opacity:1, offset:.7}, {translate:'0 0', opacity:1}], {duration:560, delay:120 + k*40, easing:'cubic-bezier(.3,.7,.4,1)', fill:'backwards'});
+  });
+}
+function select(i, fromLine){
+  if (i === sel && fromLine){ return; }
+  sel = i;
+  if (sel < start || sel > start + 3) rehang(sel < start ? sel : sel - 3);
+  line.querySelectorAll('.pol').forEach(el => el.classList.toggle('on', +el.dataset.i === sel));
+  /* 点一张，像按了一下快门：白光闪一下 */
+  if (!RM){ const f = $('#flash'); f.classList.remove('go'); void f.offsetWidth; f.classList.add('go'); }
+  const p = POLS.find(q => q.m.i === sel); if (p) p.om += (Math.random() < .5 ? -1 : 1)*.5;
+  sheetFill(); fitSheet();
+  const th = $(`.th[data-i="${sel}"]`); th?.scrollIntoView({inline:'center', block:'nearest', behavior:RM ? 'auto' : 'smooth'});
+}
+
+/* ---------- 抽屉 ---------- */
+function openSheet(on){ sheet.classList.toggle('full', on); }
+const sheetDrag = (() => { let y0 = null, t0 = 0, moved = false;
+  const peek = () => parseFloat(getComputedStyle(sheet).getPropertyValue('--peek')) || 0;
+  return {
+    get moved(){ return moved; },
+    start(y){ y0 = y; moved = false; t0 = sheet.classList.contains('full') ? 0 : peek(); sheet.classList.add('drag'); },
+    move(y){ if (y0 === null) return; const dy = y - y0; if (Math.abs(dy) > 4) moved = true; sheet.style.transform = `translateY(${clamp(t0 + dy, 0, peek())}px)`; },
+    end(y){ if (y0 === null) return; const dy = y - y0; sheet.classList.remove('drag'); sheet.style.transform = ''; if (moved) openSheet(t0 + dy < peek()/2); y0 = null; },
+  };
+})();
+$('#grab').addEventListener('click', () => { if (!sheetDrag.moved) openSheet(!sheet.classList.contains('full')); });
+for (const el of [$('#grab'), $('#sh')]){
+  el.addEventListener('pointerdown', e => { el.setPointerCapture(e.pointerId); sheetDrag.start(e.clientY); });
+  el.addEventListener('pointermove', e => sheetDrag.move(e.clientY));
+  el.addEventListener('pointerup', e => sheetDrag.end(e.clientY)); el.addEventListener('pointercancel', e => sheetDrag.end(e.clientY));
+}
+
+addEventListener('resize', layout);
+strip(); sheetFill(); layout();
+
+/* ---------- 真数据：近七天每次换窗带回了什么（/admin/api/recalls）。一张拍立得＝一次开窗：
+   上个窗口留下的话（thread）、召回的那几条、当时还插着几面旗 ---------- */
+const splitSum = s => { const i = s.search(/[：:]/); return i > 0 && i <= 16 ? [s.slice(0, i), s.slice(i + 1).trim()] : [s.slice(0, 12), s]; };
+Promise.all([hut.api('/recalls?days=7'), hut.api('/thread?n=30'), hut.api('/unresolved')]).then(([rc, th, un]) => {
+  if (!rc || !rc.items.length) return;
+  const byW = Object.fromEntries((th?.items || []).map(t => [t.window, t]));
+  if (un) ITEMS.splice(0, ITEMS.length, ...un.items.map(x => [splitSum(x.summary)[0], (x.initialDate || '').slice(5)]));
+  const shots = rc.items.filter(x => x.selfCheck !== 'fail').map(x => {
+    const prev = byW[x.threadWindow];
+    return {w:(x.threadWindow || 0) + 1, d:x.time.slice(0, 10), h:x.time.slice(11, 16),
+            last:{t:prev ? prev.topics.join('、') : '', s:prev ? prev.current_state : ''},
+            mem:(x.recall || []).map(m => [(m.date || '').slice(5).replace('-', '.'), m.heading || m.snippet || ''])};
+  });
+  SHOTS.splice(0, SHOTS.length, ...shots.map((m, i) => ({...m, i, flags:ITEMS.filter(([, o]) => o && o <= m.d.slice(5))})));
+  sel = SHOTS.length - 1; start = Math.max(0, SHOTS.length - 4); POLS = [];
+  strip(); sheetFill(); layout();
+});
+if (RM){ dev = 1; devApply(); } else requestAnimationFrame(t => { last = t; tick(t); });
+})();
+</script>
+<script>setTimeout(() => document.querySelector('.sheet')?.classList.add('ready'), 600);</script>
