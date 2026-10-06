@@ -38,13 +38,12 @@
 
 - README 的 License 一节补两句：个人在自己的设备或服务器上部署、非商业自用，也在允许范围内；使用时的界面截图、录屏可以分享到社交平台。
 
-### 文档
+## 2026-10-04
 
-- README 按「解决什么问题 → 山屋 → 怎么开始 → 守住的四件事与设计判断 → 技术形态 → 状态」重排，自动浮现压成技术形态里的一条。
-- 《给AI的引导指南》：「TA」只指用户的 AI 伙伴，人叫「用户」；各客户端的接法、代价与坑移到文末附录 A；新增第 9 步问用户要不要山屋，自动浮现、事实模式顺延为第 10、11 步。
-- 新增《工具参考》：八个工具的参数、回执与边界，含 `latent_note_reply`；《快速上手》只讲安装路径，新增 §4c 山屋（怎么开、三把钥匙、便条怎么走、stdio 部署的两条走法）。
-- 《自动浮现》hook 配法、《升级与迁移》（服务名迁移、stdio 便条）、《故障排查》（山屋一节）、《隐
-`。只标不删，同一天的、单独递出的一条旧状态都不标。默认只在同块里比；设了 `LATENT_PASSIVE_STATE_SIM`（余弦线，要在自己的语料上量）才在不同块之间比。
+### 新增
+
+- 事实模式同源成组：最像的两条之外，同一条记忆拆出的其他事实只要也过相似度下限、不在冷却，会一起递出（最多再带 3 条），同一件事的几个面放在一块给。兄弟行只在整段 `content` 不超过 `LATENT_PASSIVE_FACT_GROUP_BYTES`（默认 1000 字节）时才带，最像的两条不受它限制。ready 响应的 `reasonCodes` 带上兄弟行时多一个 `fact_group`。
+- 事实模式“较早的状态”标注：同一轮里递出同一条记忆拆出的几条状态事实、而且事件日期不同时，较早的那条加注“这是较早的状态，可能已被更新”，`reasonCodes` 多一个 `fact_state_older`。只标不删，同一天的、单独递出的一条旧状态都不标。默认只在同块里比；设了 `LATENT_PASSIVE_STATE_SIM`（余弦线，要在自己的语料上量）才在不同块之间比。
 - `latent_supersede` 只补链：新事实已经用 `latent_append` 写进去了，只传 `supersedes`（旧 recordId）和 `by`（新 recordId）、不带 `text`，服务端只在 `.supersessions.json` 补这一段链，不重复写正文、不重建索引。两条都要是现行 timeline 记录、旧的还没被取代、补上不成环，不合要求时报错写明怎么改。`latent_supersede` 的 schema 里 `text`、`current_state` 改为可选（写新事实时仍必填，由服务端校验），没有用根级 `anyOf`。
 - 写入端旧记录提示（默认关）：设了 `LATENT_SUPERSEDE_HINT_MIN`、`LATENT_SUPERSEDE_HINT_LEAD` 后，`latent_append` 写完新记录会用现成向量和现行记录比一次，第一名够高且明显领先时在回执里列出那条旧记录，请 AI 判断要不要只补链；最多两条，不发额外请求。提示与补链记在 `~/.cache/latent-supersede-hints.jsonl`（`LATENT_SUPERSEDE_HINT_LOG` 可改），只有时间与 recordId。两条线要在自己的语料上量：`tests/supersede_hint_calibration.py`。
 - 自动浮现隐藏入口新增可选字段 `origin`（`main`／`derived`）：宿主声明这一轮来自子智能体、派生会话或不是人说的回合（`derived`）时，服务端一律回空（原因码 `origin_derived`），不检索、不登记交付、不记冷却；不传时行为与之前逐位一致。服务端判断不了宿主说的对不对，分不清来源的宿主仍要自己不注入、不调用。
