@@ -189,7 +189,8 @@ def user_prompt_submit(payload, out):
             led.save()
             out.write(text + "\n")
         _observe(**seen, state=state, retrieved=sc.get("status") == "ready", injected=bool(text),
-                 reasonCodes=reasons, elapsedMs=elapsed, incrementalTokens=size,
+                 reasonCodes=reasons, diagnostics=sc.get("diagnostics"),
+                 elapsedMs=elapsed, incrementalTokens=size,
                  ordinaryUsed=led.data["spent"], wireVersion=sc.get("wireVersion"))
 
     if result.get("isError") or sc.get("wireVersion") != WIRE_VERSION \

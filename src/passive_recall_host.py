@@ -163,7 +163,7 @@ class PassiveRecallAdapter:
         self.turn["response"] = {
             key: json.loads(json.dumps(response[key])) for key in (
                 "status", "wireVersion", "policyVersion", "assemblyPolicyVersion",
-                "reasonCodes", "records", "dependencies") if key in response
+                "reasonCodes", "diagnostics", "records", "dependencies") if key in response
         }
         if response["status"] == "empty":
             self.turn["state"] = "empty"
@@ -346,6 +346,7 @@ class PassiveRecallAdapter:
             "retrieved": retrieval_performed,
             "injected": bool(ledger.get("confirmed")),
             "reasonCodes": reason_codes,
+            "diagnostics": response.get("diagnostics") if isinstance(response, dict) else None,
             "sourceIds": source_ids,
             "dependencyCoverage": "complete" if source_ids else "none",
             "visibility": ledger.get("visibility", "unknown"),

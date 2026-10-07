@@ -149,6 +149,33 @@ class FactModeTests(unittest.TestCase):
         self.assertTrue(legacy.cooling("y", midnight + 11 * 3600))
         self.assertFalse(legacy.cooling("y", midnight + 13 * 3600))
 
+    def test_margin_code_top1_minus_top2_before_floor_and_cooldown(self):
+        """ready 末尾带一个 fact_margin:<排除后第 1 名减第 2 名>，不看下限与冷却；其余原因码与加它之前一样。"""
+        exclude = lambda row: (row["meta"].get("written") or "") >= TODAY
+
+        def margin_of(service, text):
+            (_r1, s1), (_r2, s2) = service.fact_index.ranked(text, exclude=exclude, top=2)
+            return f"fact_margin:{s1 - s2:.3f}"
+
+        # 排除后只剩 1 条（今天＝01-03，只有 a 写在之前）：没有第 2 名，不给分差。
+        single = _ask(self.service(today="2026-01-03"), "九月想喝酒", 0)
+        self.assertEqual(single["status"], "ready", single)
+        self.assertFalse([c for c in single["reasonCodes"] if c.startswith("fact_margin:")], single)
+        self.cool_path.unlink()
+        # 第 2 名低于下限（a 0.55／c 0.13）：只递 1 条，分差照算。
+        service = self.service()
+        codes = _ask(service, "九月想喝酒", 1)["reasonCodes"]
+        self.assertEqual(codes, ["fact_mode_signal", "w4_assembled", "fact_top2",
+                                 codes[3], margin_of(service, "九月想喝酒")], codes)
+        self.assertTrue(codes[3].startswith("fact_score:") and len(codes[-1]) <= 20, codes)
+        # 第 1 名在冷却（b 0.54／f 0.50）：只递 f，分差仍是 b 减 f，不往下顺延。
+        service = self.service()
+        top1 = service.fact_index.ranked("她的猫", exclude=exclude, top=1)[0][0]
+        service.fact_cooldown.mark([pr._chunk_key(top1["text"])], service._now())
+        result = _ask(service, "她的猫", 2)
+        self.assertEqual(len(result["records"]), 1, result)
+        self.assertEqual(result["reasonCodes"][-1], margin_of(service, "她的猫"))
+
     def test_floor_drops_unrelated(self):
         result = _ask(self.service(), "qqqq zzzz xxxx", 1)
         self.assertEqual(result["reasonCodes"], ["fact_below_floor"], result)

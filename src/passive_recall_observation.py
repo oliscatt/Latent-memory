@@ -23,7 +23,7 @@ _FIELDS = {
     "statusUsed", "policyVersion", "assemblyPolicyVersion", "wireVersion",
     "failurePoint", "reviewRequired", "shadowStrictState", "shadowWideState",
     "model", "base", "requestInputTokens", "cachedInputTokens",
-    "historyAddedMessages", "historyAddedChars",
+    "historyAddedMessages", "historyAddedChars", "diagnostics",
 }
 _FORBIDDEN = {"userInput", "input", "prompt", "content", "answer", "history",
               "messages", "apiKey", "authorization"}
@@ -47,9 +47,9 @@ def safe_base(value):
     return urlunsplit((parts.scheme, host, parts.path, "", ""))
 
 
-# 这几类原因码的冒号后面是用户这句话里的词（主题词、锚点词），只留前缀；
-# 分数类（fact_score:0.512）是数字，照留。
-_WORD_BEARING_REASONS = ("topic:", "anchor:")
+# 这几类原因码（含 diagnostics 里的短码）冒号后面是用户这句话里的词（主题词、锚点词、
+# 没命中／没覆盖到的词），只留前缀；分数、计数类（fact_score:0.512、topic_hits:1/2）照留。
+_WORD_BEARING_REASONS = ("topic:", "anchor:", "topic_missing:", "uncovered:")
 
 
 def _safe_reason(code):
@@ -73,8 +73,9 @@ def sanitize_observation(event):
     clean = {key: value for key, value in event.items() if value is not None}
     if "base" in clean:
         clean["base"] = safe_base(clean["base"])
-    if isinstance(clean.get("reasonCodes"), list):
-        clean["reasonCodes"] = [_safe_reason(code) for code in clean["reasonCodes"]]
+    for key in ("reasonCodes", "diagnostics"):
+        if isinstance(clean.get(key), list):
+            clean[key] = [_safe_reason(code) for code in clean[key]]
     clean["schemaVersion"] = SCHEMA_VERSION
     clean["observedAt"] = datetime.now(timezone.utc).isoformat()
     return clean
@@ -112,12 +113,18 @@ def _selftest():
                                                              "anchor:风车岛", "fact_score:0.512"]})
         assert worded["reasonCodes"] == ["specific_user_signal", "topic", "anchor", "fact_score:0.512"]
         assert "冰淇淋" not in recorder.path.read_text(encoding="utf-8"), "原因码不许带出用户原话里的词"
+        diagnosed = recorder({"event": "turn", "reasonCodes": ["no_reliable_candidate"], "diagnostics": [
+            "path:topic_gate", "candidates:1", "admitted:0", "topic_hits:1/2",
+            "topic_missing:机能", "uncovered:显示", "uncovered:浮现"]})
+        assert diagnosed["diagnostics"] == ["path:topic_gate", "candidates:1", "admitted:0", "topic_hits:1/2",
+                                            "topic_missing", "uncovered", "uncovered"]
+        assert "显示" not in recorder.path.read_text(encoding="utf-8"), "调试出口落盘不许带出用户原话里的词"
         try:
             recorder({"event": "turn", "content": "不应落盘的原文"})
             raise AssertionError("原文字段必须被拒绝")
         except ValueError:
             pass
-    print("W5 observation selftest 通过：字段白名单、会话散列、默认不收原文")
+    print("W5 observation selftest 通过：字段白名单、会话散列、默认不收原文、调试出口只留前缀")
 
 
 if __name__ == "__main__":
