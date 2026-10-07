@@ -262,6 +262,34 @@ class FactModeTests(unittest.TestCase):
                 {"fact": "她说周末想去看海边的日落。"}, {"fact": "短"}])
         self.assertFalse((root / "增量").exists(), "整批拒收，不半写")
 
+    def test_facts_error_names_item_length_and_right_shape(self):
+        # 判据：报错要指出第几条、哪一项、实际字符数与上下限，“写对”是 facts 自己的形状且能直接过校验。
+        try:
+            import mcp_server
+        except SyntaxError:
+            self.skipTest("mcp_server 需要 Python 3.12+")
+        from memory_retrieval import MemoryIndex
+        from passive_facts import append_facts
+        long_fact = ("她把阳台的绿萝换了一个蓝色的新花盆，" * 10)[:137]
+        facts = [{"fact": f"她说第{n}个周末想去看海边的日落。", "tag": "life", "kind": "event"} for n in range(8)]
+        facts[2] = {"fact": long_fact, "tag": "life", "kind": "event"}
+        corpus = Path(self.tmp.name) / "timeline"
+        corpus.mkdir()
+        srv = mcp_server.MemoryServer(index=MemoryIndex().build(), corpus_dir=str(corpus))
+        with self.assertRaises(mcp_server.ToolError) as caught:
+            srv._tool_memory_append({"text": "她今天换了花盆。", "current_state": "已换", "facts": facts})
+        msg = str(caught.exception)
+        for needle in ("facts[2]", "137", "8～120", "按字符数算"):
+            self.assertIn(needle, msg)
+        right = json.loads(next(l for l in msg.splitlines() if l.startswith("写对："))[3:])
+        self.assertTrue(right["facts"])
+        self.assertTrue(all(set(item) == {"fact", "tag", "kind"} for item in right["facts"]), right)
+        self.assertEqual(append_facts(Path(self.tmp.name) / "lib", "local", "2026-01-08", "blk", right["facts"]),
+                         len(right["facts"]), "“写对”要能直接通过校验")
+        with self.assertRaisesRegex(ValueError, r"facts\[1\]\.tag"):
+            append_facts(Path(self.tmp.name) / "lib", "local", "2026-01-08", "blk",
+                         [facts[0], {"fact": facts[1]["fact"], "tag": "home"}])
+
     def test_latent_append_writes_facts_linked_to_record(self):
         try:
             import mcp_server
@@ -960,6 +988,14 @@ class SupersedeHintTests(unittest.TestCase):
         self.assertEqual(listed(False), names)
         self.assertEqual(listed(True), names + [self.mcp.PASSIVE_RECALL_TOOL])
         self.assertEqual((len(listed(False)), len(listed(True))), (8, 9))
+
+
+class FactFloorCalibrationTests(unittest.TestCase):
+    def test_tool_selftest(self):
+        """tests/fact_floor_calibration.py 随包；它的自检（判据 1a～1c）跟着发布检查跑，不靠人记得单独跑。"""
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import fact_floor_calibration
+        fact_floor_calibration.selftest()
 
 
 if __name__ == "__main__":

@@ -271,7 +271,7 @@ TOOLS = [
                                    "对方买了什么、你们搭了什么、定了什么约定、对方的身体和情绪、一句原话、"
                                    "一个具体数字。一句只讲一件事，写清主语，不写空泛总结。",
                     "items": {"type": "object", "properties": {
-                        "fact": {"type": "string", "description": "一句话，8–120 字"},
+                        "fact": {"type": "string", "description": "一句话，8–120 字（按字符数算，一个汉字算一个）"},
                         "tag": {"type": "string", "enum": ["life", "work", "meta"]},
                         "kind": {"type": "string", "enum": ["event", "state"],
                                  "description": "event＝那天发生了什么；state＝现在是什么状态、以后可能变"},
@@ -560,7 +560,7 @@ FACT_BACKFILL_TOOL_SCHEMA = {
                 "items": {"type": "object", "properties": {
                     "block": {"type": "string"},
                     "facts": {"type": "array", "items": {"type": "object", "properties": {
-                        "fact": {"type": "string", "description": "一句话，8–120 字"},
+                        "fact": {"type": "string", "description": "一句话，8–120 字（按字符数算，一个汉字算一个）"},
                         "tag": {"type": "string", "enum": ["life", "work", "meta"]},
                         "kind": {"type": "string", "enum": ["event", "state"]},
                         "event_date": {"type": "string", "description": "YYYY-MM-DD，拿不准就省略"},
@@ -629,6 +629,10 @@ _APPEND_INPUT_EXAMPLES = {
     "mode": (
         '{"mode":"dry-run","text":"她说下周要去复查","current_state":"日期还没定"}',
         '{"mode":"preflight","text":"她说下周要去复查","current_state":"日期还没定"}'
+    ),
+    "facts": (
+        '{"facts":[{"text":"她周六在楼下面馆吃了一碗牛肉面"}]}',
+        '{"facts":[{"fact":"她周六在楼下面馆吃了一碗牛肉面","tag":"life","kind":"event"}]}'
     ),
     "unresolved": (
         '{"unresolvedOps":[]}',
@@ -1023,9 +1027,10 @@ class MemoryServer:
         self.recall = SessionRecall(self.index, topN=recall_topN, thread_store=self.thread_store,
                                     time_context=self.time_context,
                                     unresolved_store=self.unresolved_store,
-                                    per_day_cap=recall_per_day_cap,
-                                    log_path=(Path(corpus_dir) / RECALL_LOG_FILENAME
-                                              if corpus_dir is not None else None))
+                                    per_day_cap=recall_per_day_cap)
+        # 换窗召回记录只给山屋的拍立得看：路径先留着，enable_notes()（开了页面钥匙）才接上
+        self.recall_log_path = (Path(corpus_dir) / RECALL_LOG_FILENAME
+                                if corpus_dir is not None else None)
         fact_index = fact_cooldown = None
         if enable_passive_recall:
             # 事实模式：显式配了 LATENT_PASSIVE_FACTS，或语料旁的「事实库/」里已有全量回填就启用；
@@ -1597,7 +1602,7 @@ class MemoryServer:
                 with tempfile.TemporaryDirectory() as probe:   # 只校验，不落盘
                     append_facts(probe, "probe", "2000-01-01", "0" * 16, facts)
             except ValueError as e:
-                raise ToolError(_append_input_error(f"facts 格式不对：{e}", "full")) from None
+                raise ToolError(_append_input_error(f"facts 格式不对：{e}", "facts")) from None
         result = self._tool_memory_append_core(core_args, now=now)
         if core_args.get("mode", "write") != "write" or core_args.get("recordId"):
             return result
@@ -2311,11 +2316,13 @@ class MemoryServer:
         raise ToolError("action 只能是 status／next／submit／finish")
 
     def enable_notes(self):
-        """开了页面口子才调：工具表多一个 latent_note_reply，开场最先给还在等的便条。"""
+        """开了页面口子才调：工具表多一个 latent_note_reply，开场最先给还在等的便条，
+        换窗召回记录从此开始记（给拍立得看；没开页面就没人读，不写）。"""
         if not self.notes_enabled:
             self.notes_enabled = True
             self.tools.append(NOTE_REPLY_TOOL_SCHEMA)
             self.recall.notes_store = self.notes_store
+            self.recall.log_path = self.recall_log_path
 
     def _tool_note_reply(self, args, now=None):
         at = self.time_context.isoformat(now if now is not None else time.time())
@@ -7956,9 +7963,17 @@ def _selftest():
             f"stdio 下配了 admin 钥匙也要开便条：工具表里没有 {NOTE_REPLY_TOOL}：{sorted(names_on)}"
         assert opening_on.startswith("【对方写给你的便条】") and "那天不是周二，是周三。" in opening_on, \
             f"stdio 下开场要最先给还没回的便条原文：{opening_on[:300]}"
+        # 换窗召回记录只给山屋的拍立得看：开了页面钥匙才记，没开不写（没人读的账本不该写，
+        # 语料在 git 里的用户会把它一起提交进去）。变异：把 enable_notes() 里接 log_path 那句删掉 → 第一条红；
+        # 把构造 SessionRecall 时的 log_path 改回按 corpus 给 → 第二条红
+        log28 = c28 / RECALL_LOG_FILENAME
+        assert log28.exists() and "session_start" in log28.read_text(encoding="utf-8"), \
+            "开了 admin 钥匙，换窗召回要记进 .recall-log.jsonl"
+        log28.unlink()
         names_off, opening_off = stdio_run28(c28, {})
         assert NOTE_REPLY_TOOL not in names_off and "便条" not in opening_off, \
             f"没配 admin 钥匙时工具表与开场都不该变：{sorted(names_off)} / {opening_off[:200]}"
+        assert not log28.exists(), "没开页面钥匙时不该写换窗召回记录（没人读它）"
 
     print("selftest ok（28项断言：握手 / 工具表 / 调用往返 / 薄适配层 / 错误分层（含 "
           "session_start 读取异常只重试一次、未预料异常不空断、写工具不重放）/ "
@@ -8002,7 +8017,7 @@ def _selftest():
           "长流被关掉＝指出口、开满＝说开满），且三句都不许糊到别的被拒行上）/ "
           "--log-file 让 stderr 留得下痕·真进程（诊断人话落盘、父目录自建、"
           "每次启动一条带 pid 的横幅，同一文件跑两次＝两条横幅且追加不截断——"
-          "「子进程重启过」由此可直接读出，不必再靠 token 账单倒推） / 隐藏入口按凭证隔离·真 HTTP（开自动浮现时宿主凭证 10 项、普通凭证恰 9 项且其余九项逐字不变；普通凭证盲调隐藏入口回「未知工具」而非参数校验错——凭证判断早于校验，错误文案不泄漏入口的存在与形状；宿主那条路的返回结构与三个 version 字段照旧；没配 --hook-token 时 fail-closed：所有凭证都看不见、盲调也是未知工具，宿主 hook 自己也用不了，漏配当场坏而不是静默全开） / 页面读数据的口子·真端口（默认关、三把钥匙互不通用、只收 GET、外来 Origin 403、no-store、参数超限 400、静态页不出目录；便条：不开口子没有回便条的工具、模型那把钥匙贴不进、空的 400、POST 只有便条一条路、开场最先列、不改必须说为什么、回了页面看得到、回过不再进开场） / stdio 下配 --admin-token 也开便条·真进程（只配环境变量、没有 --http：工具表有 latent_note_reply、开场最先给还没回的便条原文；不配时两样都没有）")
+          "「子进程重启过」由此可直接读出，不必再靠 token 账单倒推） / 隐藏入口按凭证隔离·真 HTTP（开自动浮现时宿主凭证 10 项、普通凭证恰 9 项且其余九项逐字不变；普通凭证盲调隐藏入口回「未知工具」而非参数校验错——凭证判断早于校验，错误文案不泄漏入口的存在与形状；宿主那条路的返回结构与三个 version 字段照旧；没配 --hook-token 时 fail-closed：所有凭证都看不见、盲调也是未知工具，宿主 hook 自己也用不了，漏配当场坏而不是静默全开） / 页面读数据的口子·真端口（默认关、三把钥匙互不通用、只收 GET、外来 Origin 403、no-store、参数超限 400、静态页不出目录；便条：不开口子没有回便条的工具、模型那把钥匙贴不进、空的 400、POST 只有便条一条路、开场最先列、不改必须说为什么、回了页面看得到、回过不再进开场） / stdio 下配 --admin-token 也开便条·真进程（只配环境变量、没有 --http：工具表有 latent_note_reply、开场最先给还没回的便条原文、换窗召回记录落盘；不配时三样都没有）")
 
 
 if __name__ == "__main__":

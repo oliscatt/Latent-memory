@@ -50,10 +50,26 @@ _QUOTED_SPANS = re.compile(r"“[^”]*”|‘[^’]*’|\"[^\"]*\"|'[^']*'")
 
 # 分词与词性负责主题识别；排除表只补充词典可能误标为名词的称呼及泛指。
 # 不用低频字符二元组充当内容词；HMM 关闭，未知词不猜成专名。
-# 内置默认准入表：只放通用中文泛词与称呼。部署方自己的人名、昵称这类私有词放进覆盖文件
+# 内置默认准入表：只放通用中文泛词、称呼和 jieba 标成 eng 的拼音／英文语气词（ok、emm、233……）。
+# 部署方自己的人名、昵称这类私有词放进覆盖文件
 # （LATENT_PASSIVE_ADMISSION_CONFIG 指定，或本文件旁的 passive_admission.json），不改这里。
 DEFAULT_ADMISSION_POLICY = {
     "query_fillers": [
+        "233",
+        "em",
+        "emm",
+        "emmm",
+        "emmmm",
+        "enmm",
+        "haha",
+        "hahaha",
+        "hh",
+        "hhh",
+        "hhhh",
+        "hmm",
+        "hmmm",
+        "ok",
+        "okk",
         "上次",
         "东西",
         "事情",
@@ -151,6 +167,21 @@ DEFAULT_ADMISSION_POLICY = {
         ]
     },
     "context_fillers": [
+        "233",
+        "em",
+        "emm",
+        "emmm",
+        "emmmm",
+        "enmm",
+        "haha",
+        "hahaha",
+        "hh",
+        "hhh",
+        "hhhh",
+        "hmm",
+        "hmmm",
+        "ok",
+        "okk",
         "上次",
         "东西",
         "为什么",
@@ -1911,6 +1942,20 @@ def __selftest_filler_ranking_body():
     print("selftest 口语虚词排序：通过（中性五问、主题约束、空结果、只读与字节上限）")
 
 
+def _selftest_interjection_fillers():
+    """判据：拼音／英文语气词不进主题词与实质词；句子本身的动词照旧留着（那要靠覆盖率）。"""
+    assert "enmm" not in _context_terms("enmm, 关于咖啡机你能想起什么？", ())
+    assert "emm" not in _context_terms("哈哈 emm 咖啡机后来修好了没", ())
+    kept = _context_terms("这次显示ok了，关于咖啡机能浮现什么？", ())
+    assert {"显示", "浮现"} <= set(kept), f"第 1 步只补排除表，不越界改语义：{kept}"
+    for word in ("233", "em", "emm", "emmm", "emmmm", "enmm", "haha", "hahaha",
+                 "hh", "hhh", "hhhh", "hmm", "hmmm", "ok", "okk"):
+        sentence = f"{word} 咖啡机后来修好了没"
+        assert word not in _context_terms(sentence, ()), f"实质词里不该有语气词 {word}"
+        assert word not in _topic_terms(sentence), f"主题词里不该有语气词 {word}"
+    print("selftest 语气词排除：通过（enmm／emm 等 15 个不进主题词与实质词，动词照旧留着）")
+
+
 def _selftest_topic_admission():
     with _hotwords_pinned(None):
         return __selftest_topic_admission_body()
@@ -2126,6 +2171,7 @@ def _selftest():
     _selftest_hotwords_path()
     _selftest_not_current()
     _selftest_topic_admission()
+    _selftest_interjection_fillers()
     _selftest_filler_ranking()
     _selftest_rare_path()
     _selftest_rare_excerpt_anchor()

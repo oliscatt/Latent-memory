@@ -29,7 +29,8 @@ from memory_retrieval import _chunk_key
 FACT_TOP = 2
 # 噪音下限：只挡「跟哪件事都不沾边」的句子，不是准入门槛（相关与否仍交给回话的模型）。
 # 默认 0.42 是在 voyage-3.5 上定的（开发集 89 句：砍掉约两成无用递送、该接的 28 道一道不丢）；
-# 换了向量模型余弦分布会变，用 LATENT_PASSIVE_FACT_FLOOR 调。
+# 只对 voyage-3.5 成立；换了向量模型余弦分布会变，先用 tests/fact_floor_calibration.py 在自己的事实库上量，
+# 再用 LATENT_PASSIVE_FACT_FLOOR 调。别的模型没标过，不给默认值。
 FACT_FLOOR = float(os.environ.get("LATENT_PASSIVE_FACT_FLOOR") or 0.42)
 # 同源成组：一条记忆拆出的几条是同一件事的几个面，前 2 名之外每轮最多再带这么多条同块的。
 FACT_SIBLINGS = 3
@@ -229,24 +230,29 @@ def _fact_rows(block, written, facts, *, allow_empty=False):
     if not isinstance(facts, list) or (not facts and not allow_empty):
         raise ValueError("facts 必须是非空数组")
     rows = []
-    for item in facts:
+    for i, item in enumerate(facts):
         if isinstance(item, str):
             item = {"fact": item}
         if not isinstance(item, dict):
-            raise ValueError("facts 每项必须是对象或字符串")
+            raise ValueError(f"facts[{i}] 必须是对象或字符串")
+        if "fact" not in item:
+            raise ValueError(f"facts[{i}] 没有 fact 字段（那句话写在 fact 里，不是 text）")
         text = str(item.get("fact") or "").strip()
         if not 8 <= len(text) <= 120:
-            raise ValueError(f"事实要一句话、8–120 字：{text[:20]}…")
+            raise ValueError(f"facts[{i}].fact {len(text)} 字，要 8～120 字（按字符数算，"
+                             f"一个汉字算一个）：{text[:20]}…")
         tag = item.get("tag", "life")
         kind = item.get("kind", "event")
         event_date = item.get("event_date")
-        if tag not in {"life", "work", "meta"} or kind not in {"event", "state"}:
-            raise ValueError("tag 只收 life／work／meta，kind 只收 event／state")
+        if tag not in {"life", "work", "meta"}:
+            raise ValueError(f"facts[{i}].tag 是 {tag!r}，只收 life／work／meta")
+        if kind not in {"event", "state"}:
+            raise ValueError(f"facts[{i}].kind 是 {kind!r}，只收 event／state")
         if event_date is not None:
             try:
                 _dt.date.fromisoformat(str(event_date))
             except ValueError:
-                raise ValueError(f"event_date 要写成 YYYY-MM-DD，拿不准就省略：{event_date}") from None
+                raise ValueError(f"facts[{i}].event_date 要写成 YYYY-MM-DD，拿不准就省略：{event_date}") from None
         fid = "f" + hashlib.sha256(f"{block}|{text}".encode()).hexdigest()[:12]
         rows.append({"id": fid, "fact": text, "event_date": event_date, "written": written,
                      "block": block, "tag": tag, "kind": kind})
