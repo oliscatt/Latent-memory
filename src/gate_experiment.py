@@ -394,7 +394,7 @@ def selftest():
     k≥2 真的比 k≥1 严、护栏是从 harness 走的不是另抄一份。"""
     chunks = ["周三下午去学了陶艺，拉坯拉坏了三个，老师说手太急。",
               "昨天猫把水杯打翻了，键盘遭殃，擦了半天。",
-              "楼下那家螺蛳粉店换了老板，味道淡了不少。"]
+              "楼下那家牛肉面馆换了老板，味道淡了不少。"]
     idx = MemoryIndex()
     for c in chunks:
         idx.add(c, {})
@@ -410,11 +410,11 @@ def selftest():
 
     # 2. span 越长越严，k 越大越严（方向性，不是具体数值）
     with apply_gate(make_gate(_units_span(2))):
-        wide = MemoryIndex.lexical_admit(idx, "楼下那家螺蛳粉店")
+        wide = MemoryIndex.lexical_admit(idx, "楼下那家牛肉面馆")
     with apply_gate(make_gate(_units_span(4))):
-        narrow = MemoryIndex.lexical_admit(idx, "楼下那家螺蛳粉店")
+        narrow = MemoryIndex.lexical_admit(idx, "楼下那家牛肉面馆")
     with apply_gate(make_gate(_units_span(2), k=2)):
-        k2 = MemoryIndex.lexical_admit(idx, "楼下那家螺蛳粉店")
+        k2 = MemoryIndex.lexical_admit(idx, "楼下那家牛肉面馆")
     assert wide, "对照组是空集——三者全空时下面那条包含关系恒成立，等于没测"
     assert narrow <= wide and k2 <= wide, "更严的判据放行的块不该更多"
 

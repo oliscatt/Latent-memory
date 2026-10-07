@@ -270,7 +270,7 @@ class FactModeTests(unittest.TestCase):
         self.assertEqual(index.root, root)
         before = len(index.rows)
         append_facts(root, "local", "2026-01-08", "blk-new", [
-            {"fact": "她说周末想去看海边的日落，想带上拍立得。", "tag": "life"}])
+            {"fact": "她说周末想去看海边的日落，想带上相机。", "tag": "life"}])
         self.assertTrue(index.reload_if_changed(min_interval=0))
         for _ in range(50):
             if len(index.rows) == before + 1 and index.vectors is not None \

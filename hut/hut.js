@@ -1,6 +1,6 @@
 /* 山屋各页之间的总线。
    页面单独打开时什么都不做（按钮照旧）；装进全景（prototype.html）时，返回、回到那一天、这条记错了、去地图看都交给全景去切页。
-   hut.go('cassette', {date:'2026-06-18'})  推到磁带那一天
+   hut.go('cassette', {date:'2026-04-18'})  推到磁带那一天
    hut.go('lock', {quote, date, kind:'wrong'|'changed'})  写给 TA，便利贴上先印好是哪一条
    hut.go('map')  去地图
    hut.onShow(data => …)  全景切过来时带的东西 */
