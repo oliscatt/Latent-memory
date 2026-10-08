@@ -28,6 +28,8 @@ WIRE_VERSION = "passive-recall-w4-v1"
 POLICY_VERSION = "passive-admission-w3-v1"
 ASSEMBLY_POLICY_VERSION = "passive-assembly-w4-v1"
 TOOL_NAME = "latent_passive_recall"
+# fact_lead 比第 1 名和第 2～11 名的均值（第 1 名之后最多取 10 名）。
+FACT_LEAD_RANKS = 11
 
 # 「这个参数没给」与「给了 None」要分得开：_live_blocks() 本身就会返回 None（表示不做这道检查）。
 _UNSET = object()
@@ -1610,6 +1612,10 @@ class PassiveRecallService:
             return empty("fact_no_embedding")
         # 前两名分差只供宿主参考、不当门槛：在下限与冷却之前算，说的是最像的那条有多突出，与这轮递几条无关。
         margin = [f"fact_margin:{scored[0][1] - scored[1][1]:.3f}"] if len(scored) > 1 else []
+        # 同样只供参考：第 1 名减第 2～11 名的均值，不足 11 名按实有的算，只剩 1 名不给。
+        if len(scored) > 1:
+            rest = [score for _row, score in scored[1:FACT_LEAD_RANKS]]
+            margin.append(f"fact_lead:{scored[0][1] - sum(rest) / len(rest):.3f}")
         above = [(row, score) for row, score in scored if score >= FACT_FLOOR]
         # 只看最像的前 2 名，不往下挖：冷却中的直接去掉、不由第 3、4 名顶上——
         # 同一话题连着聊时第一轮递过，后面就安静；否则越挖越不沾边，递的全是噪音。

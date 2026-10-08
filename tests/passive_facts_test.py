@@ -57,6 +57,12 @@ def _ask(service, text, n, session="s"):
         "sessionId": session, "turnId": str(n), "deliveryId": f"{session}-{n}"}})
 
 
+def _lead_of(service, text, exclude):
+    ranked = service.fact_index.ranked(text, exclude=exclude, top=None)
+    rest = [score for _row, score in ranked[1:11]]
+    return f"fact_lead:{ranked[0][1] - sum(rest) / len(rest):.3f}"
+
+
 def pr_fact_index_or_none(root):
     from passive_facts import fact_index_from_env
     return fact_index_from_env(None, default_root=root)[0]
@@ -150,31 +156,85 @@ class FactModeTests(unittest.TestCase):
         self.assertFalse(legacy.cooling("y", midnight + 13 * 3600))
 
     def test_margin_code_top1_minus_top2_before_floor_and_cooldown(self):
-        """ready 末尾带一个 fact_margin:<排除后第 1 名减第 2 名>，不看下限与冷却；其余原因码与加它之前一样。"""
+        """ready 末尾带 fact_margin:<排除后第 1 名减第 2 名>、fact_lead:<第 1 名减第 2～11 名均值>，
+        不看下限与冷却；其余原因码与加它们之前一样。"""
         exclude = lambda row: (row["meta"].get("written") or "") >= TODAY
 
         def margin_of(service, text):
             (_r1, s1), (_r2, s2) = service.fact_index.ranked(text, exclude=exclude, top=2)
             return f"fact_margin:{s1 - s2:.3f}"
 
-        # 排除后只剩 1 条（今天＝01-03，只有 a 写在之前）：没有第 2 名，不给分差。
+        # 排除后只剩 1 条（今天＝01-03，只有 a 写在之前）：没有第 2 名，两个码都不给。
         single = _ask(self.service(today="2026-01-03"), "九月想喝酒", 0)
         self.assertEqual(single["status"], "ready", single)
-        self.assertFalse([c for c in single["reasonCodes"] if c.startswith("fact_margin:")], single)
+        self.assertFalse([c for c in single["reasonCodes"]
+                          if c.startswith(("fact_margin:", "fact_lead:"))], single)
         self.cool_path.unlink()
         # 第 2 名低于下限（a 0.55／c 0.13）：只递 1 条，分差照算。
         service = self.service()
         codes = _ask(service, "九月想喝酒", 1)["reasonCodes"]
         self.assertEqual(codes, ["fact_mode_signal", "w4_assembled", "fact_top2",
-                                 codes[3], margin_of(service, "九月想喝酒")], codes)
-        self.assertTrue(codes[3].startswith("fact_score:") and len(codes[-1]) <= 20, codes)
+                                 codes[3], margin_of(service, "九月想喝酒"),
+                                 _lead_of(service, "九月想喝酒", exclude)], codes)
+        self.assertTrue(codes[3].startswith("fact_score:") and all(len(c) <= 20 for c in codes[-2:]), codes)
         # 第 1 名在冷却（b 0.54／f 0.50）：只递 f，分差仍是 b 减 f，不往下顺延。
         service = self.service()
         top1 = service.fact_index.ranked("她的猫", exclude=exclude, top=1)[0][0]
         service.fact_cooldown.mark([pr._chunk_key(top1["text"])], service._now())
         result = _ask(service, "她的猫", 2)
         self.assertEqual(len(result["records"]), 1, result)
-        self.assertEqual(result["reasonCodes"][-1], margin_of(service, "她的猫"))
+        self.assertEqual(result["reasonCodes"][-2:], [margin_of(service, "她的猫"),
+                                                      _lead_of(service, "她的猫", exclude)])
+
+    def test_lead_code_mean_of_ranks_two_to_eleven(self):
+        """fact_lead＝第 1 名减第 2～11 名的算术平均；候选不足 11 名按实有的算，只剩 1 名不给，空结果不给。"""
+        exclude = lambda row: (row["meta"].get("written") or "") >= TODAY
+        # 夹具排除后 4 条候选（a、b、c、f）：按第 2～4 名的均值算。
+        service = self.service()
+        ranked = service.fact_index.ranked("九月想喝酒", exclude=exclude, top=None)
+        self.assertEqual(len(ranked), 4)
+        scores = [s for _r, s in ranked]
+        want = f"fact_lead:{scores[0] - sum(scores[1:]) / 3:.3f}"
+        self.assertEqual(_ask(service, "九月想喝酒", 1)["reasonCodes"][-1], want)
+        # 再写 14 条（排除后 18 条候选）：只取第 2～11 名，第 12 名以后不进均值。
+        extra = [{"id": f"x{i:02d}", "block": f"blk-x{i:02d}", "fact": f"她九月去第{i}家店喝了一杯酒。",
+                  "event_date": None, "written": "2026-01-05", "tag": "life", "kind": "event"} for i in range(14)]
+        with open(self.path, "a", encoding="utf-8") as fh:
+            fh.writelines(json.dumps(f, ensure_ascii=False) + "\n" for f in extra)
+        self.cool_path.unlink()
+        service = self.service()
+        ranked = service.fact_index.ranked("九月想喝酒", exclude=exclude, top=None)
+        self.assertEqual(len(ranked), 18)
+        scores = [s for _r, s in ranked]
+        want = f"fact_lead:{scores[0] - sum(scores[1:11]) / 10:.3f}"
+        self.assertNotEqual(want, f"fact_lead:{scores[0] - sum(scores[1:]) / 17:.3f}",
+                            "夹具得让第 12 名以后的分数改变均值，才验得出只取到第 11 名")
+        codes = _ask(service, "九月想喝酒", 2)["reasonCodes"]
+        self.assertEqual(codes[-1], want, codes)
+        self.assertEqual(sum(c.startswith("fact_lead:") for c in codes), 1, codes)
+        # 空结果（与哪条都不够像）没有它。
+        self.assertEqual(_ask(service, "qqqq zzzz xxxx", 3)["reasonCodes"], ["fact_below_floor"])
+
+    def test_lead_code_does_not_change_delivery(self):
+        """fact_lead 不参与任何门槛和排序：递哪几条只由下限、冷却和前 2 名决定，其余原因码与加它之前同形。"""
+        exclude = lambda row: (row["meta"].get("written") or "") >= TODAY
+        service = self.service()
+        inputs = ["九月想喝酒", "她的猫", "九月想喝酒", "海边的汤饭", "猫和球", "qqqq zzzz xxxx"]
+        for n, text in enumerate(inputs):
+            ranked = service.fact_index.ranked(text, exclude=exclude, top=2)
+            want = [pr._chunk_key(row["text"]) for row, score in ranked
+                    if score >= pr.FACT_FLOOR
+                    and not service.fact_cooldown.cooling(pr._chunk_key(row["text"]), service._now())]
+            result = _ask(service, text, n)
+            self.assertEqual([r["recordId"] for r in result.get("records", [])], want, (text, result))
+            codes = [c for c in result["reasonCodes"] if not c.startswith("fact_lead:")]
+            if result["status"] == "ready":
+                self.assertEqual(codes[:3], ["fact_mode_signal", "w4_assembled", "fact_top2"], codes)
+                self.assertTrue(all(c.startswith("fact_score:") for c in codes[3:-1]), codes)
+                self.assertTrue(codes[-1].startswith("fact_margin:"), codes)
+            else:
+                self.assertEqual(codes, result["reasonCodes"], "空结果不带 fact_lead")
+        self.assertTrue(self.cool_path.exists())
 
     def test_floor_drops_unrelated(self):
         result = _ask(self.service(), "qqqq zzzz xxxx", 1)
