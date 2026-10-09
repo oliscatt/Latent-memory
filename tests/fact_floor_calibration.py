@@ -11,6 +11,9 @@
    有东西浮上来的句子。只看每句前 2 条，线上也只递这 2 条（同块兄弟行不在表里）。
    加 --margins 改扫前两名分差（线上 ready 响应里的 fact_margin）：一句的分差够了前 2 条都留、不够都不留，
    可再用 --floor 叠在某个下限之上。表头另有一行 AUC：相关排在不相关前面的概率，按分数、按分差各一个。
+   加 --align-to <参照分数文件> [--ref-floor 0.42] 先按浮出比例对齐再比（换模型、改了分数分布时用）：算参照配置在
+   参照下限上“有东西浮上来的句子”占比，在本文件扫的各档里挑占比最接近的那档（平手取大），表后单独报那一档。
+   对齐只看分数、不看标注，参照文件可以是没标的 score 输出；只用于扫下限。
 
 句子取自历史聊天时，行首写提问日加一个制表符（`2026-09-01<TAB>句子`）：写入日不早于那天的事实不算，
 跟那句话当天线上能递的一致；不写就按今天算，事后从这段对话里提出来的事实会混进来。
@@ -26,6 +29,7 @@
   （在 分数.json 里标 "相关"）
   python tests/fact_floor_calibration.py sweep 分数.json [--floors 0.40 0.42 0.45 …]
   python tests/fact_floor_calibration.py sweep 分数.json --margins [0.05 0.10 …] [--floor 0.42]
+  python tests/fact_floor_calibration.py sweep 新分数.json --align-to 参照分数.json [--ref-floor 0.42] [--floors …]
   python tests/fact_floor_calibration.py --selftest
 """
 import argparse
@@ -34,10 +38,11 @@ import json
 import os
 import re
 import sys
+from fractions import Fraction
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from passive_facts import FACT_TOP, FactIndex, FactVectorCache      # noqa: E402
+from passive_facts import FACT_FLOOR, FACT_TOP, FactIndex, FactVectorCache      # noqa: E402
 
 GRID = [0.0] + [round(0.30 + 0.02 * k, 2) for k in range(31)]
 MARGIN_GRID = [round(0.002 * k, 3) for k in range(31)]   # voyage-3.5 上前两名分差几乎都在 0.06 以下
@@ -132,15 +137,37 @@ def sweep(data, floors=GRID, margins=None, floor=0.0):
     return note, rows
 
 
-def render(data, floors=GRID, margins=None, floor=0.0):
+def _surfaced(data, floor):
+    """有东西浮上来的句子：前 FACT_TOP 条里有一条 ≥ floor。只看分数、不看标注。→ (句数, 总句数)"""
+    rows = data["句子"]
+    return sum(any(x["分数"] >= floor for x in s["前N"][:FACT_TOP]) for s in rows), len(rows)
+
+
+def align(data, ref, ref_floor, floors=GRID):
+    """按浮出比例对齐：在 floors 里挑本文件浮出比例与参照在 ref_floor 上最接近的那档，平手取大
+    （同《事实模式分差按后十名均值比较》第六节 #48 的取法）。→ (参照浮出, 那档, 本文件在那档的浮出)"""
+    want = Fraction(*_surfaced(ref, ref_floor))
+    best = min(floors, key=lambda f: (abs(Fraction(*_surfaced(data, f)) - want), -f))
+    return _surfaced(ref, ref_floor), best, _surfaced(data, best)
+
+
+def render(data, floors=GRID, margins=None, floor=0.0, ref=None, ref_floor=FACT_FLOOR):
     note, rows = sweep(data, floors, margins, floor)
     pct = lambda a, b: f"{a / b:.0%}" if b else "—"
-    lines = [note, "", f"| {'floor' if margins is None else '分差≥'} | 留下 | 其中相关 | 准确率 | 相关保留 | 不相关挡掉 | 有东西浮上来的句子 |",
-             "|---|---|---|---|---|---|---|"]
-    for r in rows:
+    fl = lambda x: f"{x:.2f}" if round(x, 2) == x else f"{x:g}"    # 0.495 这类细档不被四舍五入成 0.50
+    head = [f"| {'floor' if margins is None else '分差≥'} | 留下 | 其中相关 | 准确率 | 相关保留 | 不相关挡掉 | 有东西浮上来的句子 |",
+            "|---|---|---|---|---|---|---|"]
+
+    def line(r):
         (kh, rel), (blk, irr), (ss, sn) = r["相关保留"], r["不相关挡掉"], r["有东西浮上来的句子"]
-        lines.append(f"| {r['floor']:.{2 if margins is None else 3}f} | {r['留下']} | {r['其中相关']} | {pct(r['其中相关'], r['留下'])} "
-                     f"| {kh}/{rel}（{pct(kh, rel)}） | {blk}/{irr}（{pct(blk, irr)}） | {ss}/{sn} |")
+        return (f"| {fl(r['floor']) if margins is None else format(r['floor'], '.3f')} | {r['留下']} | {r['其中相关']} "
+                f"| {pct(r['其中相关'], r['留下'])} | {kh}/{rel}（{pct(kh, rel)}） | {blk}/{irr}（{pct(blk, irr)}） | {ss}/{sn} |")
+    lines = [note, ""] + head + [line(r) for r in rows]
+    if ref is not None:
+        (rs, rn), best, (bs, bn) = align(data, ref, ref_floor, floors)
+        lines += ["", f"按浮出比例对齐（平手取大）：参照在下限 {fl(ref_floor)} 浮出 {rs}/{rn}（{pct(rs, rn)}），"
+                      f"本文件最接近的是 {fl(best)}：{bs}/{bn}（{pct(bs, bn)}）", *head,
+                  line(next(r for r in rows if r["floor"] == best))]
     return "\n".join(lines)
 
 
@@ -162,11 +189,19 @@ def main(argv=None, provider=None):
     sw.add_argument("--floors", type=float, nargs="+", default=GRID, help="要扫的下限，默认 0 与 0.30～0.90 每 0.02 一档")
     sw.add_argument("--margins", type=float, nargs="*", help="改扫前两名分差；不跟值时 0～0.06 每 0.002 一档")
     sw.add_argument("--floor", type=float, default=0.0, help="扫分差时叠在哪个下限之上，默认 0（只看分差）")
+    sw.add_argument("--align-to", help="参照配置的 score 输出（可以没标）：在本文件扫的各档里挑浮出比例与参照最接近的那档"
+                                       "（平手取大），表后单独报")
+    sw.add_argument("--ref-floor", type=float, default=FACT_FLOOR,
+                    help=f"参照配置的下限，默认 {FACT_FLOOR}（同服务的 LATENT_PASSIVE_FACT_FLOOR）")
     args = ap.parse_args(argv)
 
     if args.cmd == "sweep":
+        if args.align_to and args.margins is not None:
+            ap.error("--align-to 只用于扫下限，不和 --margins 一起用")
         margins = None if args.margins is None else (args.margins or MARGIN_GRID)
-        print(render(json.loads(Path(args.labelled).read_text(encoding="utf-8")), args.floors, margins, args.floor))
+        read = lambda p: json.loads(Path(p).read_text(encoding="utf-8"))
+        print(render(read(args.labelled), args.floors, margins, args.floor,
+                     read(args.align_to) if args.align_to else None, args.ref_floor))
         return
     if provider is None:
         from embedding_provider import resolve_provider
@@ -180,13 +215,13 @@ def main(argv=None, provider=None):
 
 
 def selftest():
-    """自检判据 1a～1c 与 2d。夹具全是虚构的；向量用字符袋假向量，不联网。"""
+    """自检判据 1a～1c、2d 与按浮出比例对齐。夹具全是虚构的；向量用字符袋假向量，不联网。"""
     import contextlib
     import io
     import tempfile
     import time
     from memory_retrieval import load_corpus
-    from passive_facts import FACT_FLOOR, FactCooldown, _dot, _unit
+    from passive_facts import FactCooldown, _dot, _unit
 
     class CharBag:
         """字符袋假向量：共享的字越多越近。"""
@@ -306,7 +341,41 @@ def selftest():
             assert "1 条" in str(e.code), e.code
         else:
             raise AssertionError("1b：前 2 条里有没标的，应当报错而不是当成不相关")
-    print("selftest 事实下限标定：1a 1b 1c 2d 通过")
+
+        # 对齐（《标定工具按浮出比例对齐比较》第三节，先于实现写定）：参照的分数整体加 δ 当成“新配置”，
+        #   在新配置扫的各档里挑浮出比例与参照最接近的那档，必须正好是参照下限 ＋ δ。参照只看每句前 2 条：
+        #   第 1 句 0.70✓ 0.60✗、第 2 句 0.50✓ 0.40✗、第 3 句 0.45✗ 0.30✗、第 4 句 0.20✗ 0.10✗；
+        #   参照下限 0.45 浮出第 1～3 句 → 3/4。新配置扫 0.30～0.80 每 0.01 一档，浮出 3/4 的是 0.30 到 0.45＋δ
+        #   一整段：平手取大才落在 0.45＋δ，取小落在 0.30。
+        #   参照在 0.45 的准确率 2/4；新配置准确率 2/4 的是 0.41＋δ～0.45＋δ 与 0.51＋δ～0.60＋δ 两段，
+        #   改看准确率对齐会落在 0.60＋δ（平手取大）或 0.41＋δ（取小），都不是 0.45＋δ。
+        ref = {"句子": [{"句": n, "准入": "fact_mode_signal",
+                         "前N": [{"id": f"r{n}{k}", "分数": s, "相关": rel} for k, (s, rel) in enumerate(top)]}
+                        for n, top in enumerate([[(0.70, True), (0.60, False)], [(0.50, True), (0.40, False)],
+                                                 [(0.45, False), (0.30, False)], [(0.20, False), (0.10, False)]], 1)]}
+        ref_path, new_path = td / "参照.json", td / "新配置.json"
+        ref_path.write_text(json.dumps(ref, ensure_ascii=False), encoding="utf-8")
+        grid = [f"{0.30 + 0.01 * k:.2f}" for k in range(51)]
+        for delta in (0.07, -0.05):
+            shifted = json.loads(json.dumps(ref))
+            for s in shifted["句子"]:
+                for item in s["前N"]:
+                    item["分数"] = round(item["分数"] + delta, 6)
+            new_path.write_text(json.dumps(shifted, ensure_ascii=False), encoding="utf-8")
+            cmd = ("sweep", str(new_path), "--floors", *grid, "--align-to", str(ref_path), "--ref-floor", "0.45")
+            out = run(*cmd)
+            aligned, want = out[out.index("按浮出比例对齐"):], f"{0.45 + delta:.2f}"
+            assert "参照在下限 0.45 浮出 3/4" in aligned and f"本文件最接近的是 {want}：3/4" in aligned, \
+                f"对齐：δ={delta:+.2f} 应对齐到 {want}\n{aligned}"
+            # 单独报那一档：留下 4 条（相关 2）、相关保留 2/2、不相关 6 条挡掉 4 条、浮出 3/4，与参照在 0.45 那行相同。
+            assert f"| {want} | 4 | 2 | 50% | 2/2（100%） | 4/6（67%） | 3/4 |" in aligned, aligned
+        # 参照只看分数：没标“相关”的 score 输出也能当参照。
+        for s in ref["句子"]:
+            for item in s["前N"]:
+                del item["相关"]
+        ref_path.write_text(json.dumps(ref, ensure_ascii=False), encoding="utf-8")
+        assert f"本文件最接近的是 {want}：3/4" in run(*cmd), "对齐：参照文件没标也应当能对齐"
+    print("selftest 事实下限标定：1a 1b 1c 2d 对齐 通过")
 
 
 if __name__ == "__main__":

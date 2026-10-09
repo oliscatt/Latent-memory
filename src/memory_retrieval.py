@@ -214,11 +214,15 @@ class BM25:
         self.tf = []
         self.doc_lengths = []
         self.df = Counter()
+        # bigram 词表：所有块的词频表共用这里的同一个字符串对象（BM25词表字符串去重卡）。
+        # 挂在实例上，随库释放、整库重读时重建；不随块退场收缩，上界是本库建起以来
+        # 出现过的不同 bigram 数。不用 sys.intern：进程级驻留表换库也不收缩。
+        self.vocab = {}
         total_tokens = 0
         # docs_tokens 故意按可迭代对象消费：大语料建库时每块的
         # bigram 数组只存活到该块 Counter 建好，不再与词频表双份常驻。
         for tokens in docs_tokens:
-            counts = Counter(tokens)
+            counts = self.count(tokens)
             length = sum(counts.values())
             self.tf.append(counts)
             self.doc_lengths.append(length)
@@ -226,6 +230,12 @@ class BM25:
             total_tokens += length
         self.N = len(self.tf)
         self.avgdl = total_tokens / self.N if self.N else 0.0
+
+    def count(self, tokens):
+        """一块的词频表，键换成词表里的那一个对象。建库和 replace_chunks 的新块都走这里，
+        绕过它的块照样能检索、分数不变，只是省不下内存（自检 2b 盯着）。"""
+        vocab = self.vocab
+        return Counter(vocab.setdefault(t, t) for t in tokens)
 
     def idf(self, term):
         n = self.df.get(term, 0)
@@ -527,7 +537,7 @@ class MemoryIndex:
         for text, meta, path, j in plan:
             self.add(text, meta, path)
             i = len(self.chunks) - 1
-            tf = old_tf[j] if j is not None else Counter(tokenize(text))
+            tf = old_tf[j] if j is not None else bm.count(tokenize(text))
             bm.tf.append(tf)
             bm.doc_lengths.append(sum(tf.values()))
             bm.df.update(tf.keys())
@@ -848,9 +858,7 @@ class MemoryIndex:
 
         这条同时解释了为什么它对"专名缺席"以外的编造也有效：判据不是"有没有专名"，
         是"共享的词面里有没有一个在这份语料里是稀有的"。"""
-        max_df = self._distinctive_df()
-        distinctive = {t for t in set(query_tokens)
-                       if 0 < self._bm25.df.get(t, 0) <= max_df}
+        distinctive = self._distinctive_tokens(query_tokens)
         # 整句都是高频功能词、一个区分性 token 都没有：**词面路一个都不放行**。
         #
         # 这一格是这条判据最要紧的地方，也是我第一版写反了的地方：当时退回旧行为
@@ -886,6 +894,25 @@ class MemoryIndex:
             if any(t in tf for t in distinctive):
                 out.add(i)
         return out
+
+    def _distinctive_tokens(self, query_tokens):
+        """查询里的区分性 token：库里出现过、且 df 不超过 `_distinctive_df()` 上限。"""
+        max_df = self._distinctive_df()
+        return {t for t in set(query_tokens) if 0 < self._bm25.df.get(t, 0) <= max_df}
+
+    def query_too_common(self, query):
+        """候选闸挡下这句问法的原因是不是“问法太泛”：问法的每个词面库里都有，而且全都超上限。
+
+        只给报错选文案用，**不参与放行**（放行仍只看 `lexical_admit`）。每个词面都在库里、
+        但都太常见（比如两字问法只切出一个 bigram，写入又把它的 df 推过 max(3, N//5)）＝
+        库里有含这些词的记录，只是分不出是哪一条，不能说“没有相关记录”。只要有一个词面库里
+        从没出现过，就仍按“库里没有”说：编造题的典型形态正是“常见词＋库里没有的细节”
+        （“今天去冰岛骑马”），不能因为“今天”太常见就暗示库里可能有。真问法若原样在库里出现过，
+        跨词的 bigram 也在库里、且多半不超上限，候选闸本来就放行，走不到这里
+        （见《检索无可靠命中报错区分问法太泛》）。"""
+        tokens = set(tokenize(query))
+        cap = self._distinctive_df()
+        return bool(tokens) and all(self._bm25.df.get(t, 0) > cap for t in tokens)
 
     def same_claim_survivors(self, chunk_idx, exclude=()):
         """撤回是块级的、事实是跨块的：撤掉一块后，返回库里**仍在讲同一说法**的其它块。
@@ -2244,6 +2271,17 @@ def _selftest(embed=False):
     tracemalloc.stop()
     assert retained_bytes < 4 * 1024 * 1024, \
         f"BM25 常驻分配过高：{retained_bytes / 1024 / 1024:.1f} MiB"
+
+    # 2b.【bigram 键去重（BM25词表字符串去重卡）】建库和增量写入的新块，词频表的键
+    #     都得是词表里那一个对象。分数看不出来（换回独立字符串照样逐位相同），只能
+    #     按对象身份查。反向变异：replace_chunks 新块改回 Counter(tokenize(text)) 即红
+    idx2b = MemoryIndex(embed=False)
+    idx2b.add("咖啡机的保险丝熔断了")
+    idx2b.build()
+    idx2b.replace_chunks((), [("咖啡机又坏了，换了保险丝", None, None)])
+    vocab2b = idx2b._bm25.vocab
+    assert all(vocab2b.get(t) is t for tf in idx2b._bm25.tf for t in tf), \
+        "词频表的键没经 BM25.vocab 去重（建库或 replace_chunks 新块绕过了 BM25.count）"
 
     # 3. RRF 融合是纯函数：两路名次都把 0 排前 → 0 胜
     fused = rrf_fuse([[0, 1], [0, 1]])

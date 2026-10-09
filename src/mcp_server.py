@@ -1280,7 +1280,21 @@ class MemoryServer:
         if not results:
             # 可靠命中门槛（验收反馈）：低相关不硬凑。这句要同时做两件事——
             # 说清"查过了、真没有"，并明确解锁如实回答（instructions 堵的是
-            # "没查就说没记录"，查过之后的"没有"是诚实，不是那句被堵的话术）
+            # "没查就说没记录"，查过之后的"没有"是诚实，不是那句被堵的话术）。
+            # 例外是"问法太泛"：问法的每个词库里都有、全都太常见、被候选闸挡下，库里其实有含
+            # 这些词的记录，这时不能说"没有相关记录"，改说分不出是哪一条、要补具体的词。
+            # 有一个词库里从没出现过（编造题的典型形态）就仍走下面的"没有"。
+            # 两种都以"没有可靠命中"开头，下游按这个前缀认空手。
+            if any(self.index.query_too_common(q) for q in queries):
+                raise ToolError(
+                    "没有可靠命中：问法太泛——这个说法里的词在记忆库中都太常见，很多条记录都有，"
+                    "分不出要找的是哪一条；这不等于库里没有这件事，也不说明有。"
+                    + ("你已经带 queryVariant 重试过了，仍分不出是哪一条——请停止检索，如实告诉对方"
+                       "没找到/记不清，可以请对方补一个具体的细节，不要拿沾边内容凑答案。"
+                       if variant is not None else
+                       "你已经查过一次；最多再试一次：保留原 query，在 queryVariant 里补一个更具体"
+                       "的词（人、地、物、事或日期）。")
+                    + (" " + note if note else ""))
             retry = ("你已经带 queryVariant 重试过了——第二次仍没找到，请停止检索并"
                      "如实告诉对方没找到/记不清，不要拿沾边内容凑答案。") \
                 if variant is not None else \
@@ -3159,6 +3173,9 @@ def make_http_server(server, host="127.0.0.1", port=8765, token=None,
                     base = {p: (m, s) for p, m, s in state["sig"]}
                     current = {p: (m, s) for p, m, s in _corpus_signature(server.source_dirs)}
                     for path in server.written_paths:
+                        # 指纹走解析过的读取根，写回路径走原样的 corpus_dir（命令行 --corpus
+                        # 可以是相对路径、带 `..` 或经软链接），先解析成同一种写法再比
+                        path = str(Path(path).resolve())
                         if path in current:
                             base[path] = current[path]
                         else:
@@ -4776,10 +4793,104 @@ def _selftest_external_changes(now=1_800_000_000.0):
                 assert found("晾衣架", 461.5), "索引是空的不防抖，下一个请求立刻从盘上重建"
             finally:
                 httpd.shutdown()
+
+            # 判据 5（语料路径没规范化卡）：语料目录写成带 `..` 或经软链接时，自己写的文件
+            # 也要折进指纹基线（指纹走解析过的读取根，写回路径走原样的 corpus_dir）。
+            # 折不进去的话，下一个请求把它当外部变化，安静满 60 秒再空跑一次同步。
+            # 反向变异：HTTP 层折基线前不做 resolve() → 这条红
+            real = Path(td) / "pathcase"
+            shutil.copytree(seed, real)
+            (Path(td) / "绕").mkdir()
+            forms = [Path(td) / "绕" / ".." / "pathcase"]
+            try:
+                (Path(td) / "链").symlink_to(real, target_is_directory=True)
+                forms.append(Path(td) / "链")
+            except (OSError, NotImplementedError):
+                pass        # Windows 没开开发者模式建不了软链接，只跑 `..` 那种写法
+            for n, form in enumerate(forms):
+                srv = mk(form)
+                httpd = make_http_server(srv, host="127.0.0.1", port=0, clock=lambda: clock[0])
+                threading.Thread(target=httpd.serve_forever, daemon=True).start()
+                url = f"http://127.0.0.1:{httpd.server_address[1]}/mcp"
+                try:
+                    counts.update(sync=0, reload=0)
+                    code, resp = post("latent_append", {"text": f"路径写法{n}：窗台的仙人掌开花了。",
+                                                        "current_state": "虚构验证数据"}, 1000)
+                    assert code == 200 and resp["result"]["isError"] is False, resp
+                    assert found(f"路径写法{n}", 1001) and found(f"路径写法{n}", 1100) \
+                        and counts == {"sync": 0, "reload": 0}, \
+                        f"语料路径写成 {form} 时，自己写的文件被当成了外部变化：{counts}"
+                finally:
+                    httpd.shutdown()
     finally:
         MemoryServer._sync_external, MemoryServer._reload_from_disk = real_sync, real_reload
     print("selftest 外部同步增量：通过（五类外部变化与重启逐位一致、漂移只在图谱；搬家不计数、到阈值恰好"
-          "重读一次；60 秒防抖合并三次变化、180 秒封顶、自己写入不受影响；出错退回重读，重读失败 503 后立刻重建）")
+          "重读一次；60 秒防抖合并三次变化、180 秒封顶、自己写入不受影响；语料路径带 .. 或经软链接时自己写入照样不算外部变化；出错退回重读，重读失败 503 后立刻重建）")
+
+
+def _selftest_no_hit_wording(now=1_800_000_000.0):
+    """《检索无可靠命中报错区分问法太泛》第三节判据。夹具照《写入后立即短问法检索无可靠命中》
+    补充组 B：40 块虚构日记，两字话题词 T 恰好出现在 max(3, N//5)＝8 块里；写入一条同时含 T
+    和独有词的记录（正文块＋索引块各 1），T 的 df 到 10、上限仍是 8，单用 T 查就被候选闸挡下。
+    - 写前单用 T 查照常命中（放行边界没动）；
+    - 写后单用 T 查：仍是“没有可靠命中”开头（下游按这个前缀认空手），但说成“问法太泛”，
+      不再说“记忆库里没有……相关的记录”；带上一个库里没有的 queryVariant 也一样，并叫停检索；
+    - 库里完全没有的词：原文案逐字不变；
+    - 常见词＋库里没有的细节（编造题的典型形态，“今天去冰岛骑马”）：原文案逐字不变。
+    变异：把“问法太泛”的判断去掉（总走原文案）→ 写后那条红；条件放宽成“库里出现过的词
+    全都超上限”（不管有没有库里没有的词）→ 编造题那条红。"""
+    import tempfile
+    topic, absent = "阿橘", "量子对撞机"
+    old = "没有可靠命中：记忆库里没有与这个说法词面或语义相关的记录。"
+    places = ("菜市场", "公园", "图书馆", "地铁站", "河边")
+    acts = ("散步", "买菜", "加班", "看书", "跑步", "做饭", "浇花")
+    with tempfile.TemporaryDirectory() as td:
+        corpus, index_dir = Path(td) / "corpus", Path(td) / "index"
+        (corpus / "timeline").mkdir(parents=True)
+        index_dir.mkdir()
+        (corpus / "timeline" / "window_01_2026-06-01.md").write_text("\n\n".join(
+            f"## 2026-06-{1 + n % 28:02d} {places[n % 5]}\n今天去{places[n % 5]}{acts[n % 7]}，"
+            f"顺手记一笔。" + (f"{topic}在窗台上睡觉。" if n < 8 else "")
+            for n in range(40)) + "\n", encoding="utf-8")
+        source_dirs, loader = make_corpus_loader(corpus, index_dir)
+        srv = MemoryServer(index=loader(), thread_store=ThreadStore(), corpus_dir=corpus,
+                           index_dir=index_dir, source_dirs=source_dirs, loader=loader)
+        df = srv.index._bm25.df
+        assert srv.index._bm25.N == 40 and df[topic] == 8 == srv.index._distinctive_df(), \
+            "夹具：40 块，话题词 df 恰在上限"
+        def search(args, at):
+            return srv.handle({"jsonrpc": "2.0", "id": 51, "method": "tools/call",
+                               "params": {"name": "latent_search", "arguments": args}},
+                              now=at)["result"]
+        r = search({"query": topic}, now)
+        assert r["isError"] is False and topic in r["content"][0]["text"], f"写前单用 T 照常命中：{r}"
+        quote = f"{topic}把桌上的珊瑚陀螺推到了地上"
+        r = srv.handle({"jsonrpc": "2.0", "id": 52, "method": "tools/call", "params": {
+            "name": "latent_append", "arguments": {
+                "text": f"{quote}，没摔坏。", "current_state": "陀螺收进抽屉了。",
+                "indexEvidence": [{"type": "event", "quote": quote}]}}}, now=now + 1)["result"]
+        assert r["isError"] is False, r
+        assert df[topic] == 10 and srv.index._distinctive_df() == 8, "写后 T 的 df 过了上限"
+        first, second = (search(args, now + 2) for args in (
+            {"query": topic}, {"query": topic, "queryVariant": absent}))
+        for r in (first, second):
+            text = r["content"][0]["text"]
+            assert r["isError"] is True and text.startswith("没有可靠命中：问法太泛"), \
+                f"只剩超上限常见词被挡下，要说成问法太泛：{text}"
+            assert "没有与这个说法" not in text and "没有相关" not in text, \
+                f"库里有含这个词的记录，不能说没有相关记录：{text}"
+        assert "queryVariant" in first["content"][0]["text"], "第一次查：提示带 queryVariant 补具体的词"
+        assert "停止检索" in second["content"][0]["text"], "已经带过 queryVariant：叫停，不循环"
+        r = search({"query": absent}, now + 3)
+        assert r["isError"] is True and r["content"][0]["text"].startswith(old), \
+            f"库里确实没有：原文案不变：{r}"
+        # 编造题的典型形态：常见词（“今天”每块都有）＋库里从没出现过的细节。只要有一个词面
+        # 库里从没出现过，就仍说“没有相关记录”——不能因为“今天”太常见就说成问法太泛、暗示库里可能有。
+        r = search({"query": "今天去冰岛骑马"}, now + 4)
+        assert r["isError"] is True and r["content"][0]["text"].startswith(old), \
+            f"常见词＋库里没有的细节（编造题）：原文案不变：{r}"
+    print("selftest 无可靠命中文案：通过（问法里的词库里都有、全都超上限时说“问法太泛”，带不带 "
+          "queryVariant 都是；库里确实没有、或常见词＋库里没有的细节时原文案不变；写前同一问法照常命中）")
 
 
 def _selftest():
@@ -4789,6 +4900,7 @@ def _selftest():
     _selftest_status_ops_no_rebuild()
     _selftest_incremental_writes()
     _selftest_external_changes()
+    _selftest_no_hit_wording()
     now = 1_800_000_000.0
     srv = _build_server(now)
 

@@ -1079,7 +1079,7 @@ class SupersedeHintTests(unittest.TestCase):
 
 class FactFloorCalibrationTests(unittest.TestCase):
     def test_tool_selftest(self):
-        """tests/fact_floor_calibration.py 随包；它的自检（判据 1a～1c）跟着发布检查跑，不靠人记得单独跑。"""
+        """tests/fact_floor_calibration.py 随包；它的自检（第 1 步判据 1a～1c、分差扫描 2d、按浮出比例对齐）跟着发布检查跑，不靠人记得单独跑。"""
         sys.path.insert(0, str(Path(__file__).resolve().parent))
         import fact_floor_calibration
         fact_floor_calibration.selftest()
