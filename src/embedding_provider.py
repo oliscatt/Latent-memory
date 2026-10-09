@@ -20,7 +20,8 @@ embedding 提供方可插拔层（任务卡"云端 embedding 作为一等检索�
    **实测标定表**，不是默认值表。表里没有的模型返回 None＝未标定，调用方必须
    按"未标定"处理（见 memory_retrieval 里 vec_floor 那段），**不许照抄 0.45**——
    那个数跟 bge-small-zh-v1.5 的余弦标度绑死，换模型标度就变了，照抄会让
-   "库里没有就说没有"无声失灵。
+   "库里没有就说没有"无声失灵。表外的模型由用户自己量，量完填
+   `MEMORY_EMBED_HIT_FLOOR`（量法见 `probe_guard.py --floors` 与《快速上手》）。
 
 用法：
   python embedding_provider.py --selftest        # 零依赖自检（不联网、不需要 fastembed）
@@ -43,10 +44,8 @@ ENV_ENDPOINT = "MEMORY_EMBED_ENDPOINT"      # 云端：完整 URL，如 https://
 ENV_KEY_NAME = "MEMORY_EMBED_API_KEY_ENV"   # **变量名**，不是 key 本身
 ENV_QUERY_PREFIX = "MEMORY_EMBED_QUERY_PREFIX"
 DEFAULT_KEY_ENV = "MEMORY_EMBED_API_KEY"
-# 门槛覆盖口（**采纳自外部 PR #1**，`lu7899112-source`，2026.08.01）：对方指出，
-# 换了后端/模型的人**只能改源码**才能填自己量出来的门槛。这条是对的——我们的
-# 标定表纪律（没量过就是 None、不给替代数字）拦的是"照抄一个数"，不该顺带把
-# **真的量过的人**也拦在外面。所以口子开，纪律照旧写在门口：见 hit_floor_override()。
+# 用户自己标定的命中门槛。标定表只收我们自己量过的模型，表外的模型（云端档的
+# bge-m3 也在表外）一律由用户在自己的语料上量，量完从这里填进来；读法见 floor_from_env()。
 ENV_HIT_FLOOR = "MEMORY_EMBED_HIT_FLOOR"
 
 DEFAULT_LOCAL_MODEL = "BAAI/bge-small-zh-v1.5"
@@ -56,44 +55,19 @@ DEFAULT_LOCAL_MODEL = "BAAI/bge-small-zh-v1.5"
 # 在 describe() 里说出来——让用户知道我们没替他猜。
 BGE_ZH_QUERY_PREFIX = "为这个句子生成表示以用于检索相关文章："
 
-# **实测标定表，不是默认值表**：模型 → 该模型上量过的可靠命中门槛（余弦）。
+# **实测标定表，不是默认值表**：模型 → 我们自己在真实语料上量过的命中门槛（余弦）。
 # 表里没有 = 未标定，get_hit_floor 返回 None，绝不退回别的模型的数字。
 #   bge-small-zh-v1.5：0.45，2026.08.01 在 602 块真实语料上复核过（依据、局限和
 #     "它其实管不住 BM25 那一路"这件事，写在 memory_retrieval.EMBED_HIT_FLOOR 那段）。
-#   bge-m3（云端档常见选择）：0.60，**外部标定，我们未复现**——
-#     出处：外部贡献者「星迟 & Ember」，PR #4，1144 块真实中文语料。
-#     方法：走**真实 retrieve() 路径**（不是脚本拼 rank_lists）把 floor 从 0.30
-#       扫到 0.70，**同时量两条曲线**——gold=1 的 20 题命中，和"编造题下向量路
-#       独立放行的块数"（后者就是"floor 太松时向量路给编造递多少材料"）。
-#     他们自报的两条局限照原话收：**单一语料形态**（中文原子记忆，块中位较短），
-#       别的语料形态请复测再信；**absent 那一侧在他们语料上是被词面闸先漏的
-#       （0/9，与 floor 无关）**——所以这次标定管住的是向量路，词面路仍敞着
-#       （与 bge-small-zh 那条"管不住 BM25 一路"的已知局限同构）。
-#     **选点规则（这条比数字值钱）**：两个候选点的测量值在噪声内等价时，
-#       取**两个方向都退化得体**的那个。0.62 与 0.58 同属平台边缘——0.58 的 18/20
-#       靠某个金标块压线，0.62 的上邻 0.64 已进衰退区——0.60 是唯一双向都有
-#       一格余量的点。⚠ **我们标 0.45 那次没有这条判据**：只量了 present 一侧，
-#       平台边缘和平台中间在我们眼里长得一样。
+# 只收我们自己复现过的数。别人量的数再可信，也是别人的语料、别人的问法；
+# 用户要用表外的模型，就自己量、自己填 MEMORY_EMBED_HIT_FLOOR。
 HIT_FLOOR_BY_MODEL = {
     "BAAI/bge-small-zh-v1.5": 0.45,
-    "BAAI/bge-m3": 0.60,
-}
-
-# **第三类口径：外部标定**。模型 → 标定出处（人话，会原样进 describe() 给用户看）。
-# 表里有 = 这个数是别人量的、我们没复现；表里没有 = 我们自己量的。先例口径是
-# **收但标着，不是收了就当自己量的**——出处藏在用户看不见的注释里等于没标。
-# ⚠ **出处只影响那句话怎么说，不影响这个数怎么用**，所以它单独一张表，不把
-# HIT_FLOOR_BY_MODEL 的值改成元组／字典带出处：`get_hit_floor()` 必须继续返回
-# 纯 float——memory_retrieval 那条向量路判据直接拿它比大小，改结构要动所有调用方。
-# 顺带一个好处：将来我们自己复核过，**从这张表里删一行**就升级成「已标定」，
-# 数一个字都不用改。
-EXTERNAL_CALIBRATED = {
-    "BAAI/bge-m3": "外部贡献者 星迟 & Ember，1144 块中文语料，PR #4",
 }
 
 # 自检夹具：一个**永远不会进标定表**的模型名，专门用来守"未标定绝不退回 0.45"
-# 这个最坏方向。⚠ 别再拿真实模型名当这个夹具——bge-m3 当了一阵，2026.08.03 它
-# 一被标定，两个文件里的夹具当场全红。名字取成明显虚构的，免得有人以为它能跑。
+# 这个最坏方向。别拿真实模型名当这个夹具：真实模型哪天进了标定表，用它的断言
+# 就会成片假红。名字取成明显虚构的，免得有人以为它能跑。
 UNCALIBRATED_FIXTURE_MODEL = "example-org/uncalibrated-test-embed"
 
 # 云端批量大小：一次请求塞多少块。经验值——足够摊薄往返开销，又不至于撞上各家的
@@ -101,12 +75,13 @@ UNCALIBRATED_FIXTURE_MODEL = "example-org/uncalibrated-test-embed"
 CLOUD_BATCH = 32
 CLOUD_TIMEOUT = 60
 
-# 单条截断（**采纳自外部 PR #1**，`lu7899112-source`，2026.08.01——对方在 2G 内存 VPS 上
-# 独立实现了同一条云端路径，这一条是我们那版漏掉的）：护住服务商侧的 token 上限。
-# 我们自己的块中位 352 字符，但真实语料里量到过 4386 的长块——一批全是长块就可能
-# 撞上批量 token 上限，而**失效形态是整批请求报错**，建库当场中断。
-# 截断只作用在**发出去的那份副本**上，本地的块正文一个字都不动。
-CLOUD_TRUNC = 2000
+# 每条文本发给云端时最多带多少字（只限请求体里那一份，块正文与缓存键都不动）。
+# 服务商对单条输入有长度上限，超了的常见反应是整批 400，建库就断在半路；而块是按
+# 标题切的，偶尔会有一段几千字的长记录。取 2000 字：与线上 Voyage 接入
+# （专属前端 voyage_provider 的 VOYAGE_TEXT_LIMIT）同一个数，两条路线给同一块算的
+# 是同一段文字；块的标题和主题都在开头，截掉的尾巴对"这块讲什么"影响最小。
+# 按字数截、不按 token 截：单条上限只有 512 token 的模型仍可能超，到时把它调小。
+CLOUD_MAX_CHARS = 2000
 
 
 def normalize(vec):
@@ -125,53 +100,45 @@ def query_prefix_for(model, override=None):
     return ""      # 认不出来就不加，并在 describe() 里说明
 
 
-def hit_floor_override(env=None):
-    """`MEMORY_EMBED_HIT_FLOOR` → float 或 None（没设／设歪了）。
+def floor_from_env(env=None):
+    """读 `MEMORY_EMBED_HIT_FLOOR` → (门槛, 没生效的原因)。
 
-    **这个口子是给"自己量过"的人开的，不是给"想找个数填上"的人开的**（采纳自
-    外部 PR #1，那一版把这条警告原样搬进了新注释，做法对）。余弦标度跟模型绑死，
-    照抄别人的数会让"库里没有就说没有"无声失灵——所以这里只做一件事：**把它
-    如实标成 override**，`describe()` 里说明这个数不是我们量的，出了偏差是用户
-    自己的标定，不是我们的标定表。
+    - 没设或是空串：(None, None)；
+    - 0 到 1 之间（不含两端）的有限数：(该数, None)；
+    - 其余（读不成数、≤0、≥1、nan）：(None, 原因)。≤0 等于向量路什么都放行，
+      ≥1 等于什么都不放行，都不是"一道门槛"。
 
-    设歪了（非数字、不在 [-1, 1] 内）**当没设**，不当 0 用：一个悄悄变成 0 的门槛
-    等于门槛不存在，而那正是这条最坏的失效方向。"""
-    raw = (env if env is not None else os.environ).get(ENV_HIT_FLOOR)
-    if raw is None or not str(raw).strip():
-        return None
+    设歪了**不当 0 用、也不悄悄吞掉**：原因会写进 describe()，启动信息里就能看到
+    自己那一行没生效，而不是以为开了门槛、其实一直走的是"未标定"那条路。"""
+    raw = str((os.environ if env is None else env).get(ENV_HIT_FLOOR) or "").strip()
+    if not raw:
+        return None, None
     try:
-        val = float(raw)
-    except (TypeError, ValueError):
-        return None
-    return val if -1.0 <= val <= 1.0 else None
+        value = float(raw)
+    except ValueError:
+        value = math.nan
+    if 0.0 < value < 1.0:      # nan 的比较恒为假，一并拦在这里
+        return value, None
+    return None, f"{ENV_HIT_FLOOR}={raw} 不是 0 到 1 之间的数，没生效"
 
 
 def get_hit_floor(model, env=None):
-    """该模型的实测门槛；**没标定过返回 None，不给替代数字**。
-    用户自己量过、通过 `MEMORY_EMBED_HIT_FLOOR` 传进来的覆盖值优先。"""
-    override = hit_floor_override(env)
-    if override is not None:
-        return override
-    return HIT_FLOOR_BY_MODEL.get(model)
+    """该模型的命中门槛：用户填的 `MEMORY_EMBED_HIT_FLOOR` 优先，其次标定表；
+    两边都没有返回 None（未标定），**不给替代数字**。"""
+    value, _ = floor_from_env(env)
+    return value if value is not None else HIT_FLOOR_BY_MODEL.get(model)
 
 
-def _floor_note(floor, env=None, model=None):
-    """describe() 里那句门槛说明。**三类分开说，不许混**：
-
-    - **用户自己设的覆盖值**：标明是他设的——出了偏差那是他的标定，不是我们表里的数；
-    - **外部标定**（`EXTERNAL_CALIBRATED`）：点名出处、并写明我们未复现。数字功能上
-      照用、floor 真生效，只在口径上跟"我们量的"分开；
-    - 剩下的才是**我们自己量过**的那一类。
-
-    第二类是 2026.08.03 新加的（收外部 PR #4 的 bge-m3 标定）：**收但标着，不是收了
-    就当自己量的**。出处必须落在用户看得见的这句话里——藏在注释里等于没标。"""
+def _floor_note(floor, env=None):
+    """describe() 里那句门槛说明。三种来源各说各的，不混：标定表里的数是我们量的，
+    用户填的数是用户自己的标定，两边都没有就明说未标定，并指出去哪儿填。"""
+    user_floor, problem = floor_from_env(env)
     if floor is None:
-        return "命中门槛**未标定**"
-    if hit_floor_override(env) is not None:
-        return f"命中门槛 {floor}（**你自己设的覆盖值**，不是我们量的）"
-    source = EXTERNAL_CALIBRATED.get(model)
-    if source:
-        return f"命中门槛 {floor}（**外部标定**：{source}；我们未复现）"
+        why = f"（{problem}）" if problem else ""
+        return (f"命中门槛**未标定**{why}：向量路只参与排序、不单独放行；"
+                f"在自己的语料上量好后填 {ENV_HIT_FLOOR}")
+    if user_floor is not None:
+        return f"命中门槛 {floor}（{ENV_HIT_FLOOR} 填的，是你自己的标定）"
     return f"命中门槛 {floor}（已标定）"
 
 
@@ -212,7 +179,7 @@ class EmbeddingProvider:
         return f"{self.kind}:{self.model}"
 
     def hit_floor(self):
-        return get_hit_floor(self.model)
+        return get_hit_floor(self.model, getattr(self, "_env", None))
 
     def describe(self):
         raise NotImplementedError
@@ -240,7 +207,7 @@ class LocalProvider(EmbeddingProvider):
     def describe(self):
         prefix = "加 bge 中文指令前缀" if self.query_prefix else "不加 query 前缀"
         return (f"本地模型 {self.model}（fastembed / 本地 CPU）；"
-                f"语料不出本机；{_floor_note(self.hit_floor(), model=self.model)}；{prefix}")
+                f"语料不出本机；{_floor_note(self.hit_floor())}；{prefix}")
 
 
 class HTTPCloudProvider(EmbeddingProvider):
@@ -300,8 +267,7 @@ class HTTPCloudProvider(EmbeddingProvider):
     def _embed_raw(self, texts):
         out = []
         for i in range(0, len(texts), self.batch):
-            # 发出去的副本按 CLOUD_TRUNC 截断，本地正文不动（见那个常量的注释）
-            chunk = [t[:CLOUD_TRUNC] for t in texts[i:i + self.batch]]
+            chunk = [t[:CLOUD_MAX_CHARS] for t in texts[i:i + self.batch]]   # 见 CLOUD_MAX_CHARS
             self.calls += 1
             data = self._post({"model": self.model, "input": chunk})
             try:
@@ -317,7 +283,7 @@ class HTTPCloudProvider(EmbeddingProvider):
         from urllib.parse import urlparse
         host = urlparse(self.endpoint).netloc or self.endpoint
         floor = self.hit_floor()
-        cal = _floor_note(floor, self._env, model=self.model)
+        cal = _floor_note(floor, self._env)
         prefix = "加 bge 中文指令前缀" if self.query_prefix else "不加 query 前缀"
         return (f"云端服务 {host} 的 {self.model}；"
                 f"**查询和被检索的内容都会发到这家服务商**；"
@@ -613,72 +579,48 @@ def _selftest():
         except ValueError:
             pass
 
-    # 9.【采纳自外部 PR #1：单条截断】护住服务商侧 token 上限。
-    #    **靶子取真正发出去的请求体**——截断做在本地正文上就成了另一个 bug
-    #    （把用户的记忆截短了），所以两头都断言：发出去的短了、手上的没动。
-    long_env = {ENV_ENDPOINT: "https://api.example.com/v1/embeddings",
-                ENV_MODEL: "BAAI/bge-m3", "MEMORY_EMBED_API_KEY": "k"}
-    seen = []
+    # 9.【请求体里的超长块按 CLOUD_MAX_CHARS 截，手上的块不动】
+    #    两头都要看：只看请求体，截断写成原地改也是绿的——那会把用户的记忆截短。
+    sent = []
+    pc = HTTPCloudProvider("https://api.example.com/v1/embeddings", "m",
+                           transport=lambda pl: sent.append(list(pl["input"])) or
+                           {"data": [{"index": i, "embedding": [1.0, 0.0]}
+                                     for i in range(len(pl["input"]))]},
+                           env={"MEMORY_EMBED_API_KEY": "k"})
+    batch = ["长" * (CLOUD_MAX_CHARS + 1), "短句", "满" * CLOUD_MAX_CHARS]
+    before = list(batch)
+    pc._embed_raw(batch)       # 直接调这一层：embed() 开头那份 list() 拷贝会替原地修改打掩护
+    assert [len(t) for t in sent[0]] == [CLOUD_MAX_CHARS, 2, CLOUD_MAX_CHARS],         f"请求体没按 CLOUD_MAX_CHARS 截：{[len(t) for t in sent[0]]}"
+    assert batch == before, "截断改到了调用方手上的块正文"
 
-    def _capture(payload):
-        seen.append(payload)
-        return {"data": [{"index": i, "embedding": [1.0, 0.0]}
-                         for i in range(len(payload["input"]))]}
+    # 10.【MEMORY_EMBED_HIT_FLOOR：读得成就生效，读不成就当没设，并且说出来】
+    assert floor_from_env({}) == (None, None)
+    assert floor_from_env({ENV_HIT_FLOOR: " 0.58 "}) == (0.58, None)
+    assert get_hit_floor(UNCALIBRATED_FIXTURE_MODEL, env={ENV_HIT_FLOOR: "0.58"}) == 0.58
+    assert get_hit_floor(DEFAULT_LOCAL_MODEL, env={ENV_HIT_FLOOR: "0.5"}) == 0.5,         "用户自己量的数在标定表里的模型上同样优先"
+    for bad in ("abc", "0", "-0.2", "1", "1.5", "nan", "inf"):
+        value, problem = floor_from_env({ENV_HIT_FLOOR: bad})
+        assert value is None and problem and bad in problem,             f"{bad!r} 不是门槛，必须当没设并说出原因（得到 {value!r}, {problem!r}）"
+        assert get_hit_floor(UNCALIBRATED_FIXTURE_MODEL, env={ENV_HIT_FLOOR: bad}) is None
+    assert floor_from_env({ENV_HIT_FLOOR: "  "}) == (None, None), "空白当没设，不算设歪"
+    #     describe() 三种来源各说各的：用户填的、标定表的、设歪了的
+    env_ok = {"MEMORY_EMBED_API_KEY": "k", ENV_HIT_FLOOR: "0.58"}
+    env_bad = {"MEMORY_EMBED_API_KEY": "k", ENV_HIT_FLOOR: "0,58"}
+    d_ok = HTTPCloudProvider("https://x/v1/embeddings", UNCALIBRATED_FIXTURE_MODEL,
+                             transport=_fake_transport(), env=env_ok).describe()
+    d_bad = HTTPCloudProvider("https://x/v1/embeddings", UNCALIBRATED_FIXTURE_MODEL,
+                              transport=_fake_transport(), env=env_bad).describe()
+    assert "0.58" in d_ok and "你自己的标定" in d_ok and "已标定）" not in d_ok, d_ok
+    assert "未标定" in d_bad and "0,58" in d_bad and ENV_HIT_FLOOR in d_bad,         f"设歪了要在启动信息里看得见：{d_bad}"
+    assert "（已标定）" in _floor_note(0.45, {})
 
-    long_text = "长" * (CLOUD_TRUNC + 500)
-    texts = [long_text, "短句"]
-    pc = resolve_provider("cloud", env=long_env, transport=_capture)
-    #    **把 texts 本身传进去，不传副本**——传副本的话"本地正文没被改"这条
-    #    就成了恒真断言（截断即使写成原地修改也测不出来，验过）
-    pc.embed(texts)
-    sent = seen[0]["input"]
-    assert len(sent[0]) == CLOUD_TRUNC, \
-        f"超长块没按 CLOUD_TRUNC 截断就发出去了，会撞服务商的 token 上限：{len(sent[0])}"
-    assert sent[1] == "短句", "短块不该被动"
-    assert texts[0] == long_text, "截断污染了本地正文——那是把用户的记忆截短了"
-    #    如实标注：这一条**只挡得住两层一起塌**。`embed()` 开头的 `texts = list(texts)`
-    #    是第一层，截断处不原地改是第二层，单点变异会被另一层吸收（两层都拆掉才红，
-    #    验过）。不假装它是单点靶。
-
-    # 10.【采纳自外部 PR #1：门槛覆盖口，但设歪了要当没设】
-    #     覆盖口是给"自己量过"的人开的。**非法值绝不能悄悄变成 0**——门槛为 0
-    #     等于门槛不存在，而那是这条最坏的失效方向（"库里没有就说没有"当场归零）。
-    assert get_hit_floor(UNCALIBRATED_FIXTURE_MODEL, env={}) is None, "没设覆盖时，未标定模型仍该是 None"
-    assert get_hit_floor(UNCALIBRATED_FIXTURE_MODEL, env={ENV_HIT_FLOOR: "0.62"}) == 0.62, \
-        "自己量过的覆盖值该生效——不然只能改源码"
-    for bad in ("abc", "", "  ", "1.5", "-2", "nan"):
-        got = get_hit_floor(UNCALIBRATED_FIXTURE_MODEL, env={ENV_HIT_FLOOR: bad})
-        assert got is None, f"非法覆盖值 {bad!r} 该当没设（得到 {got}），绝不能落成 0"
-    #     覆盖值要在 describe() 里标明是用户设的，不许混进"我们标定过"
-    note = _floor_note(0.62, {ENV_HIT_FLOOR: "0.62"})
-    assert "你自己设的" in note and "已标定" not in note, \
-        f"覆盖值被说成了我们的标定值：{note}"
-
-    # 11.【第三类口径：外部标定】（2026.08.03，收外部 PR #4 的 bge-m3 标定 0.60）
-    #     **数字功能上照用、floor 真生效**，只在口径上跟"我们量的"分开——先例是
-    #     "收但标着"，不是"收了就当自己量的"。
-    assert get_hit_floor("BAAI/bge-m3") == 0.60, "外部标定的数该跟自己量的一样真生效"
-    #     ⚠ 靶心：**必须是纯 float**。把出处塞进表值（元组／字典）是最容易顺手做的
-    #     那种"顺便重构"，而 memory_retrieval 那条向量路判据直接拿它比大小。
-    assert type(get_hit_floor("BAAI/bge-m3")) is float, \
-        "get_hit_floor 必须返回纯 float——出处走 EXTERNAL_CALIBRATED，不许耦进这个返回值"
-    ext = HTTPCloudProvider("https://api.example.com/v1/embeddings", "BAAI/bge-m3",
-                            transport=_fake_transport(), env={"MEMORY_EMBED_API_KEY": "k"})
-    d_ext = ext.describe()
-    #     ⚠ 靶心：出处要落在**用户看得见的那句话**里。把 _floor_note() 的第三支删掉
-    #     （退回"已标定"）时这条必红——藏在注释里的出处等于没标。
-    for must in ("外部标定", "星迟 & Ember", "1144 块中文语料", "PR #4", "我们未复现"):
-        assert must in d_ext, f"外部标定的口径缺了「{must}」：{d_ext}"
-    assert "（已标定）" not in d_ext, "外部标定不许被说成我们自己量的"
-    #     三类互不串味：我们自己量的那格照旧说"已标定"，覆盖值照旧说"你自己设的"
-    note_own = _floor_note(0.45, {}, model=DEFAULT_LOCAL_MODEL)
-    assert "（已标定）" in note_own and "外部标定" not in note_own, \
-        f"我们自己量的被说成了外部标定：{note_own}"
-    note_ov = _floor_note(0.55, {ENV_HIT_FLOOR: "0.55"}, model="BAAI/bge-m3")
-    assert "你自己设的" in note_ov and "外部标定" not in note_ov, \
-        f"覆盖值被说成了外部标定：{note_ov}"
-    assert get_hit_floor("BAAI/bge-m3", env={ENV_HIT_FLOOR: "0.55"}) == 0.55, \
-        "自己量过的人给的覆盖值，在外部标定过的模型上同样该优先"
+    # 11.【bge-m3 没有预设门槛】标定表只收我们自己复现过的数；bge-m3 要用户自己量。
+    #     这条守的是"表外模型别偷偷带一个数进来"——哪天往表里加一行没量过的数，这里红。
+    assert get_hit_floor("BAAI/bge-m3", env={}) is None
+    m3 = HTTPCloudProvider("https://api.example.com/v1/embeddings", "BAAI/bge-m3",
+                           transport=_fake_transport(), env={"MEMORY_EMBED_API_KEY": "k"})
+    assert m3.hit_floor() is None and ENV_HIT_FLOOR in m3.describe(),         "未标定时 describe() 要告诉用户门槛去哪儿填"
+    assert set(HIT_FLOOR_BY_MODEL) == {DEFAULT_LOCAL_MODEL},         "标定表里多了一个模型：先确认是我们自己在真实语料上量过的，再改这条断言"
 
     # 13.【刚算出来的块向量＝缓存里那份】增量写入当场算的向量，要和重启后从缓存读回的逐位
     #     相同（外部同步卡）。变异：embed_with_cache 里 out[i] 换回 array("f", v) → 这条红
@@ -700,9 +642,8 @@ def _selftest():
 
     print("selftest ok（13 项：key 不外泄 / 缺 key 报错 / 分批不乱序 / 前缀按模型 / "
           "未标定即 None / 缓存只算一次 / 坏缓存不致命 / 缓存内存存 float32、磁盘逐字节不变 / 未知档报错 / "
-          "超长块截断（发出去的截、本地的不动）/ 门槛覆盖口（设歪了当没设）/ "
-          "第三类口径「外部标定」（数照用、出处进用户可见文本、返回值仍是纯 float）/ "
-          "当场算的向量＝缓存读回的那份）")
+          "请求体里的超长块截断、手上的块不动 / MEMORY_EMBED_HIT_FLOOR 读不成就当没设并说出来 / "
+          "bge-m3 没有预设门槛 / 当场算的向量＝缓存读回的那份）")
 
 
 if __name__ == "__main__":

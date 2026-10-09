@@ -2,6 +2,14 @@
 
 这里记录公开版本对用户可见的变化。内部任务史、私人复测记录和未发布实验不写进本文件。
 
+## 2026-10-09（二）
+
+### 变化
+
+- 云端档的 `BAAI/bge-m3` 不再预设命中门槛（此前是 0.60），标定表只剩 bge-small-zh-v1.5 的 0.45。用 bge-m3 的部署启动时会显示“未标定”，此时向量路只参与排序、不单独放行候选；要让向量路照旧放行，在自己的语料上量好门槛后填 `MEMORY_EMBED_HIT_FLOOR`，量法见《快速上手》云端档那节。
+- `MEMORY_EMBED_HIT_FLOOR` 只认 0 到 1 之间（不含两端）的数；读不成数、≤0 或 ≥1 都按没设处理，`--describe` 会写出哪一行没生效。此前 -1 到 1 之间都收，设错了不提示。
+- 探针脚本：删除 `absent_probe_harness.py`、`present_probe_harness.py`、`floor_calibration.py`，新增 `src/probe_guard.py`（编造题护栏，加 `--floors` 门槛标定）；present 侧 gold=1 题的护栏用 `src/present_gold1_builder.py`，这个文件随本版一起发布。编造题词表为空的题现在记“未验证”、不计分。
+
 ## 2026-10-09
 
 ### 新增

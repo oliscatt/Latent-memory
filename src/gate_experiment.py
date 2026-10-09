@@ -3,13 +3,13 @@
 
 ## 这个文件为什么存在
 
-任务卡「区分性token离开bigram层」定的取数方式（**方案三，贡献者自己提的**）：
+任务卡「区分性token离开bigram层」定的取数方式（**方案三，外部反馈里提的**）：
 **新判据做出来 → 发给对方 → 对方在自己机器上跑 → 只回数字。**
 
 ⚠ **不许向任何人索取语料。** 别人的语料是他们和自己 AI 的对话，性质跟我们自己的
 timeline 一样，"要过来"这个动作本身就是错的，加一句"不会外传"也不改变它。
 所以这个文件的全部设计目标只有一个：**让别人在自己机器上跑得起来，只回数字给我们。**
-它因此不内置任何语料、不内置任何题目（同 `absent_probe_harness.py` 的纪律）。
+它因此不内置任何语料、不内置任何题目（同 `probe_guard.py` 的纪律）。
 
 ## 怎么跑
 
@@ -27,7 +27,7 @@ timeline 一样，"要过来"这个动作本身就是错的，加一句"不会�
 
 `--probes` 是 JSON：`[["编造的问题", ["区分词1", "区分词2"]], ...]`。
 **区分词表是护栏的输入，不是装饰**：计分前会先验证这些词在你语料全文里一个都
-不出现，出现即作废——护栏来自 `absent_probe_harness.py`，本文件**不另抄一份**，
+不出现，出现即作废——护栏来自 `probe_guard.py`，本文件**不另抄一份**，
 也不绕过它（任务卡：不许绕过护栏）。
 
 ## 输出里有什么、没有什么
@@ -55,11 +55,11 @@ from collections import defaultdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-# stdout 的 UTF-8 包装交给 absent_probe_harness 那一处（它 import 时就做了）。
-# **这里不能再包一层**：两层 TextIOWrapper 套同一个 buffer，先被回收的那个会把
-# buffer 关掉，后面所有 print 全炸（第一版就是这么红的）。
+# stdout 改 UTF-8 交给 probe_guard（import 时 reconfigure）。**别在这里另包一层
+# TextIOWrapper**：两层套同一个 buffer，先被回收的那个会把 buffer 关掉，后面所有
+# print 全炸（第一版就是这么红的）。
 
-from absent_probe_harness import run_probes                      # noqa: E402
+from probe_guard import run_absent                               # noqa: E402
 from memory_retrieval import MemoryIndex, load_corpus, tokenize  # noqa: E402
 
 SPAN_MAX = 8   # 只为省算力：更长的子串必是更短子串的超集，到 8 已经覆盖完
@@ -124,8 +124,7 @@ def _units_jieba(nouns_only):
 def make_gate(units, k=1):
     """units：查询 → 候选证据单元集合；k：一个块要共享几段证据才有候选资格。
 
-    df 上限**问闸本人**（`_distinctive_df()`），不抄一份会漂移的判据——
-    同 `absent_probe_harness` 那条纪律。这一维本轮实测几乎不动指标，
+    df 上限**问闸本人**（`_distinctive_df()`），不抄一份会漂移的判据。这一维本轮实测几乎不动指标，
     换层才是有效的那一维。"""
     def gate(self, query):
         max_df = self._distinctive_df()
@@ -372,9 +371,10 @@ def run(corpus=None, probes=None, only=None, verbose=False, embed=False):
         row = f"{name:<16}"
         with apply_gate(gate):
             if probe_list and chunks:
-                ok, tested, skipped, _ = run_probes(chunks, probe_list,
-                                                    embed=embed, verbose=verbose)
-                row += f"{f'{ok}/{tested}':>14}{skipped:>6}"
+                # 与 present 那把尺子共用 load_corpus 建的同一个索引（产品路径）
+                res = run_absent(idx0, probe_list, verbose=verbose)
+                frac = f"{res['correct']}/{res['scored']}"
+                row += f"{frac:>14}{res['voided'] + res['unverified']:>6}"
             if pairs:
                 # 复用同一个 index：单元缓存跨判据是共用的（它只取决于语料本身，
                 # 不取决于判据），重建一次等于把缓存扔了
@@ -391,7 +391,7 @@ def run(corpus=None, probes=None, only=None, verbose=False, embed=False):
 
 def selftest():
     """验的是本文件的机械部分，不需要语料：判据切换真的生效并且**真的会还原**、
-    k≥2 真的比 k≥1 严、护栏是从 harness 走的不是另抄一份。"""
+    k≥2 真的比 k≥1 严、护栏是从 probe_guard 走的不是另抄一份。"""
     chunks = ["周三下午去学了陶艺，拉坯拉坏了三个，老师说手太急。",
               "昨天猫把水杯打翻了，键盘遭殃，擦了半天。",
               "楼下那家牛肉面馆换了老板，味道淡了不少。"]
@@ -418,11 +418,10 @@ def selftest():
     assert wide, "对照组是空集——三者全空时下面那条包含关系恒成立，等于没测"
     assert narrow <= wide and k2 <= wide, "更严的判据放行的块不该更多"
 
-    # 3. 护栏是**走 harness 的那一份**：区分词在语料里出现过的题必须作废。
-    #    这条不是重测 harness，是钉住"本文件没有绕过它另抄一份宽松的"。
-    ok, tested, skipped, _ = run_probes(
-        chunks, [("上次陶艺课我拉坏了几个坯", ["陶艺", "坯"])], verbose=False)
-    assert (skipped, tested) == (1, 0), "护栏没生效——本文件绕过了 harness"
+    # 3. 护栏是**走 probe_guard 的那一份**：事实词在语料里出现过的题必须作废。
+    #    这条不是重测 probe_guard，是钉住"本文件没有绕过它另抄一份宽松的"。
+    res = run_absent(idx, [("上次陶艺课我拉坏了几个坯", ["陶艺", "坯"])])
+    assert (res["voided"], res["scored"]) == (1, 0), "护栏没生效——本文件绕过了 probe_guard"
 
     # 4. 语料没有分层时 present 那把尺子如实缺席，不硬凑
     assert build_pairs(idx) == [], \
@@ -430,12 +429,11 @@ def selftest():
 
     # 5.【隐私：默认输出一个字语料正文都不许有】这个文件的全部设计目标是"让别人
     #    在自己机器上跑、只回数字给我们"，那么"回给我们的东西不夹带正文"就不能
-    #    只写在 docstring 里靠自觉——`absent_probe_harness.run_probes` 的 LEAK
-    #    分支会打印命中块开头几十字，而**它的 verbose 默认是 True**：这里但凡
-    #    漏传一次参数，别人回给我们的表里就夹着 TA 的私人对话。
-    #    所以这条走**真正会泄漏的那条路**：造一份临时语料 + 一道必然 LEAK 的探针，
+    #    只写在 docstring 里靠自觉：表头、语料统计、尺子体检、逐题诊断，哪一处
+    #    顺手打了块的开头，别人回给我们的表里就夹着 TA 的私人对话。
+    #    所以这条走**真会漏的那条路**：造一份临时语料 + 一道必然 LEAK 的探针，
     #    按默认参数跑一遍 run()，捕获全部 stdout，断言语料正文一个字都不在里面。
-    #    **变异：把 run() 的 verbose 默认改成 True，这条立刻红。**
+    #    变异：run() 里语料统计那行顺手打出 chunks[0][:20] → 这条红。
     import contextlib
     import io as _io
     import json as _json
@@ -463,7 +461,7 @@ def selftest():
         assert c[:10] not in _out, f"默认输出里出现了语料正文：{c[:10]}"
 
     print("selftest ok（5项断言：判据换得上且还原得回 / 更严的判据不放行更多 / "
-          "护栏走 harness 没另抄 / 尺子不适用时如实缺席 / 默认输出不含语料正文）")
+          "护栏走 probe_guard 没另抄 / 尺子不适用时如实缺席 / 默认输出不含语料正文）")
 
 
 def main():

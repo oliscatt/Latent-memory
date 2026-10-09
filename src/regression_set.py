@@ -105,6 +105,7 @@ CASES 里那一段注释。
 import argparse
 from collections import Counter
 
+from probe_guard import screen_absent
 from memory_retrieval import (MemoryIndex, _chunk_key, tokenize,
                               query_miss_rate, MISS_RATE_FLAG)
 
@@ -272,28 +273,21 @@ HELDOUT_CASES = [
     ("absent_日常", "我们后来还提起过那回的事吗", []),
 ]
 
-# ---------- 编造题探针的护栏（2026.08.02，协议照抄外部报告人 `lu7899112-source`） ----------
+# ---------- 编造题探针的护栏（走 probe_guard） ----------
 #
-# 她那份 1144 条真实语料的复测报告里，最值得信的不是那些数字，是**她的护栏抓了她
-# 自己一次**：十道编造题里有一道（问「科目二」）被自己的护栏拦下作废了——那个词
-# 在她语料里真的存在，那道题问的就不是"库里没有的事"，计进去等于给自己送分。
+# 编造题是人写的：写的人凭印象觉得"这事没发生过"，就写进来了。没有一步去验证它真的
+# 不在语料里，absent 那一格就可能混进送分题——这道题问的其实是语料里有的事，检索端回
+# 东西本是对的。所以计分之前先过 `probe_guard.screen_absent`：每道题登记一张事实词表，
+# 词表里任何一个词在任何一块里出现，这道题就作废并记录原因。established 档当场就拦下
+# 我们自己一道（「球赛」在填充块里真的出现过）。
 #
-# 我们原来的 absent 集**没有这一层**：编造题是人写的，写的人凭印象觉得"这事没发生
-# 过"就写进去了，没有任何一步去验证它真的不在语料里。这跟"合成集给 absent 满分"
-# 是同一类病——**尺子上没刻这一格，就永远量不出自己错在哪**。
-#
-# 协议三条：
-#   ① 每道编造题带**区分词表**：这道题靠哪几个词才算"问的是另一件事"；
-#   ② 计分前先验证词表里的词**在语料全文里一个都不出现**，出现即作废并记录；
-#   ③ 有一类编造题**天生没有区分词**（整句都是功能词，「那次我们说好的事后来怎么
-#      样了」这种）——它们恰恰是最真实的威胁形态。**护栏管不了这一类，就如实说
-#      管不了**，单独归一档、单独计数，不假装验过。
-#
-# 第③条是这次特意没有偷懒的地方：给它编一个"查一下有没有稀有 token"的伪护栏很
-# 容易，但本单的判定实验刚刚证明**零依赖判不出"是不是内容词"**（字符 bigram 层
-# 产不出这个概念，PMI 内聚度也分不开——「薄荷」+10.38 对「光是」+0.69）。
-# 拿一个我们刚证伪的判据去当护栏，比没有护栏更糟。
-UNGUARDABLE = "无区分词·整句功能词"
+# 有一类编造题**天生没有事实词**（整句都是功能词，「那次我们说好的事后来怎么样了」）——
+# 它们恰恰是最真实的威胁形态。护栏管不了这一类，就如实说管不了：登记成空词表，
+# probe_guard 记"未验证"，这里单独归一档、单独计数，不假装验过。
+# 没给它编一个"查一下有没有稀有 token"的伪护栏：本单的判定实验刚证明**零依赖判不出
+# "是不是内容词"**（字符 bigram 层产不出这个概念，PMI 内聚度也分不开——「薄荷」+10.38
+# 对「光是」+0.69）。拿一个刚证伪的判据去当护栏，比没有护栏更糟。
+UNGUARDABLE = ()     # 空词表＝整句功能词，护栏验不了
 
 ABSENT_DISTINCTIVE = {
     # absent_远主题
@@ -326,30 +320,29 @@ GUARDED_KINDS = ("absent_日常", "absent_远主题")
 
 
 def absent_probe_guard(idx, cases=None):
-    """编造题探针护栏 → (valid, rejected, unguardable)。
+    """编造题过 `probe_guard` 的护栏 → (valid, rejected, unguardable)。
 
-    valid：区分词经验证确实不在语料里，可以计分；
-    rejected：区分词在语料里真的存在 → **作废并记录**（这题问的不是"库里没有的
-              事"，计进去是给自己送分）；也包括压根没登记区分词表的题；
-    unguardable：显式声明"整句功能词、没有区分词"的那一批，护栏验不了，单独计数。
+    valid：事实词经验证确实不在语料里，可以计分；
+    rejected：事实词在语料里真的出现 → **作废并记录**（这题问的不是"库里没有的事"，
+              计进去是给自己送分）；没登记词表的题也归这一档；
+    unguardable：登记了空词表的那一批（整句功能词），护栏验不了，单独计数。
 
     **越界提问不走这条护栏**：它问的是很可能真发生过、只是不在语料时间范围内的事，
     判据是时间锚不是词面，拿"词不在语料里"去卡它是错的口径。
     """
-    full = "\n".join(idx.chunks)
-    valid, rejected, unguardable = [], [], []
+    todo, rejected = [], []
     for kind, q, expect in (CASES if cases is None else cases):
         if kind not in GUARDED_KINDS:
             continue
         words = ABSENT_DISTINCTIVE.get(q)
         if words is None:
             rejected.append((q, "没登记区分词表——编造题必须写清楚它靠哪几个词才算编造"))
-        elif words == UNGUARDABLE:
-            unguardable.append((kind, q, expect))
-        elif [w for w in words if w in full]:
-            rejected.append((q, f"区分词 {[w for w in words if w in full]} 在语料里真的存在"))
         else:
-            valid.append((kind, q, expect))
+            todo.append(((kind, q, expect), list(words)))
+    kept, voided, unverified = screen_absent(idx.chunks, [(c[1], w) for c, w in todo])
+    valid = [todo[n - 1][0] for n, _q, _w in kept]
+    unguardable = [todo[n - 1][0] for n, _q, _w in unverified]
+    rejected += [(q, f"区分词 {list(hits)} 在语料里真的存在") for _n, q, hits in voided]
     return valid, rejected, unguardable
 
 
@@ -742,7 +735,7 @@ def report(embed=False, provider_spec=None):
                                               cases=HELDOUT_CASES)).strip().replace("\n", "  "))
     print()
 
-    print("【编造题护栏】（协议照抄外部报告人；被拦下的题作废、不进计分分母）")
+    print("【编造题护栏】（probe_guard；被拦下的题作废、不进计分分母）")
     for scale in ("cold", "established"):
         i = mk(scale=scale)
         for name, cs in (("CASES", CASES), ("留出集", HELDOUT_CASES)):
@@ -788,7 +781,7 @@ def report(embed=False, provider_spec=None):
     print("  ⚠ 只消融排序，消融不掉候选资格：候选闸先于 routes 算，"
           "所以词面路的贡献这张表天然看不见")
     print("  ⚠ 所以「关掉 bm25 四类分数一个没变」**不能读成「词面路独立贡献是 0」**"
-          "（2026.08.03 外部标定方就是这么读的，还据此说跟 README 对不上）——"
+          "（2026.08.03 外部反馈就是这么读的，还据此说跟 README 对不上）——"
           "那句话这张表证不了，量它要拆 lexical_admit，不是关 routes")
     print("  ⚠ 拆掉候选闸实测过了，别再拆一遍（2026.08.03；判据＝把 lexical_admit "
           "换成「全放行」再跑同一套 score，零依赖档、Python 3.11、本回归集 206 块／"
@@ -863,10 +856,10 @@ def _selftest():
             BASELINE[scale]["absent_日常"]["correct_empty"] - 1e-9, \
             f"absent_日常 退化（{scale} 档）——这一格本来就不及格，不许再降"
 
-    # 2b.【变异靶心：编造题护栏】2026.08.02，协议照抄外部报告人。
+    # 2b.【变异靶心：编造题护栏】走 probe_guard。
     #     没有这一层的话，"编造题"只是**写的人以为**没发生过的事——写错一道，
-    #     absent 那一格就凭空多一分送分。她自己的护栏抓过她一次（「科目二」），
-    #     我们的护栏也当场抓了我们一次（「球赛」在 established 档的填充块里真有）。
+    #     absent 那一格就凭空多一分送分。护栏当场抓了我们一次（「球赛」在
+    #     established 档的填充块里真有）。
     for scale in ("cold", "established"):
         i = build_index(scale=scale)
         for cs in (CASES, HELDOUT_CASES):

@@ -5,7 +5,7 @@
 **不改任何实现**：候选判据以运行时补丁的形式挂上去（`_patch`），进程一退就没了。
 `memory_retrieval.py` 一个字都不动——判据选定之后再动它，那是下一单的事。
 
-背景（外部实测，2026.08.02，报告人 `lu7899112-source`，1144 条中文语料）：
+背景（外部反馈，2026.08.02，1144 条中文语料）：
 现行词面闸 `lexical_admit` 的判据挂在**字符 bigram** 上，而 bigram 层会产出
 **跨词边界碎片**（"看极光是哪天"→`光是`df=1、"摔伤的是哪条腿"→`伤的`df=1），
 每道编造题都有 df=1 的碎片开闸，`absent` 正确空手 **0/9**。报告里那句话是病因本身：
@@ -36,7 +36,7 @@
 
   编造题文件是一个 JSON 数组，每项 `[问题, [区分词, ...]]`——区分词是这道题里
   承载"编造事实"的内容词，护栏会**先验证它们在你语料全文里一个都不出现**，
-  出现即作废（`absent_probe_harness.py`，外部贡献者送的，本单不改它）。
+  出现即作废（`probe_guard.py`）。
 
   ⚠ **外部语料模式下只打印数字**：不打印任何语料正文、不打印命中片段——
   你回传给我们的那张表里不该夹带你和你的 AI 说过的话。这是刻意的，别改。
@@ -54,7 +54,7 @@ from memory_retrieval import (  # noqa: E402
     entities_from_answer,
     load_corpus,
 )
-import absent_probe_harness as harness  # noqa: E402
+from probe_guard import run_absent  # noqa: E402
 
 CRITERIA = ("bigram", "df3", "ngram", "entity", "ngram+entity", "seg")
 DEFAULT_N = 3
@@ -65,7 +65,7 @@ def _norm(text):
     return re.sub(r"[^\w一-鿿]", "", text.lower())
 
 
-# ---------- 我们自己造的编造题（走护栏，护栏不改） ----------
+# ---------- 我们自己造的编造题（走 probe_guard 的护栏） ----------
 #
 # ⚠ **区分词要写成"语料里可能出现的最小内容词"**：护栏做的是子串检查，
 # 区分词写成「天文望远镜」这种长串时，语料里的「望远镜」拦不住它——出题人
@@ -281,7 +281,7 @@ def run_one(criterion, chunks, probes, cases, entities=None, n=DEFAULT_N,
     row = {"criterion": criterion}
     patch(criterion, n=n)
     try:
-        # absent 侧走护栏（本单不改它）：每道题先验证区分词不在语料里才计分
+        # absent 侧走 probe_guard 的护栏：每道题先验证区分词不在语料里才计分
         idx_probe = MemoryIndex()
         for c in chunks:
             idx_probe.add(c, {})
@@ -290,13 +290,14 @@ def run_one(criterion, chunks, probes, cases, entities=None, n=DEFAULT_N,
             idx_probe._entities = entities
             idx_probe.build()
         try:
-            ok, tested, skipped, detail = harness.run_probes(
-                chunks, probes, verbose=False, index=idx_probe)
+            res = run_absent(idx_probe, probes)
         except RuntimeError as e:                        # seg 档没装分词器
             unpatch()
             return {"criterion": criterion, "skip_reason": str(e)}
-        row.update(absent_ok=ok, absent_n=tested, absent_skip=skipped)
-        row["leak_evidence"] = [(q, ev) for st, q, ev in detail if st == "LEAK"]
+        row.update(absent_ok=res["correct"], absent_n=res["scored"],
+                   absent_skip=res["voided"] + res["unverified"])
+        row["leak_evidence"] = [(probes[r["n"] - 1][0], r["evidence"])
+                                for r in res["rows"] if r["status"] == "LEAK"]
 
         if cases is not None:
             import regression_set as RS                   # noqa: PLC0415
@@ -408,13 +409,16 @@ def _selftest():
     # 2.【本单靶心】护栏真的被调用了，且它照样能抓住我们自己
     #    ——出题人写了一道区分词其实在语料里的题，必须作废、不进分母
     patch("bigram")
-    ok, tested, skipped, detail = harness.run_probes(
-        chunks, [("上次陶艺课我拉坏了几个坯", ["陶艺"]),
-                 ("那台咖啡机后来修好了吗", ["咖啡机"])], verbose=False)
+    idx_g = MemoryIndex()
+    for c in chunks:
+        idx_g.add(c, {})
+    idx_g.build()
+    res = run_absent(idx_g, [("上次陶艺课我拉坏了几个坯", ["陶艺"]),
+                             ("那台咖啡机后来修好了吗", ["咖啡机"])])
     unpatch()
-    assert skipped == 1 and tested == 1, \
-        f"「咖啡机」在语料里，那道题必须被护栏拦下作废，实际 {skipped=} {tested=}"
-    assert any(st == "SKIP" and "咖啡机" in ev for st, _q, ev in detail), \
+    assert (res["voided"], res["scored"]) == (1, 1), \
+        f"「咖啡机」在语料里，那道题必须被护栏拦下作废，实际 {res}"
+    assert any(r["status"] == "VOID" and "咖啡机" in r["evidence"] for r in res["rows"]), \
         "护栏要说出是哪个词漏的"
 
     # 3. 实体判据只认实体表：表空 → 一个都不放行（**别静默退回 bigram**，
