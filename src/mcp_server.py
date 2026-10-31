@@ -3502,21 +3502,14 @@ def diagnose(corpus_dir, threads_path=None, embed=False, time_context=None,
         add(WARN, "分层", "没有索引层（父目录名叫 index 的才算）。不算错，但命中率会低一档："
                           "索引层是每会话一条高密度摘要，专门喂检索。")
 
-    # 时间戳成色：mtime 兜底不是"不太准"，是**方向错误**——复制目录/重新 clone 会把
-    # 全目录 mtime 刷成"刚刚"，于是最没有时间依据的块拿到全库最新的日期，
-    # 换窗召回按新鲜度排序时**最旧的事实冒充最新的**（2026.08.03 跨模型实测：
-    # 这么一份语料下两家模型 0/6 答对当下状态）。
+    # 文件复制会刷新 mtime，缺少内容日期仍须提示用户。
     srcs = {}
     for m in index.meta:
         srcs[m.get("timestamp_source")] = srcs.get(m.get("timestamp_source"), 0) + 1
     detail = "、".join(f"{k} {v} 块" for k, v in sorted(srcs.items(), key=lambda x: -x[1]))
     n_mtime = srcs.get("mtime", 0)
     ratio = n_mtime / len(index.chunks) if index.chunks else 0
-    # 判据二（2026.08.03 补，**与比例无关**）：只要有 mtime 档的块比全库最新的
-    # 真日期块还"新"，就报——**危险的恰恰是混合且占比低的情况**：绝大多数块有日期、
-    # 少数几块落 mtime，那几块的时间戳就是"今天"，稳稳压过所有真日期，
-    # 而占比 5% 连比例判据的门都够不着，于是静默。比例判据看的是"有多少块没日期"，
-    # 这条看的是"没日期的块会不会骑到有日期的头上"，两件事。
+    # 即使占比低，只要文件时间比所有内容日期都新，也提示检查日期来源。
     real_ts = [m["timestamp"] for m in index.meta
                if m.get("timestamp") is not None and m.get("timestamp_source") != "mtime"]
     mtime_ts = [m["timestamp"] for m in index.meta
@@ -3526,11 +3519,9 @@ def diagnose(corpus_dir, threads_path=None, embed=False, time_context=None,
         bad = sorted({m["source"] for m in index.meta
                       if m.get("timestamp_source") == "mtime"})
         add(WARN, "时间戳来源",
-            f"{detail}——{ratio:.0%} 的块只能退到文件修改时间。它不是“不太准”，"
-            "**是方向错误**：复制一遍目录或重新 clone，这些块的时间会被刷成“刚刚”，"
-            "于是最没有日期依据的内容拿到全库最新的时间戳，"
-            "**换窗召回会把最旧的事实当成你现在的状态端出来**"
-            + ("（**这份语料已经是这种形态**：落 mtime 的块比所有带真日期的块都新）"
+            f"{detail}——{ratio:.0%} 的块只能退到文件修改时间。复制目录会刷新这个时间，"
+            "无查询换窗对这些块不计新鲜度"
+            + ("（本库的文件修改时间比所有已识别的内容日期都新）"
                if outranks else "")
             + "。修法是把日期写进文件名"
             f"（window_04_2026-06-17.md 这种）或标题行。落 mtime 的文件："
@@ -5140,7 +5131,7 @@ def _selftest_doctor_empty():
         for path in (corpus, index_dir, sessions, root / "neighbor"):
             path.mkdir()
         (root / "neighbor" / "2026-10-26.md").write_text("虚构邻目录材料。", encoding="utf-8")
-        tc = TimeContext("Asia/Shanghai")
+        tc = TimeContext("UTC+08:00")
         kwargs = dict(index_dir=index_dir, threads_path=sessions / "threads.jsonl", time_context=tc)
         before = {str(p.relative_to(root)): p.read_bytes() for p in root.rglob("*") if p.is_file()}
         checks = diagnose(corpus, **kwargs)
@@ -5165,7 +5156,7 @@ def _selftest_doctor_empty():
         # 真 CLI 的人读／JSON 输出同样成功，并检查两个读取根都没有被写入。
         args = [sys.executable, str(Path(__file__).resolve()), "--doctor", "--corpus", str(corpus),
                 "--index-dir", str(index_dir), "--threads", str(kwargs["threads_path"]),
-                "--timezone", "Asia/Shanghai"]
+                "--timezone", tc.name]
         for extra in ([], ["--json"]):
             result = subprocess.run(args + extra, capture_output=True, text=True, encoding="utf-8")
             assert result.returncode == 0, result.stdout + result.stderr
@@ -5199,7 +5190,7 @@ def _selftest_doctor_current_probes():
         probe = _doctor_probe(ix)
         assert probe in bodies, probe
         before = {str(p.relative_to(root)): p.read_bytes() for p in root.rglob("*") if p.is_file()}
-        kwargs = dict(index_dir=index_dir, time_context=TimeContext("Asia/Shanghai"))
+        kwargs = dict(index_dir=index_dir, time_context=TimeContext("UTC+08:00"))
         checks = diagnose(corpus, **kwargs)
         assert any(c["title"] == "检索自查" and c["level"] == OK for c in checks), checks
         # 真撤回、落盘、重载：不能再用已撤回内容造强探针。
@@ -7073,12 +7064,7 @@ def _selftest():
         #    变异：去掉 _chunk_body 的首行判断（整块都当正文）/ 把阈值放到 1.0
         #    / 只报块数不报块长 → 各自红
 
-        #    【mtime 骑到真日期头上·变异靶心】（2026.08.03 补）比例判据看的是
-        #    "有多少块没日期"，这条看的是"没日期的块会不会骑到有日期的头上"。
-        #    **危险的恰恰是占比低的情况**：绝大多数块有日期、少数几块落 mtime，
-        #    那几块的时间戳就是"刚刚"，稳稳压过所有真日期，而占比连 20% 的门都
-        #    够不着 → 静默。这里造的正是那种语料：4 块带日期、1 块落 mtime（20%
-        #    不过阈值），必须靠新判据报出来。
+        # 四块有日期、一块只有 mtime，比例恰好未超过阈值，仍应提示文件时间晚于内容日期。
         混合 = _P(td) / "混合"
         混合.mkdir()
         for d in ("2026-06-01", "2026-06-02", "2026-06-03", "2026-06-04"):
@@ -7089,8 +7075,7 @@ def _selftest():
         code, out_mix = run_doctor(td, "--corpus", "混合")
         assert "⚠ 时间戳来源" in out_mix, \
             f"少数几块落 mtime 却比所有真日期都新时必须报警（比例判据够不着这一格）：{out_mix}"
-        assert "最旧的事实当成你现在的状态" in out_mix or "方向错误" in out_mix, \
-            f"WARN 正文要说清后果是方向错误，不是“没有排序信号”：{out_mix}"
+        assert "无查询换窗对这些块不计新鲜度" in out_mix, out_mix
         #    变异：把 outranks 那一支删掉（只留比例判据）→ 这条红
 
         #    缺 --corpus：argparse 拦下，同样是真进程才盖得到的一格

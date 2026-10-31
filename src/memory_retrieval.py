@@ -716,8 +716,8 @@ class MemoryIndex:
         真实评估再调）。now 可注入固定时刻，selftest 确定性用。只读 meta/weights，
         不需要先 build()。
 
-        兜底：meta 没有 timestamp 的块 recency 记 0——不崩、沉底但 topN 够大时仍会
-        返回，缺时间戳的块之间按权重排（排序键里权重当第二关键字）。
+        兜底：缺时间戳、只有文件修改时间或时间超前超过一天的块 recency 记 0——不崩、沉底但 topN 够大时仍会
+        返回，零新鲜度的块之间按权重排（排序键里权重当第二关键字）。
 
         乘法 vs 加权和（任务卡测试第 3 条：不预设答案，实测后定，过程如实记）：
         极端对比实测（selftest 第 9 项）——刚发生但从未被命中的块（w=1.0, recency≈1）
@@ -762,8 +762,8 @@ class MemoryIndex:
             if excluded and _chunk_key(self.chunks[i]) in excluded:
                 continue
             ts = meta.get("timestamp")
-            if ts is None:
-                recency = 0.0  # 兜底：没时间戳当"无限旧"，不猜不崩
+            if ts is None or meta.get("timestamp_source") == "mtime" or ts > now + 86400:
+                recency = 0.0
             else:
                 recency = 0.5 ** (max(0.0, now - ts) / 86400.0 / half_life)
             # 权重钳到 WEIGHT_INFLUENCE_CAP（2026.07.31 滚雪球治理）：不封顶的话
@@ -2014,7 +2014,7 @@ def load_corpus(corpus_dir, embed=False, recursive=True, provider=None, cache_pa
         同窗口号，是同一次会话的两种写法，借它的日期是有据可依的，不是猜
       > mtime（最后兜底。⚠ **它不是"基本没有排序信号"，是给出方向错误的信号**：
         全新 clone／刚落盘会把这些块刷成"刚刚"，于是最没有日期依据的内容拿到全库
-        最新的时间戳，换窗召回按新鲜度排序时最旧的事实冒充最新的。2026.08.03 跨模型
+        最新的时间戳，因此无查询换窗对 mtime 不计新鲜度。2026.08.03 跨模型
         实测量到过这条：那么一份语料下两家模型 0/6 答对当下状态。召回层已对这一档
         改标「时间未知」不再打日期，`--doctor` 也有专门判据，但**根子仍是语料没日期**）"""
     if embed and cache_path is None and isinstance(corpus_dir, (str, Path)):
