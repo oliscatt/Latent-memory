@@ -12,7 +12,7 @@
 它是一套本地优先的长期记忆工具，不是另一个聊天 App，也不靠把全部历史硬塞进上下文。
 你继续用自己熟悉的 Claude、Codex、手机前端或自建前端。
 
-`Python 3.10+` · `默认零第三方依赖` · `stdio / Streamable HTTP` · `PolyForm Internal Use 1.0.0`
+`Python 3.10+` · `默认零第三方依赖` · `stdio / Streamable HTTP` · `AGPL-3.0`
 
 ## 它解决什么问题
 
@@ -238,7 +238,8 @@ embedding 都是可选路线，没把语料去向念给用户听，就不出货�
 
 ## License
 
-PolyForm Internal Use License 1.0.0，允许内部业务使用，不允许分发；完整条款见 [LICENSE](LICENSE)。
+Copyright (C) 2026 oliscatt。本项目以 GNU Affero General Public License v3.0（AGPL-3.0）发布，完整条款见 [LICENSE](LICENSE)。
 
-个人在自己的设备或服务器上部署、非商业自用，也在允许范围内。
-使用时的界面截图、录屏可以分享到社交平台。
+可以自己安装、修改和使用；二次开源可以，但必须保留原版权说明、注明改动，并同样以 AGPL-3.0 公开源码，包括作为网络服务提供时；禁止并入闭源项目或以闭源方式提供。
+
+个人在自己的设备或服务器上部署、自用，也在允许范围内；使用时的界面截图、录屏可以分享到社交平台。
