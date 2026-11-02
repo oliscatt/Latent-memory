@@ -14,6 +14,8 @@ DSH 把每个会话存成 ``~/.dsh/sessions/<项目>/<会话>/session.v4.jsonl.z
 4. **增量**：``--state`` 记住每个会话已导出的条数，重跑只追加新的；
    会话被压缩重写过（条数变少）则从头重导。
 
+取不到时间的消息也跳过：落档端靠时间推游标，一行空时间会让整份来源读不进去。
+
 时间字段按"事件顶层 ``time``（毫秒 epoch）→ ``data.time`` → ``ts``"依次取，
 毫秒自动除以 1000。输出行形如::
 
@@ -119,16 +121,18 @@ def records_of(events: Iterable[dict], tz: timezone,
         text = text_of(content)
         if not text or not message_id or message_id in seen:
             continue
+        seconds = to_seconds(event.get("time") or data.get("time") or event.get("ts"))
+        if seconds is None:
+            continue                          # 落档端按时间推游标，没有时间的行会让整份来源读不进去
         seen.add(message_id)
 
-        seconds = to_seconds(event.get("time") or data.get("time") or event.get("ts"))
         stamp = iso(seconds, tz)
         yield {
             "id": message_id,
             "ts": stamp,
             "role": role,
             "text": text,
-            # 会话重写后 id 可能变，落档端用一个与时间+角色+正文绑定的稳定键
+            # 时间+角色+正文的短哈希，供自己核对导出结果；落档端只认 id 与 ts，不读这个字段
             "key": hashlib.sha1(f"{stamp}{role}{text}".encode()).hexdigest()[:16],
         }
 

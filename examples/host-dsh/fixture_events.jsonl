@@ -9,3 +9,4 @@
 {"type":"user/message","time":1762000000000,"data":{"id":"m0001","content":[{"type":"text","text":"今天风很大，我把窗关上了。"}]}}
 {"type":"assistant/message","ts":"2026-11-01T05:20:00Z","data":{"id":"a0002","content":[{"type":"text","text":"第二种布局也认，ISO 时间也认。"}]}}
 {"type":"assistant/message","time":1762000300000,"data":{"message":{"id":"a0003","content":[{"type":"text","text":"   "}]}}}
+{"type":"assistant/message","data":{"message":{"id":"a0004","content":[{"type":"text","text":"这条没有时间，不应被导出。"}]}}}
