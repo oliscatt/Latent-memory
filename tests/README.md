@@ -11,6 +11,10 @@ python tests/run_release_checks.py
 检查脚本本身零第三方依赖。没装 jieba 时各文件照样跑完，但自动浮现相关的自检段落会打印
 “跳过”，这部分就没有被覆盖。GitHub Actions（`.github/workflows/release-checks.yml`）在 Python 3.10／3.11／3.12 上先装 jieba 再跑。
 
+`tests/dsh_export_test.py` 是宿主适配的夹具测试，不进上面这条正式判据（它不跑 `--selftest`），
+单独跑：`python3 tests/dsh_export_test.py`。只用 `examples/host-dsh/` 里的虚构事件，无第三方依赖；
+本机没有 `zstd` 时，CLI 增量那一段打印跳过，其余断言照跑。
+
 **macOS 上 `e2e_smoke.py` 与 `memory_init.py` 两项会红，结果是 26/28，这不是出货问题。** macOS 的临时
 目录 `/var/…` 是 `/private/var/…` 的软链接，这两份自检用临时目录夹具比对产出路径时，一边是别名、
 一边是真实路径，字面对不上；报错文字（“引导句没指向这次出货的人格文件”“config 指向……”）看着像

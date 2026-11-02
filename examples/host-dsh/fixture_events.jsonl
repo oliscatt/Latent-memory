@@ -1,0 +1,12 @@
+{"type":"session/init","time":1762000000000,"data":{"id":"s1"}}
+{"type":"user/message","time":1762000000000,"data":{"id":"m0001","content":[{"type":"text","text":"今天风很大，我把窗关上了。"}]}}
+{"type":"user/message","time":1762000060000,"data":{"id":"m0002","source":{"kind":"schedule"},"content":[{"type":"text","text":"【提醒】二十分钟到了。"}]}}
+{"type":"user/message","time":1762000065000,"data":{"id":"m0003","source":{"kind":"plugin","plugin":"示例插件"},"content":[{"type":"text","text":"【历史召回】这是一条注入的旧事。"}]}}
+{"type":"assistant/thinking","time":1762000100000,"data":{"id":"a0000","text":"先想一下要不要提开空调。"}}
+{"type":"assistant/message","time":1762000120000,"data":{"message":{"id":"a0001","content":[{"type":"thinking","thinking":"示例思考块，不应被导出"},{"type":"text","text":"那就别开窗了。"}]}}}
+{"type":"tool/call","time":1762000130000,"data":{"id":"t0001","name":"示例工具","arguments":"{}"}}
+{"type":"tool/result","time":1762000140000,"data":{"id":"t0001","ok":true,"content":[{"type":"text","text":"工具结果不应被导出"}]}}
+{"type":"user/message","time":1762000000000,"data":{"id":"m0001","content":[{"type":"text","text":"今天风很大，我把窗关上了。"}]}}
+{"type":"assistant/message","ts":"2026-11-01T05:20:00Z","data":{"id":"a0002","content":[{"type":"text","text":"第二种布局也认，ISO 时间也认。"}]}}
+{"type":"assistant/message","time":1762000300000,"data":{"message":{"id":"a0003","content":[{"type":"text","text":"   "}]}}}
+{"type":"assistant/message","data":{"message":{"id":"a0004","content":[{"type":"text","text":"这条没有时间，不应被导出。"}]}}}
