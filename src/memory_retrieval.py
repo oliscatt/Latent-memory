@@ -1242,7 +1242,12 @@ class MemoryIndex:
     # 被谁以什么理由撤掉的，全程可追溯。更正内容走 latent_append 正常写回，
     # 新旧两条在账本里互相指认。
 
-    def retract(self, quote, reason, now=None, replaced_by=None):
+    def _retract_candidate(self, i):
+        meta = self.meta[i]
+        return {"recordId": _chunk_key(self.chunks[i]), "source": meta.get("source"),
+                "heading": meta.get("heading"), "local_date": meta.get("local_date")}
+
+    def retract(self, quote, reason, now=None, replaced_by=None, record_id=None):
         """撤回一段记录：quote 必须唯一定位到一个块（从检索结果里逐字摘）。
         命中零条或多条都明确报错，不猜——歧义时替调用方挑一条，就是把"清错误"
         变成"造新错误"。返回 (chunk_idx, 块原文)。
@@ -1274,16 +1279,29 @@ class MemoryIndex:
         if not matches:
             raise ValueError("没有找到包含这段原文的记录（或它已被撤回）。"
                              "quote 要从 latent_search 返回的原文里逐字摘，别转述。")
-        if len(matches) > 1:
-            raise ValueError(f"这段原文命中了 {len(matches)} 条记录，定位不到唯一一条"
-                             "——换一段更长、更独特的原文再试。")
+        if record_id is not None:
+            # issue #67：多命中时允许按候选 recordId 指定；别名兼容同窗口清理后的边界漂移
+            narrowed = [i for i in matches
+                        if record_id == _chunk_key(self.chunks[i])
+                        or record_id in (self.meta[i].get("record_id_aliases") or ())]
+            if not narrowed:
+                raise ValueError(f"这段原文命中的记录里没有 recordId={record_id}；"
+                                 "请从上次报错列出的候选里挑，不要猜。")
+            matches = narrowed
+        keys = {_chunk_key(self.chunks[i]) for i in matches}
+        if len(matches) > 1 and not (record_id is not None and len(keys) == 1):
+            raise AmbiguousRetraction(len(matches),
+                                      [self._retract_candidate(i) for i in matches])
         i = matches[0]
         now = time.time() if now is None else now
-        self.retracted.add(i)
-        self.weights[i] = 1.0        # 权重归位：误召回攒的命中数是错误信号，不留
-        for j in self._index_followers(i):
-            self.retracted.add(j)
-            self.weights[j] = 1.0
+        # 撤回账本按内容哈希记，一字不差的副本重启后本来就会一起退出；这里当场同步，
+        # 免得内存态和盘上账本不一致（issue #67）
+        for k in matches:
+            self.retracted.add(k)
+            self.weights[k] = 1.0    # 权重归位：误召回攒的命中数是错误信号，不留
+            for j in self._index_followers(k):
+                self.retracted.add(j)
+                self.weights[j] = 1.0
         self.retraction_log[_chunk_key(self.chunks[i])] = {
             "reason": reason.strip(), "time": now,
             "source": self.meta[i].get("source"), "heading": self.meta[i].get("heading"),
@@ -1656,6 +1674,25 @@ def annotate_block(block, rate, threshold=None):
     低于阈值时原样返回，不加噪声。"""
     note = miss_rate_note(rate, threshold)
     return block + ("\n" + note if note else "")
+
+
+class AmbiguousRetraction(ValueError):
+    """quote 命中多条时带上全部候选，让调用方按 recordId 指定，而不是只能换 quote 重试（issue #67）。"""
+
+    def __init__(self, count, candidates):
+        self.count, self.candidates = count, candidates
+        listing = "；".join(
+            f"recordId={c['recordId']}（{c.get('source') or '来源不明'}"
+            + (f"，{c['local_date']}" if c.get("local_date") else "") + "）"
+            for c in candidates)
+        if len({c["recordId"] for c in candidates}) == 1:
+            rid = candidates[0]["recordId"]
+            hint = (f"这 {count} 条是一字不差的重复写入，recordId 相同。只想去掉多余的副本、"
+                    f"保留一份：用 latent_cleanup action=preview recordId={rid}；"
+                    f"整条都是错的：带上 recordId={rid} 再调一次 latent_correct，所有副本会一起撤回。")
+        else:
+            hint = "从下面的候选里挑出要撤的那条，带上 recordId 再调一次；或换一段更长、更独特的原文。"
+        super().__init__(f"这段原文命中了 {count} 条记录，定位不到唯一一条。{hint}候选：{listing}")
 
 
 def _chunk_key(text):

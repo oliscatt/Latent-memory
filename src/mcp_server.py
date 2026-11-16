@@ -86,7 +86,7 @@ from memory_retrieval import (MemoryIndex, load_corpus, append_record, corpus_fi
                               _chunk_key, INDEX_SUMMARY_TEMPLATE,
                               INDEX_SUMMARY_EXAMPLE, INDEX_SUMMARY_FORMAT_GUIDE,
                               has_history_intent, has_current_intent, _file_info, _note_window, _file_chunks,
-                              _MARKDOWN_SIDECARS, pick_supersede_hint)
+                              _MARKDOWN_SIDECARS, pick_supersede_hint, AmbiguousRetraction)
 from embedding_provider import resolve_provider
 # 切块下界与体检的切块成色检查**共用同一个判据**，不各抄一份
 from chunking_experiment import chunk_body as _chunk_body, chunk_heading
@@ -100,7 +100,7 @@ from notes_state import (FILENAME as NOTES_FILENAME, NoteStore, NoteRequestError
                          NoteStoreError)
 # 记忆所有者的时区（任务卡"写回时区与跨日归窗"）：一个进程一份，stdio 与 HTTP
 # 两种起动形态共用同一个，不各自造一份换算逻辑
-from time_context import (TimeContext, detect_local_timezone, parse_record_time_marker,
+from time_context import (TimeContext, detect_local_timezone, parse_record_time_marker, record_time_marker,
                           tzdb_available)
 from passive_recall import (ASSEMBLY_POLICY_VERSION, POLICY_VERSION,
                             PassiveRecallRequestError, PassiveRecallService,
@@ -418,6 +418,9 @@ TOOLS = [
                                "description": "更正后的内容（可省略：只撤不补）"},
                 "current_state": {"type": "string",
                                   "description": "更正这件事现在的状态（写 correction 时必填）"},
+                "recordId": {"type": "string",
+                             "description": "可省略。quote 命中多条时，报错会列出候选 recordId；"
+                                            "从中挑一个填回来指定撤哪条，不要猜"},
             },
             "required": ["quote", "reason"],
         },
@@ -721,6 +724,59 @@ def _closest_source_span(needle, sources, window=12):
     return best[1] if best else None
 
 
+_APPEND_DUPLICATE_WINDOW_S = 600
+
+
+def _recent_duplicate_record(body_plan, now):
+    """目标文件最后一节是不是刚写下的同一段正文；是就返回 (recordId, 相隔秒数)。
+
+    只看同一文件的最后一节、只看 10 分钟内：拦的是客户端重试造成的连写（issue #67），
+    不是“同样的话以后不许再记”。"""
+    path = Path(body_plan["path"])
+    if not path.exists():
+        return None
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return None
+    starts = [m.start() for m in re.finditer(r"(?m)^## ", text)]
+    if not starts:
+        return None
+    last = text[starts[-1]:]
+    marker = parse_record_time_marker(last)
+    if marker is None:
+        return None
+    now = time.time() if now is None else now
+    age = now - marker[0]
+    if not 0 <= age <= _APPEND_DUPLICATE_WINDOW_S:
+        return None
+
+    def body(section):
+        return re.sub(r"<!--\s*写于\s*[^>]+-->", "", section).strip()
+
+    new_section = body_plan["content"][body_plan["content"].rfind("\n## ") + 1:]
+    if body(last) != body(new_section):
+        return None
+    return _chunk_key(chunk_heading(text)[-1]), age
+
+
+def _loose_quote_original(quote, chunks, retracted=()):
+    """把只差空白、全半角或引号标点的 quote 映射回第一处原文；找不到返回 None。"""
+    if not isinstance(quote, str) or not quote.strip():
+        return None
+    needle, _ = _canonical_quote(quote.strip())
+    if sum(_content_char(ch) for ch in needle) < 2:
+        return None
+    for i, chunk in enumerate(chunks):
+        if i in retracted:
+            continue
+        haystack, positions = _canonical_quote(chunk)
+        pos = haystack.find(needle)
+        if pos >= 0:
+            return chunk[positions[pos]:positions[pos + len(needle) - 1] + 1]
+    return None
+
+
 def validate_index_evidence(items, source_texts):
     """把容忍排版差异的 quote 映射回原文；绝不把模型改写直接写进索引。"""
     if not isinstance(items, list) or not items:
@@ -944,7 +1000,9 @@ def _record_section_plan(path, record_id):
         raise ValueError(f"原始记录文件无法读取：{path}（{type(exc).__name__}）") from None
     starts = [match.start() for match in re.finditer(r"(?m)^## ", text)]
     if not starts:
-        raise ValueError("目标文件没有可清理的 ## 记录节；只支持 latent_append 写下的记录")
+        # 没有 ## 节的文件（导入或手写语料）不可能装着 latent_append 的记录：跳过，
+        # 不能让写回目录里任意一个这样的文件挡住所有记录的清理（issue #67）
+        return None
     preamble = text[:starts[0]]
     candidates = []
     for number, start in enumerate(starts):
@@ -959,9 +1017,11 @@ def _record_section_plan(path, record_id):
                                "chunks": chunks, "hashes": hashes})
     if not candidates:
         return None
-    if len(candidates) != 1:
+    if len(candidates) != 1 and len({c["section"].strip() for c in candidates}) != 1:
         raise ValueError(f"recordId 在原文件中对应 {len(candidates)} 个记录节，定位不唯一，拒绝删除")
-    target = candidates[0]
+    # 同一文件里一字不差的重复写入（issue #67）：删哪份都等价，固定删最后一份、保留第一份
+    target = candidates[-1]
+    target["copies"] = len(candidates)
     if parse_record_time_marker(target["section"]) is None:
         raise ValueError("目标没有 Latent 写回时刻标记；只支持 latent_append 自己写下的记录，"
                          "普通导入语料请继续用 latent_correct 撤回")
@@ -1838,6 +1898,12 @@ class MemoryServer:
             raise ToolError(_append_input_error(str(e), "full")) from None
         except OSError as e:
             raise ToolError(str(e)) from None
+        duplicate = _recent_duplicate_record(body_plan, now)
+        if duplicate is not None:
+            dup_id, age = duplicate
+            return (f"这条正文与 {int(age)} 秒前写下的 recordId={dup_id} 一字不差，判定为重复提交，"
+                    "未再写入。bodyStatus=duplicate；unresolvedOps 也没有重复执行。"
+                    f"要补索引就用 recordId={dup_id}，不要再发一遍正文。")
         try:
             index_plans, index_status = self._plan_append_indexes(
                 args, body_plan, index_write_dir)
@@ -2031,15 +2097,34 @@ class MemoryServer:
                             "病灶迁移，同 latent_append：更正这件事现在是什么状态？")
         # 撤回先做——它同时是 quote 的校验关卡；quote 定位不到就该在写任何东西
         # 之前失败（否则更正落了盘、旧记录还在，比什么都没做更糟）
+        record_id = args.get("recordId")
+        if record_id is not None and not (isinstance(record_id, str)
+                                          and re.fullmatch(r"[0-9a-f]{16}", record_id)):
+            raise ToolError("recordId 必须是 16 位小写十六进制，从多命中报错列出的候选里抄")
+        quote = args.get("quote") or ""
         try:
-            old_idx, _ = self.index.retract(args.get("quote") or "",
-                                            args.get("reason") or "", now=now)
+            try:
+                old_idx, _ = self.index.retract(quote, args.get("reason") or "",
+                                                now=now, record_id=record_id)
+            except AmbiguousRetraction:
+                raise
+            except ValueError:
+                # 逐字找不到时，按与 indexEvidence 同一套规整（空白、全半角、引号标点）
+                # 映射回原文再试一次；映射不到就照原样报错（issue #67 D）
+                original = _loose_quote_original(quote, self.index.chunks, self.index.retracted)
+                if original is None or original == quote.strip():
+                    raise
+                old_idx, _ = self.index.retract(original, args.get("reason") or "",
+                                                now=now, record_id=record_id)
         except ValueError as e:
             raise ToolError(str(e))
         old_record_id = _chunk_key(self.index.chunks[old_idx])
+        copies = sum(1 for c in self.index.chunks if _chunk_key(c) == old_record_id)
         # 推荐索引摘要跟随正文一起退出检索（retract 内已处理）；回执如实报条数（issue #39）
         followers = self.index._index_followers(old_idx)
         follow_note = (f"，它的 {len(followers)} 条索引摘要也一并退出检索" if followers else "")
+        if copies > 1:
+            follow_note += f"；这条有 {copies} 份一字不差的副本，已一起撤回"
         msg = (f"已撤回那段旧记录：检索不会再返回它{follow_note}"
                "（原文件保留，撤回原因入账可追溯）。"
                f" retractionStatus=applied；旧 recordId={old_record_id} 的 passiveStatus=invalidated。")
@@ -2144,11 +2229,18 @@ class MemoryServer:
                 raise ToolError(str(exc)) from None
             if section_plan is not None:
                 candidates.append((source, section_plan))
-        if len(candidates) != 1:
+        same_text = len({plan["section"].strip() for _, plan in candidates}) == 1
+        if not candidates or (len(candidates) > 1 and not same_text):
             reason = "没有找到" if not candidates else f"找到 {len(candidates)} 条"
             raise ToolError(f"按 recordId={record_id} {reason}原始记录；"
-                            "记录可能已清理或被手工修改，请重新检索，不要猜着删除")
-        source, section_plan = candidates[0]
+                            "记录可能已清理或被手工修改，请重新检索，不要猜着删除"
+                            + ("（cleanup 只认 latent_append 写下、带写回时刻标记的 ## 记录节）"
+                               if not candidates else ""))
+        # 一字不差的重复写入（issue #67）：固定删最后一份、保留第一份；
+        # 跨文件时也一样，按文件名排序后的最后一份
+        copies = sum(plan.get("copies", 1) for _, plan in candidates)
+        source, section_plan = candidates[-1]
+        duplicate = copies > 1
 
         index_root = Path(self.index_dir) if self.index_dir is not None \
             else Path(self.corpus_dir) / "index"
@@ -2157,6 +2249,10 @@ class MemoryServer:
         unresolved_items = self.unresolved_store.read()
         blocker_ids = [item.id for item in unresolved_items
                        if record_id in source_record_ids([item])]
+        if duplicate:
+            # 还留着一份同样的正文：索引、权重／撤回／实体账本、被动元数据和未解决引用
+            # 都继续归那一份用，这次只删多余的那一节
+            linked_index, blocker_ids = [], []
 
         removed_hashes = set(section_plan["hashes"])
         for path in linked_index:
@@ -2168,7 +2264,8 @@ class MemoryServer:
 
         changes = {source: section_plan["new_bytes"]}
         changes.update({path: None for path in linked_index})
-        for sidecar in (self.weights_path, self.retractions_path, self.entities_path):
+        for sidecar in (() if duplicate else
+                        (self.weights_path, self.retractions_path, self.entities_path)):
             if sidecar is None:
                 continue
             path = Path(sidecar)
@@ -2186,7 +2283,7 @@ class MemoryServer:
 
         # 被动账本不是权威正文，但 cleanup 后也不能留下还能触发的孤儿元数据。
         try:
-            passive_plan = self.passive_metadata.plan_remove(record_id)
+            passive_plan = None if duplicate else self.passive_metadata.plan_remove(record_id)
         except ValueError as exc:
             raise ToolError(f"清理前无法核验 {PASSIVE_METADATA_FILENAME}：{exc}，拒绝改盘") from None
         if passive_plan is not None:
@@ -2204,6 +2301,7 @@ class MemoryServer:
             "section": section_plan["section"],
             "linked_index": linked_index,
             "blocker_ids": blocker_ids,
+            "copies": copies,
             "changes": changes,
             "snapshots": snapshots,
             "confirmation": _cleanup_confirmation(record_id, snapshots),
@@ -2259,7 +2357,9 @@ class MemoryServer:
         if action == "preview":
             blocker_note = (f"；当前被未解决事项引用：{blockers}，关闭或改写引用前不能删除"
                             if blockers else "；未发现未解决事项引用")
-            return (f"清理预览：recordId={plan['record_id']}；来源={plan['source'].name}；"
+            dup_note = (f"；这条有 {plan['copies']} 份一字不差的重复写入，本次只删最后一份、保留其余，"
+                        "索引与账本不动" if plan["copies"] > 1 else "")
+            return (f"清理预览：recordId={plan['record_id']}；来源={plan['source'].name}{dup_note}；"
                     f"关联索引={len(plan['linked_index'])} 个{blocker_note}。\n"
                     f"目标内容：{_cleanup_preview_text(plan['section'])}\n"
                     f"确认令牌：{plan['confirmation']}\n"
@@ -2283,6 +2383,9 @@ class MemoryServer:
             raise ToolError(f"清理失败，活动文件已尝试回滚；隔离备份保留在 {backup_dir}。{exc}") from None
         self._refresh_after_write()
         self.written_paths.update(str(path) for path in changed)
+        if plan["copies"] > 1:
+            return (f"已清理 recordId={plan['record_id']} 的 1 份重复副本，保留 {plan['copies'] - 1} 份；"
+                    f"索引与账本未动；隔离备份与审计 manifest 位于 {backup_dir}。")
         return (f"已精准清理 recordId={plan['record_id']}：正文记录 1 条、关联索引 "
                 f"{len(plan['linked_index'])} 个；隔离备份与审计 manifest 位于 {backup_dir}。")
 
@@ -4215,6 +4318,97 @@ def _selftest_structured_text_every_tool(now=1_800_000_000.0):
     print("selftest 结构化正文：通过（每个模型可见工具 structuredContent.text 与 content 一致）")
 
 
+def _selftest_duplicate_records(now=1_800_000_000.0):
+    """issue #67：一字不差的重复写入不能把 correct／cleanup 卡成死锁。
+
+    判据：① 写回目录里有不带 ## 节的导入文件时，cleanup 照样能定位别的文件里的记录；
+    ② 同一文件里两节一字不差（同一 recordId）时，correct 的报错列出 recordId 并指向 cleanup；
+    cleanup preview 说明有 2 份、delete 只删最后一份，正文还剩一份可检索；
+    ③ 10 分钟内同一段正文重复 append 不再落第二份，回执给出已有 recordId；
+    ④ 正文不同但都含同一段 quote 时，报错列出两个候选，带 recordId 只撤指定那条；
+    ⑤ quote 只差全半角／引号时，correct 照样定位。采集条件：stdlib 服务端、临时语料、零依赖检索。"""
+    import tempfile
+    tc = TimeContext.default()
+    with tempfile.TemporaryDirectory() as td:
+        corpus = Path(td) / "corpus"
+        timeline = corpus / "timeline"
+        timeline.mkdir(parents=True)
+        # 导入语料：没有 ## 节，文件名照样是 window_*.md
+        (timeline / "window_01_2026-01-01.md").write_text(
+            "# 导入的旧窗口\n\n普通导入正文，没有记录节。\n", encoding="utf-8")
+        dup = (f"## 2027-01-15 记\n{record_time_marker(now - 3600, tc)}\n"
+               "虚构验证：阳台的绣球开成了蓝色。\n当下状态：虚构验证数据")
+        (timeline / "window_02_2027-01-15.md").write_text(
+            "# 第2个窗口 · 2027-01-15\n\n"
+            f"## 2027-01-15 记\n{record_time_marker(now - 7200, tc)}\n"
+            "虚构验证：楼下新开了一家修鞋铺。\n当下状态：虚构验证数据\n\n"
+            + dup + "\n\n" + dup + "\n", encoding="utf-8")
+        loader = lambda: load_corpus(corpus)
+        mk = lambda: MemoryServer(index=loader(), thread_store=ThreadStore(), corpus_dir=corpus,
+                                  loader=loader, retractions_path=corpus / ".retractions.json")
+        srv = mk()
+        def call(name, args, at):
+            return srv.handle({"jsonrpc": "2.0", "id": 67, "method": "tools/call",
+                               "params": {"name": name, "arguments": args}}, now=at)["result"]
+        text = lambda r: r["content"][0]["text"]
+
+        r = call("latent_correct", {"quote": "阳台的绣球开成了蓝色", "reason": "虚构验证"}, now)
+        assert r["isError"] is True and "一字不差的重复写入" in text(r), text(r)
+        rid = re.search(r"recordId=([0-9a-f]{16})", text(r)).group(1)
+        assert "latent_cleanup" in text(r), text(r)
+
+        preview = call("latent_cleanup", {"action": "preview", "recordId": rid}, now + 1)
+        assert preview["isError"] is False and "2 份" in text(preview), text(preview)
+        token = re.search(r"确认令牌：(DELETE-[0-9a-f]{16}-[0-9a-f]{16})", text(preview)).group(1)
+        r = call("latent_cleanup", {"action": "delete", "recordId": rid, "confirmation": token,
+                                    "reason": "虚构验证：重复写入"}, now + 2)
+        assert r["isError"] is False and "保留 1 份" in text(r), text(r)
+        body = (timeline / "window_02_2027-01-15.md").read_text(encoding="utf-8")
+        assert body.count("绣球开成了蓝色") == 1 and "修鞋铺" in body, body
+        assert (timeline / "window_01_2026-01-01.md").exists(), "导入文件不受影响"
+        found = call("latent_search", {"query": "阳台绣球蓝色"}, now + 3)
+        assert "绣球开成了蓝色" in text(found), text(found)
+
+        # ③ 重试连写
+        first = call("latent_append", {"text": "虚构验证：洗衣机换了进水管。",
+                                       "current_state": "虚构验证数据"}, now + 10)
+        assert first["isError"] is False, text(first)
+        first_id = re.search(r"recordId=([0-9a-f]{16})", text(first)).group(1)
+        again = call("latent_append", {"text": "虚构验证：洗衣机换了进水管。",
+                                       "current_state": "虚构验证数据"}, now + 11)
+        assert again["isError"] is False and "bodyStatus=duplicate" in text(again) \
+            and first_id in text(again), text(again)
+        written = "".join(p.read_text(encoding="utf-8") for p in timeline.glob("window_*.md"))
+        assert written.count("洗衣机换了进水管") == 1, written
+        later = call("latent_append", {"text": "虚构验证：洗衣机换了进水管。",
+                                       "current_state": "虚构验证数据"}, now + 11 + 3600)
+        assert "bodyStatus=duplicate" not in text(later), "超过 10 分钟的同一句话照常写"
+
+        # ④ 不同正文共享同一段 quote
+        for n, body_text in enumerate(("虚构验证：周六去看了蓝鲸展，排队很久。",
+                                       "虚构验证：周日又去看了蓝鲸展，人少多了。")):
+            assert call("latent_append", {"text": body_text, "current_state": "虚构验证数据"},
+                        now + 20 + n)["isError"] is False
+        r = call("latent_correct", {"quote": "去看了蓝鲸展", "reason": "虚构验证"}, now + 30)
+        ids = re.findall(r"recordId=([0-9a-f]{16})", text(r))
+        assert r["isError"] is True and len(set(ids)) == 2 and "候选" in text(r), text(r)
+        sunday = [i for i in srv.index.chunks if "周日又去" in i][0]
+        r = call("latent_correct", {"quote": "去看了蓝鲸展", "reason": "虚构验证",
+                                    "recordId": _chunk_key(sunday)}, now + 31)
+        assert r["isError"] is False, text(r)
+        found = text(call("latent_search", {"query": "蓝鲸展"}, now + 32))
+        assert "排队很久" in found and "人少多了" not in found, found
+
+        # ⑤ 全半角／引号差异
+        call("latent_append", {"text": "虚构验证：她说“下次带伞”，结果还是忘了。",
+                               "current_state": "虚构验证数据"}, now + 40)
+        r = call("latent_correct", {"quote": '她说"下次带伞"，结果还是忘了', "reason": "虚构验证"},
+                 now + 41)
+        assert r["isError"] is False and "已撤回" in text(r), text(r)
+    print("selftest 重复记录：通过（导入文件不挡 cleanup；一字不差的副本 correct 指路、cleanup 只删多余一份；"
+          "10 分钟内重复 append 不落第二份；多命中列候选并可按 recordId 指定；引号形态差异可定位）")
+
+
 def _selftest_retract_index_followers(now=1_800_000_000.0):
     """issue #39：latent_correct 撤回某条记录时，它自己的推荐索引摘要也要退出检索。
 
@@ -5237,6 +5431,7 @@ def _selftest():
     _selftest_search_visible_body()
     _selftest_structured_text_every_tool()
     _selftest_retract_index_followers()
+    _selftest_duplicate_records()
     _selftest_status_ops_no_rebuild()
     _selftest_incremental_writes()
     _selftest_external_changes()
