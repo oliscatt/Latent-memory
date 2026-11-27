@@ -152,8 +152,8 @@ INSTRUCTIONS = (
     "说法再查一次看看还有没有；不必、也不该逐条撤。\n"
     "查过但确实没有的，就如实说没找到——查过之后的“没有”是诚实，查之前的“没有”才是错。\n"
     "第一次检索没找到、或返回内容明显对不上时，最多再查一次：保留原 query，把更具体的"
-    "说法放进 queryVariant（补名字、物件、地点或记录里可能用过的词）；服务器会融合两种"
-    "问法。第二次仍对不上就停，不要循环查到有为止。\n"
+    "说法放进 queryVariant（补名字、物件、地点或记录里可能用过的词；还是同一个问题，"
+    "不要塞第二个问题）；服务器会融合两种问法。第二次仍对不上就停，不要循环查到有为止。\n"
     "新会话开场先调一次 latent_session_start，会话结束前调一次 latent_thread_close。"
 )
 
@@ -188,6 +188,11 @@ _UNRESOLVED_OPS_SCHEMA = {
     }, "required": ["action"]},
 }
 
+# latent_search 顺带补几句事实库里的小事（见 _search_fact_lines）。下限比自动浮现的 0.42 高：
+# 主动检索已经有正文了，只补确实沾边的；同样是在 voyage-3.5 上定的，换向量模型要重量。
+SEARCH_FACT_TOP = int(os.environ.get("LATENT_SEARCH_FACT_TOP") or 3)
+SEARCH_FACT_FLOOR = float(os.environ.get("LATENT_SEARCH_FACT_FLOOR") or 0.5)
+
 TOOLS = [
     {
         "name": "latent_search",
@@ -196,8 +201,12 @@ TOOLS = [
                        "不是本次对话的聊天记录）。**对方提到任何过去发生过的事、"
                        "约定、日期、地点、称呼、人名，或你对细节拿不准时，先查这里**——"
                        "不要在查之前说“我没有记录”“我不记得”，那在挂着记忆库时是错的。"
+                       "一次只查一件事；问「为什么」「当时怎么回事」时，query 写那件事本身的具体词"
+                       "（人、物、地点、软件名、版本号），不要只写「为什么」「原因」这类泛词。"
                        "若第一次结果不相关，最多重试一次：原问题仍放 query，更具体的说法放"
-                       "queryVariant；两种问法会融合，第二次仍不相关就如实说没找到。"
+                       "queryVariant——还是同一个问题，换成记录里可能出现的词，不要塞进第二个问题；"
+                       "两种问法会融合，第二次仍不相关就如实说没找到。"
+                       "结果末尾若有【相关的小事】，那是事实库里没随片段带出来的短句，同样可信。"
                        "查完自然接上话，不用报告查过。",
         "annotations": {
             "readOnlyHint": False,
@@ -211,7 +220,7 @@ TOOLS = [
                 "query": {"type": "string", "description": "要查什么"},
                 "queryVariant": {
                     "type": "string",
-                    "description": "可选的一种更具体说法；与原 query 融合。最多一个，不能循环扩写",
+                    "description": "可选的一种更具体说法：同一个问题，换成记录里可能用过的具体词；与原 query 融合。最多一个，不能循环扩写，不要加第二个问题",
                 },
                 "topN": {"type": "integer", "description": "返回几条，默认 5"},
             },
@@ -266,10 +275,13 @@ TOOLS = [
                 "facts": {
                     "type": "array",
                     "description": "可选。你的工具里有 latent_fact_backfill（部署开了自动浮现）就带上；没有就不用传。"
-                                   "带了会写进事实库，供自动浮现的事实模式使用。"
+                                   "带了会写进事实库，供自动浮现和 latent_search 使用。"
                                    "把这次写的内容里值得单独记住的小事拆成一句一条："
                                    "对方买了什么、你们搭了什么、定了什么约定、对方的身体和情绪、一句原话、"
-                                   "一个具体数字。一句只讲一件事，写清主语，不写空泛总结。",
+                                   "一个具体数字。一句只讲一件事，写清主语，不写空泛总结。"
+                                   "一件事是为了另一件事才做的，把原因写进同一句"
+                                   "（「因为手机升了新系统、电脑认不出，所以升级电脑系统」），"
+                                   "不要只写动作：以后被问「当时为什么」，靠的就是这一句。",
                     "items": {"type": "object", "properties": {
                         "fact": {"type": "string", "description": "一句话，8–120 字（按字符数算，一个汉字算一个）"},
                         "tag": {"type": "string", "enum": ["life", "work", "meta"]},
@@ -1419,11 +1431,49 @@ class MemoryServer:
                               miss_rate)
         if self.passive is None:
             return text
+        text += self._search_fact_lines(queries, results)
         # 有些宿主只向模型投递 structuredContent；两种消费路径都必须包含正文。
         # 保留 passiveRecall 原始来源字段，让宿主照常识别主动检索已覆盖的记录。
         structured = self.passive.search_metadata(results)
         structured["text"] = text
         return {"text": text, "structuredContent": structured}
+
+    def _search_fact_lines(self, queries, results, top=SEARCH_FACT_TOP):
+        """主动检索顺带查事实库：时间线块长、一块装好几件事，问「为什么」时原因常埋在没排上来的块里，
+        而事实库里那一句短、排得上。只补上面片段没带出来的块里的事实，来源块撤回、取代的不给；
+        事实库没开、没建好或向量出错都返回空串，不影响正文。不加权、不进冷却。"""
+        facts = getattr(self.passive, "fact_index", None)
+        if facts is None or getattr(facts, "provider", None) is None or not facts.ready:
+            return ""
+        shown = {r["meta"].get("record_id") for r in results} - {None}
+        live = self.passive._live_blocks()
+
+        def exclude(row):
+            block = row["meta"].get("block")
+            if not block or block in shown:
+                return True
+            return live is not None and block not in live[0]
+
+        best = {}
+        try:
+            facts.reload_if_changed()
+            for q in queries:
+                for row, score in facts.ranked(q, exclude=exclude, top=top) or []:
+                    if score >= SEARCH_FACT_FLOOR and score > best.get(row["id"], (None, -1))[1]:
+                        best[row["id"]] = (row, score)
+        except Exception as exc:     # 事实库只是补充，坏了不连累正文
+            print(f"latent_search 查事实库失败：{type(exc).__name__}", file=sys.stderr)
+            return ""
+        picked = sorted(best.values(), key=lambda item: -item[1])[:top]
+        if not picked:
+            return ""
+        lines = ["", "【相关的小事】事实库里和这个问法接近、但上面片段没带出来的几句（一句一件事，"
+                     "括号里是出处 recordId；要看前后文，就用这句里的具体词再查一次）："]
+        for row, _score in picked:
+            meta = row["meta"]
+            day = meta.get("event_date") or meta.get("written") or "时间未知"
+            lines.append(f"- [{day}] {row['text']}（recordId={meta['block']}）")
+        return "\n".join(lines)
 
     def _tool_passive_recall(self, args, now=None):
         """宿主隐藏入口；程序准入后返回经来源核验的 W4 现场资料。"""

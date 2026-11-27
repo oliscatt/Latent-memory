@@ -985,6 +985,23 @@ class SupersedeHintTests(unittest.TestCase):
         self.assertNotIn("冲刺校是 B 校", search)
         self.assertEqual(self.mcp.supersede_hint_stats(self.log), {"hinted": 1, "linked": 1, "ignored": 0})
 
+    def test_s1_search_adds_facts_from_blocks_not_shown(self):
+        """latent_search 顺带补事实库：只补正文片段没带出来的块，来源块被取代后不再补。"""
+        srv, ids, _ = self.build()
+        f1, f4 = KAOYAN[0][3], KAOYAN[3][3]
+        lines = srv._search_fact_lines([ASK_ALL], [])
+        self.assertIn("【相关的小事】", lines)
+        self.assertIn(f"{f1}（recordId={ids['R1']}）", lines)
+        self.assertIn(f"{f4}（recordId={ids['R4']}）", lines)
+        shown = [{"meta": {"record_id": ids["R1"]}}]
+        lines = srv._search_fact_lines([ASK_ALL], shown)
+        self.assertNotIn(f"recordId={ids['R1']}）", lines, "R1 已在片段里就不重复补")
+        self.assertIn(f4, lines)
+        srv._call_tool(1, {"name": "latent_supersede", "arguments": {"supersedes": ids["R1"], "by": ids["R4"]}})
+        self.assertNotIn(f1, srv._search_fact_lines([ASK_ALL], []), "来源块被取代的事实不补")
+        srv.passive.fact_index = None
+        self.assertEqual(srv._search_fact_lines([ASK_ALL], []), "", "没开事实库就什么都不加")
+
     def test_h6_superseded_record_no_longer_a_candidate(self):
         """判据写定后补的：第七节写了候选池去掉已被取代的记录，判据里漏了这条（变异“候选池不去掉已被取代的”
         只有这条会红）。补链后再写一条和 R1 一样的，提示只能指向现行的 R4，不能指回已退场的 R1。"""
