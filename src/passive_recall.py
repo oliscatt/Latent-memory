@@ -272,6 +272,9 @@ DEFAULT_ADMISSION_POLICY = {
         "测试"
     ],
     "skip_same_day_records": True,
+    # 当天写的记录只挡刚写下的这一段（分钟）：带精确时刻的记录写满这么久就放行。
+    # 窗口一换或上下文一压缩，当天早些时候的事本轮上下文里已经没有，整天都挡会两头够不着。
+    "same_day_quiet_minutes": 120,
     "rare_word_tags": [
         "nr",
         "ns",
@@ -1004,6 +1007,28 @@ class PassiveRecallService:
             return context.local_date(now)
         return _time.strftime("%Y-%m-%d", _time.localtime(now))
 
+    def _too_fresh(self, meta, today):
+        """这条当天写的记录还算不算「刚写的」——刚写的多半还在本轮上下文里，不递。
+
+        只认服务器自己写下的精确时刻（append／record_iso）：写下满 same_day_quiet_minutes
+        就放行。没有时刻的当天记录仍按整天挡，和改之前一样。today 为 None 表示不挡。"""
+        if today is None or (meta or {}).get("local_date") != today:
+            return False
+        ts = meta.get("timestamp")
+        if ts is None or meta.get("timestamp_source") not in {"append", "record_iso"}:
+            return True
+        quiet = float(_ADMISSION_POLICY.get("same_day_quiet_minutes") or 0) * 60
+        return self._now() - float(ts) < quiet
+
+    def _block_metas(self):
+        """块号（含别名）→ 主库里那块的 meta，事实按来源块的写入时刻判断新旧。"""
+        out = {}
+        for meta in getattr(self.index, "meta", None) or []:
+            for key in [meta.get("record_id"), *(meta.get("record_id_aliases") or ())]:
+                if key:
+                    out[key] = meta
+        return out
+
     def _record_row(self, record_id):
         if self.fact_index is not None:
             row = self.fact_index.row(record_id)
@@ -1459,7 +1484,7 @@ class PassiveRecallService:
             if (row.get("meta") or {}).get("layer", "timeline") != "timeline":
                 rejected.append("duplicate_summary")
                 continue
-            if today is not None and (row.get("meta") or {}).get("local_date") == today:
+            if self._too_fresh(row.get("meta") or {}, today):
                 # 当天写入的记录不浮现。它若是本轮要交付的那一条（前面还没有合格记录），
                 # 整轮留空、不退到下一条候选：当天记录排第一，说明这句话在说刚发生的事，
                 # 退下去取到的旧记录多半答非所问（评测里就出现过退到一条更早的、
@@ -1581,11 +1606,20 @@ class PassiveRecallService:
         cooldown = self.fact_cooldown
 
         live = self._live_blocks()
+        block_metas = None
 
         def exclude(row):
+            nonlocal block_metas
             written = row["meta"].get("written") or row["meta"].get("local_date") or ""
-            if not written or written >= today:
+            if not written or written > today:
                 return True
+            if written == today:
+                # 当天提的事实看来源块的写入时刻：刚写下的不递，写满静默期的照常递。
+                if block_metas is None:
+                    block_metas = self._block_metas()
+                source = block_metas.get(row["meta"].get("block"))
+                if source is None or self._too_fresh(source, today):
+                    return True
             # 事实必须还能追回一块现行正文：来源块被撤回（latent_correct）、被取代（supersede）
             # 或已不在语料里，它提出来的事实一并不递——改过的记忆不会从事实库绕回来。
             if live is None:
@@ -2223,6 +2257,20 @@ def __selftest_rare_path_body():
         later = ask("青瓷湾那天好怀念", 5)
         assert [r["recordId"] for r in later.get("records", [])] == [_chunk_key(texts[1])], \
             "当天记录排在要交付的那条后面时只跳过，不误伤前面的合格记录"
+        # 带精确时刻的当天记录：刚写下的照样挡，写满静默期就放行。
+        timed = index.meta[1]
+        timed.update({"local_date": "2026-01-02", "timestamp_source": "record_iso",
+                      "timestamp": index.time_context.midnight_epoch("2026-01-02") + 3600})
+        index.fixed_now = timed["timestamp"] + 30 * 60
+        fresh = ask("青瓷湾那天好怀念", 6)
+        assert fresh["status"] == "empty" and fresh["reasonCodes"] == ["same_day_record"], \
+            "刚写下半小时的当天记录仍不递"
+        index.fixed_now = timed["timestamp"] + 3 * 3600
+        aged = ask("青瓷湾那天好怀念", 7)
+        assert [r["recordId"] for r in aged.get("records", [])] == [_chunk_key(texts[1])], \
+            "当天早些时候写的记录过了静默期照常浮现：窗口一换、上下文一压缩还够得着"
+        timed.update({"local_date": "2026-01-02", "timestamp_source": "filename"})
+        assert ask("青瓷湾那天好怀念", 8)["status"] == "empty", "没有精确时刻的当天记录仍按整天挡"
         _ADMISSION_POLICY["skip_same_day_records"] = False
         _ADMISSION_POLICY["rare_word_tags"] = ["nz"]
         assert _rare_topic(("青瓷湾",), index, "青瓷湾那天") is None, \
