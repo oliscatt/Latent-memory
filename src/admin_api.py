@@ -203,6 +203,20 @@ class AdminAPI:
         return {"items": [self._row(i, t, m, g) for _, i, t, m, g in rows[:n]]}
 
     # ---------- 事实 ----------
+    def _dead_blocks(self):
+        """来源块已撤回或被取代的块号：从那块拆出来的事实跟着下架，事实簿和浮现看到的是同一批。
+        块号同时还挂在一条在用的块上（别名、副本）就不算下架。"""
+        index = getattr(self.server, "index", None)
+        metas = getattr(index, "meta", None) or []
+        gone = set(getattr(index, "retracted", ()) or ()) | set(getattr(index, "superseded", ()) or ())
+        if not metas or not gone:
+            return set()
+        dead, live = set(), set()
+        for i, meta in enumerate(metas):
+            ids = {meta.get("record_id"), *(meta.get("record_id_aliases") or ())} - {None}
+            (dead if i in gone else live).update(ids)
+        return dead - live
+
     def _facts(self):
         """直接读事实库的 jsonl（FactIndex 不收 meta，事实簿要数"记忆本身"那一类）。
         跳过去重记录和回填中途的，跟 FactIndex 认的是同一批文件。"""
@@ -211,12 +225,15 @@ class AdminAPI:
         files = [self.fact_path] if self.fact_path.is_file() else sorted(
             p for p in self.fact_path.rglob("*.jsonl")
             if not p.name.endswith(".dups.jsonl") and "回填中" not in p.parts)
+        dead = self._dead_blocks()
         out = []
         for p in files:
             for line in p.read_text(encoding="utf-8").splitlines():
                 try:
                     r = json.loads(line)
                 except ValueError:
+                    continue
+                if r.get("block") in dead:
                     continue
                 if (r.get("fact") or "").strip():
                     out.append({"fact": r["fact"].strip(), "date": r.get("event_date") or r.get("written"),
@@ -364,7 +381,9 @@ def _selftest():
         (td / "事实库").mkdir()
         (td / "事实库" / "f.jsonl").write_text(
             '{"fact": "咖啡机保险丝换好了。", "tag": "life", "event_date": "%s"}\n'
-            '{"fact": "这一条是 meta。", "tag": "meta", "event_date": "%s"}\n' % ((date.today().isoformat(),) * 2),
+            '{"fact": "这一条是 meta。", "tag": "meta", "event_date": "%s"}\n'
+            '{"fact": "阳台那条撤回了，这句跟着下架。", "tag": "life", "event_date": "%s", "block": "%s"}\n'
+            % ((date.today().isoformat(),) * 3 + (idx.meta[1].get("record_id") or "",)),
             encoding="utf-8")
         (td / "persona.md").write_text("# 人格\n\n## 我们之间\n私人的话，不该出来。\n\n## 里程碑索引\n\n"
                                        "**第一次修好咖啡机 · 第 3 窗**：她拆，我念说明书。\n\n"
@@ -398,6 +417,10 @@ def _selftest():
         assert api.handle("/facts/search", {"q": ["长" * 201]})[0] == 400
         assert api.handle("/nope", {})[0] == 404
 
+        assert api.handle("/facts/search", {"q": ["阳台"]})[1]["items"][0]["fact"] == "阳台那条撤回了，这句跟着下架。"
+        idx.retracted.add(1)
+        assert not [f for f in api.handle("/facts/search", {"q": ["阳台"]})[1]["items"] if "下架" in f["fact"]], \
+            "来源块撤回了，拆出来的事实不再列"
         st = api.handle("/facts/stats", {})[1]
         assert st["total"] == {"life": 1, "meta": 1}
         assert [f["fact"] for f in api.handle("/facts/random", {"n": ["5"]})[1]["items"]] == ["咖啡机保险丝换好了。"], \
