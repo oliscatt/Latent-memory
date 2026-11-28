@@ -76,7 +76,8 @@ SELF_CHECK_FOOTER = (
 # 选择"截断单条"而不是"少给几条"：召回块是广度层（最近发生过什么），条数比单条
 # 完整度更值钱；被截掉的全文让模型用 latent_search 再查一次，标注写在截断处。
 DEFAULT_MAX_ITEM_CHARS = 500
-TRUNCATION_NOTE = "…（片段已截断，要全文就用 latent_search 再查一次）"
+# 以前只说「再查一次」，可再查回来的还是同一截（2026-11-28 实测）；全文要按 recordId 读。
+TRUNCATION_NOTE = "…（片段已截断，要全文就用 latent_search 带上这条的 recordId 再查）"
 
 
 # 换窗召回记录（给 UI 的"每次换窗带回了什么"）：召回块原来只当场拼成文本注入，

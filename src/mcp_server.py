@@ -214,6 +214,11 @@ TOOLS = [
                     "description": "可选的一种更具体说法；与原 query 融合。最多一个，不能循环扩写",
                 },
                 "topN": {"type": "integer", "description": "返回几条，默认 5"},
+                "recordId": {
+                    "type": "string",
+                    "description": "可选：要读某一条的全文时填它（片段标签里的 recordId，16 位）。"
+                                   "带了就只回这一条、不截断，query 照填你在找什么",
+                },
             },
             "required": ["query"],
         },
@@ -891,6 +896,29 @@ def validate_index_summaries(items, text, current_state, local_date):
     return validated
 
 
+def _umask():
+    current = os.umask(0)
+    os.umask(current)
+    return current
+
+
+_UMASK = _umask()
+
+
+def _keep_mode(fd, path):
+    """mkstemp 建的临时文件固定是 0600，替换上去会把原文件的权限一起换成 0600——
+    靠组权限或 ACL 只读这份语料的进程（比如隔离成别的系统用户的模型）就读不到了。
+    原文件在就沿用它的权限；新文件按进程 umask 给，和直接 open() 新建一样。"""
+    try:
+        mode = Path(path).stat().st_mode & 0o7777
+    except FileNotFoundError:
+        mode = 0o666 & ~_UMASK
+    try:
+        os.fchmod(fd, mode)
+    except (AttributeError, OSError):    # Windows 没有 fchmod；改不了权限不该挡住写入
+        pass
+
+
 def commit_memory_files(plans, replace_func=os.replace):
     """同目录临时文件逐个替换；多文件中途失败时尽力恢复调用前快照。"""
     snapshots, temps, committed = {}, {}, []
@@ -900,6 +928,7 @@ def commit_memory_files(plans, replace_func=os.replace):
             path.parent.mkdir(parents=True, exist_ok=True)
             snapshots[path] = path.read_bytes() if path.exists() else None
             fd, name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+            _keep_mode(fd, path)
             with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
                 handle.write(plan["content"])
                 handle.flush()
@@ -920,6 +949,7 @@ def commit_memory_files(plans, replace_func=os.replace):
                 else:
                     fd, name = tempfile.mkstemp(prefix=f".{path.name}.rollback.", suffix=".tmp",
                                                 dir=path.parent)
+                    _keep_mode(fd, path)
                     with os.fdopen(fd, "wb") as handle:
                         handle.write(before)
                         handle.flush()
@@ -942,6 +972,7 @@ def _atomic_write_bytes(path, content, replace_func=os.replace):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    _keep_mode(fd, path)
     temp = Path(name)
     try:
         with os.fdopen(fd, "wb") as handle:
@@ -1340,6 +1371,9 @@ class MemoryServer:
         variant = args.get("queryVariant")
         if variant is not None and (not isinstance(variant, str) or not variant.strip()):
             raise ToolError("queryVariant 若提供，必须是非空字符串")
+        record_id = args.get("recordId")
+        if record_id is not None:
+            return self._read_record(record_id)
         queries = [query] + ([variant] if variant is not None else [])
         top_n = int(args.get("topN", self.search_topN))
         historical = any(has_history_intent(q) for q in queries)
@@ -1424,6 +1458,24 @@ class MemoryServer:
         structured = self.passive.search_metadata(results)
         structured["text"] = text
         return {"text": text, "structuredContent": structured}
+
+    def _read_record(self, record_id):
+        """按 recordId 读一条记录的全文：检索片段只给前一截，读全文走这里。
+        同一 recordId 切成几块的按原顺序接起来；撤回的不给，被取代的照给但标出来。"""
+        if not (isinstance(record_id, str) and re.fullmatch(r"[0-9a-f]{16}", record_id)):
+            raise ToolError("recordId 必须是 16 位小写十六进制，从片段标签里抄")
+        hidden = self.index.hidden_indices()
+        picked = [i for i, meta in enumerate(self.index.meta)
+                  if i not in self.index.retracted and i not in hidden
+                  and (meta.get("record_id") == record_id
+                       or record_id in (meta.get("record_id_aliases") or ())
+                       or _chunk_key(self.index.chunks[i]) == record_id)]
+        if not picked:
+            raise ToolError(f"没有可读的记录：recordId={record_id} 不在库里，或已经撤回。")
+        rows = [{"id": i, "text": self.index.chunks[i], "meta": self.index.meta[i], "score": 0.0,
+                 "weight": self.index.weights[i]} for i in picked]
+        text = format_recall_block(rows, max_item_chars=None, time_context=self.time_context)
+        return text.replace("【最近记忆召回】", "【记录全文】", 1)
 
     def _tool_passive_recall(self, args, now=None):
         """宿主隐藏入口；程序准入后返回经来源核验的 W4 现场资料。"""
@@ -4378,6 +4430,18 @@ def _selftest_duplicate_records(now=1_800_000_000.0):
                                        "current_state": "虚构验证数据"}, now + 11)
         assert again["isError"] is False and "bodyStatus=duplicate" in text(again) \
             and first_id in text(again), text(again)
+        # 按 recordId 读全文：长记录检索只给前 500 字，带 recordId 要回整条、不截断
+        long_tail = "虚构验证长记录结尾在这里"
+        long_rec = call("latent_append", {"text": "虚构验证：长记录开头。" + "铺垫的话。" * 150 + long_tail,
+                                          "current_state": "虚构验证数据"}, now + 12)
+        long_id = re.search(r"recordId=([0-9a-f]{16})", text(long_rec)).group(1)
+        clipped = text(call("latent_search", {"query": "虚构验证长记录开头"}, now + 13))
+        assert long_tail not in clipped and "带上这条的 recordId" in clipped, clipped
+        whole = call("latent_search", {"query": "长记录", "recordId": long_id}, now + 14)
+        assert whole["isError"] is False and long_tail in text(whole) \
+            and "【记录全文】" in text(whole) and "已截断" not in text(whole), text(whole)
+        assert call("latent_search", {"query": "x", "recordId": "0" * 16}, now + 15)["isError"] is True
+        assert call("latent_search", {"query": "x", "recordId": "不是编号"}, now + 15)["isError"] is True
         written = "".join(p.read_text(encoding="utf-8") for p in timeline.glob("window_*.md"))
         assert written.count("洗衣机换了进水管") == 1, written
         later = call("latent_append", {"text": "虚构验证：洗衣机换了进水管。",
@@ -5560,6 +5624,16 @@ def _selftest():
             assert "故障注入" in str(exc)
         assert old_path.read_text(encoding="utf-8") == "旧内容\n"
         assert not list(index_summary.glob("*.md")), "新建摘要目标在失败后必须清掉"
+        if os.name == "posix":
+            # 替换写不许把原文件权限换成 mkstemp 的 0600：靠组权限／ACL 只读语料的进程会读不到
+            old_path.chmod(0o640)
+            commit_memory_files([{"path": old_path, "content": "再改一次\n"}])
+            assert old_path.stat().st_mode & 0o777 == 0o640, "改写已有文件要沿用它原来的权限"
+            fresh = timeline_summary / "window_02_2026-08-21.md"
+            commit_memory_files([{"path": fresh, "content": "新文件\n"}])
+            assert fresh.stat().st_mode & 0o777 == 0o666 & ~_UMASK, "新文件按 umask 给权限，同 open()"
+            _atomic_write_bytes(old_path, b"bytes\n")
+            assert old_path.stat().st_mode & 0o777 == 0o640, "清理写回同样沿用原权限"
 
     # 1. 握手：字段名与协议版本照规格（protocolVersion/capabilities/serverInfo）
     r = srv.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize",
