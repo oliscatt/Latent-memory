@@ -1021,11 +1021,14 @@ class PassiveRecallService:
         return self._now() - float(ts) < quiet
 
     def _block_metas(self):
-        """块号（含别名）→ 主库里那块的 meta，事实按来源块的写入时刻判断新旧。"""
+        """块号（含别名）→ 主库里那块的 meta，事实按来源块的写入时刻判断新旧。
+        同一个块号常有两份：正文块带精确写入时刻，索引摘要只有日期。优先认带时刻的那份，
+        不然后读到的摘要会把正文盖掉，当天的事实整天都算“刚写的”（2026-11-28 实测）。"""
+        timed = lambda m: m.get("timestamp") is not None and m.get("timestamp_source") in {"append", "record_iso"}
         out = {}
         for meta in getattr(self.index, "meta", None) or []:
             for key in [meta.get("record_id"), *(meta.get("record_id_aliases") or ())]:
-                if key:
+                if key and not (key in out and timed(out[key]) and not timed(meta)):
                     out[key] = meta
         return out
 
@@ -2271,6 +2274,15 @@ def __selftest_rare_path_body():
             "当天早些时候写的记录过了静默期照常浮现：窗口一换、上下文一压缩还够得着"
         timed.update({"local_date": "2026-01-02", "timestamp_source": "filename"})
         assert ask("青瓷湾那天好怀念", 8)["status"] == "empty", "没有精确时刻的当天记录仍按整天挡"
+        # 同一块号有正文和索引摘要两份：判断新旧要认带精确时刻的正文，不管谁在后面
+        body = {"record_id": "r1", "timestamp": 100.0, "timestamp_source": "append"}
+        summary = {"record_id": "r1", "local_date": "2026-01-02"}
+        for metas in ([body, summary], [summary, body]):
+            holder = type("H", (), {})()
+            holder.index = type("I", (), {"meta": metas})()
+            assert PassiveRecallService._block_metas(holder)["r1"] is body, "索引摘要不许盖掉带时刻的正文"
+        holder.index = type("I", (), {"meta": [summary]})()
+        assert PassiveRecallService._block_metas(holder)["r1"] is summary, "只有摘要时照旧用摘要"
         _ADMISSION_POLICY["skip_same_day_records"] = False
         _ADMISSION_POLICY["rare_word_tags"] = ["nz"]
         assert _rare_topic(("青瓷湾",), index, "青瓷湾那天") is None, \
